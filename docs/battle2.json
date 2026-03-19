@@ -1,0 +1,438 @@
+{
+    "avoidable": null,
+    "deaths": [
+        {
+            "damage": {
+                "abilities": [
+                    {
+                        "name": "Flesh Wound",
+                        "total": 91985,
+                        "type": 1
+                    },
+                    {
+                        "name": "Massive Impact",
+                        "total": 54720,
+                        "type": 128
+                    },
+                    {
+                        "name": "Gravegrazer",
+                        "total": 49815,
+                        "totalReduced": 20702,
+                        "type": 128
+                    },
+                    {
+                        "name": "Sustained Damage",
+                        "total": 31516,
+                        "type": 1
+                    },
+                    {
+                        "name": "Plummet",
+                        "total": 27409,
+                        "type": 128
+                    }
+                ],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [],
+                "overheal": 28387,
+                "sources": [
+                    {
+                        "name": "Neckbiter",
+                        "total": 141800,
+                        "totalReduced": 112687,
+                        "type": "NPC"
+                    },
+                    {
+                        "name": "Fatal Flail",
+                        "total": 113645,
+                        "type": "NPC"
+                    }
+                ],
+                "total": 255445,
+                "totalReduced": 226332
+            },
+            "deathWindow": 9004,
+            "events": [
+                {
+                    "ability": {
+                        "abilityIcon": "215000-215067.png",
+                        "guid": 1002935,
+                        "name": "Sustained Damage",
+                        "type": 1
+                    },
+                    "absorbed": 0,
+                    "actorPotencyRatio": 1,
+                    "amount": 18462,
+                    "directHitPercentage": 0,
+                    "expectedAmount": 50,
+                    "expectedCritRate": 256,
+                    "fight": 3,
+                    "finalizedAmount": 57.7568,
+                    "guessAmount": 0.9,
+                    "hitType": 1,
+                    "multiplier": 0.9,
+                    "overkill": 13054,
+                    "packetID": 68666,
+                    "simulated": true,
+                    "sourceID": 148,
+                    "sourceInstance": 1,
+                    "sourceIsFriendly": false,
+                    "targetID": 134,
+                    "targetIsFriendly": true,
+                    "tick": true,
+                    "timestamp": 2458887,
+                    "type": "damage",
+                    "unmitigatedAmount": 35018
+                },
+                {
+                    "ability": {
+                        "abilityIcon": "215000-215521.png",
+                        "guid": 1002942,
+                        "name": "Flesh Wound",
+                        "type": 1
+                    },
+                    "absorbed": 0,
+                    "actorPotencyRatio": 1,
+                    "amount": 18462,
+                    "directHitPercentage": 0,
+                    "expectedAmount": 50,
+                    "expectedCritRate": 256,
+                    "fight": 3,
+                    "finalizedAmount": 57.7568,
+                    "guessAmount": 0.9,
+                    "hitType": 1,
+                    "multiplier": 0.9,
+                    "overkill": 13054,
+                    "packetID": 68624,
+                    "simulated": true,
+                    "sourceID": 147,
+                    "sourceInstance": 2,
+                    "sourceIsFriendly": false,
+                    "targetID": 134,
+                    "targetIsFriendly": true,
+                    "tick": true,
+                    "timestamp": 2458887,
+                    "type": "damage",
+                    "unmitigatedAmount": 35018
+                },
+                {
+                    "ability": {
+                        "abilityIcon": "000000-000405.png",
+                        "guid": 45884,
+                        "name": "Massive Impact",
+                        "type": 128
+                    },
+                    "amount": 54720,
+                    "fight": 3,
+                    "hitType": 1,
+                    "mitigated": 6080,
+                    "multiplier": 0.9,
+                    "packetID": 68666,
+                    "sourceID": 148,
+                    "sourceInstance": 1,
+                    "sourceIsFriendly": false,
+                    "targetID": 134,
+                    "targetIsFriendly": true,
+                    "timestamp": 2456035,
+                    "type": "damage",
+                    "unmitigatedAmount": 60800
+                }
+            ],
+            "fight": 3,
+            "guid": 1000134,
+            "healing": {
+                "abilities": [
+                    {
+                        "name": "Eukrasian Prognosis",
+                        "total": 29113,
+                        "totalReduced": 0,
+                        "type": 8
+                    },
+                    {
+                        "name": "Regeneration",
+                        "total": 5337,
+                        "type": 8
+                    },
+                    {
+                        "name": "Ixochole",
+                        "total": 5019,
+                        "type": 8
+                    }
+                ],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [
+                    {
+                        "name": "Gravegrazer",
+                        "total": 30892,
+                        "totalReduced": 1779,
+                        "type": 128
+                    },
+                    {
+                        "name": "Killer Voice",
+                        "total": 5019,
+                        "type": 1024
+                    },
+                    {
+                        "name": "Massive Impact",
+                        "total": 1779,
+                        "type": 128
+                    }
+                ],
+                "given": [],
+                "overheal": 28296,
+                "sources": [
+                    {
+                        "name":"\350\211\276\346\240\274\350\257\272\347\211\271",
+                        "total": 34132,
+                        "totalReduced": 5019,
+                        "type": "Sage"
+                    },
+                    {
+                        "name": "Karisa",
+                        "total": 5337,
+                        "type": "BlackMage"
+                    }
+                ],
+                "taken": [
+                    {
+                        "abilityIcon": "212000-212636.png",
+                        "guid": 1001912,
+                        "name": "Asylum",
+                        "total": 456.2727272727275,
+                        "type": "WhiteMage"
+                    }
+                ],
+                "total": 39469,
+                "totalADPS": 39469,
+                "totalCDPS": 39468.99999999999,
+                "totalNDPS": 39012.72727272727,
+                "totalRDPS": 39012.72727272727,
+                "totalRDPSGiven": 0,
+                "totalRDPSTaken": 456.2727272727275,
+                "totalReduced": 10356
+            },
+            "icon": "BlackMage",
+            "id": 134,
+            "killingBlow": {
+                "abilityIcon": "215000-215067.png",
+                "guid": 1002935,
+                "name": "Sustained Damage",
+                "type": 1
+            },
+            "name": "Karisa",
+            "overkill": 26108,
+            "timestamp": 2460935,
+            "type": "BlackMage"
+        },
+        {
+            "damage": {
+                "abilities": [
+                    {
+                        "name": "Killer Voice",
+                        "total": 134222,
+                        "type": 1024
+                    },
+                    {
+                        "name": "Sustained Damage",
+                        "total": 123113,
+                        "totalReduced": 97355,
+                        "type": 1
+                    },
+                    {
+                        "name": "Massive Impact",
+                        "total": 74252,
+                        "totalReduced": 45355,
+                        "type": 128
+                    }
+                ],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [],
+                "overheal": 36846,
+                "sources": [
+                    {
+                        "name": "Fatal Flail",
+                        "total": 197365,
+                        "totalReduced": 142710,
+                        "type": "NPC"
+                    },
+                    {
+                        "name": "Vamp Fatale",
+                        "total": 134222,
+                        "type": "Boss"
+                    }
+                ],
+                "total": 331587,
+                "totalReduced": 276932
+            },
+            "deathWindow": 10552,
+            "events": [
+                {
+                    "ability": {
+                        "abilityIcon": "000000-000405.png",
+                        "guid": 45921,
+                        "name": "Killer Voice",
+                        "type": 1024
+                    },
+                    "amount": 109941,
+                    "fight": 3,
+                    "hitType": 1,
+                    "mitigated": 14914,
+                    "multiplier": 1.26,
+                    "overkill": 24281,
+                    "packetID": 68766,
+                    "sourceID": 140,
+                    "sourceIsFriendly": false,
+                    "targetID": 139,
+                    "targetIsFriendly": true,
+                    "timestamp": 2466633,
+                    "type": "damage",
+                    "unmitigatedAmount": 149136
+                },
+                {
+                    "ability": {
+                        "abilityIcon": "215000-215067.png",
+                        "guid": 1002935,
+                        "name": "Sustained Damage",
+                        "type": 1
+                    },
+                    "absorbed": 0,
+                    "actorPotencyRatio": 1,
+                    "amount": 31525,
+                    "directHitPercentage": 0,
+                    "expectedAmount": 50,
+                    "expectedCritRate": 256,
+                    "fight": 3,
+                    "finalizedAmount": 57.7568,
+                    "guessAmount": 1.26,
+                    "hitType": 1,
+                    "multiplier": 1.26,
+                    "packetID": 68666,
+                    "simulated": true,
+                    "sourceID": 148,
+                    "sourceInstance": 1,
+                    "sourceIsFriendly": false,
+                    "targetID": 139,
+                    "targetIsFriendly": true,
+                    "tick": true,
+                    "timestamp": 2465655,
+                    "type": "damage",
+                    "unmitigatedAmount": 35028
+                },
+                {
+                    "ability": {
+                        "abilityIcon": "215000-215067.png",
+                        "guid": 1002935,
+                        "name": "Sustained Damage",
+                        "type": 1
+                    },
+                    "absorbed": 0,
+                    "actorPotencyRatio": 1,
+                    "amount": 32082,
+                    "directHitPercentage": 0,
+                    "expectedAmount": 50,
+                    "expectedCritRate": 256,
+                    "fight": 3,
+                    "finalizedAmount": 57.7568,
+                    "guessAmount": 1.26,
+                    "hitType": 1,
+                    "multiplier": 1.26,
+                    "packetID": 68666,
+                    "simulated": true,
+                    "sourceID": 148,
+                    "sourceInstance": 1,
+                    "sourceIsFriendly": false,
+                    "targetID": 139,
+                    "targetIsFriendly": true,
+                    "tick": true,
+                    "timestamp": 2462627,
+                    "type": "damage",
+                    "unmitigatedAmount": 35647
+                }
+            ],
+            "fight": 3,
+            "guid": 1000139,
+            "healing": {
+                "abilities": [
+                    {
+                        "name": "Eukrasian Prognosis",
+                        "total": 54655,
+                        "totalReduced": 0,
+                        "type": 8
+                    },
+                    {
+                        "name": "Assize",
+                        "total": 29549,
+                        "type": 1024
+                    },
+                    {
+                        "name": "Eudaimonia",
+                        "total": 21810,
+                        "type": 8
+                    },
+                    {
+                        "name": "Eukrasian Prognosis II",
+                        "total": 7155,
+                        "type": 8
+                    },
+                    {
+                        "name": "Regeneration",
+                        "total": 5169,
+                        "type": 8
+                    }
+                ],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [
+                    {
+                        "name": "Massive Impact",
+                        "total": 30620,
+                        "totalReduced": 1723,
+                        "type": 128
+                    }
+                ],
+                "given": [],
+                "sources": [
+                    {
+                        "name":"\350\211\276\346\240\274\350\257\272\347\211\271",
+                        "total": 83620,
+                        "totalReduced": 28965,
+                        "type": "Sage"
+                    },
+                    {
+                        "name": "Flat",
+                        "total": 29549,
+                        "type": "WhiteMage"
+                    },
+                    {
+                        "name":"\345\235\240\346\234\272\345\240\241\345\236\222",
+                        "total": 5169,
+                        "type": "RedMage"
+                    }
+                ],
+                "taken": [],
+                "total": 118338,
+                "totalADPS": 118338,
+                "totalCDPS": 118338,
+                "totalNDPS": 118338,
+                "totalRDPS": 118338,
+                "totalRDPSGiven": 0,
+                "totalRDPSTaken": 0,
+                "totalReduced": 63683
+            },
+            "icon": "RedMage",
+            "id": 139,
+            "killingBlow": {
+                "abilityIcon": "000000-000405.png",
+                "guid": 45921,
+                "name": "Killer Voice",
+                "type": 1024
+            },
+            "name":"\345\235\240\346\234\272\345\240\241\345\236\222",
+            "overkill": 24281,
+            "timestamp": 2468640,
+            "type": "RedMage"
+        }
+    ]
+}

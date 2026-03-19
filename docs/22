@@ -1,0 +1,15 @@
+SELECT * FROM "public"."fight_sync_maps" WHERE master_id = 'RrFNb7t3B12LMp9Z-8'
+50	RrFNb7t3B12LMp9Z-8	{RrFNb7t3B12LMp9Z-8,tjRaAN1wmrLy8dBv-2}	M10S	1768314200	588
+
+SELECT * FROM "public"."reports" WHERE player_id = 1 AND boss_name = 'M10S' and kill = true
+RrFNb7t3B12LMp9Z-8	1	AAC Heavyweight	1768314200	588	8	t	M10S	Samurai	0.01	0	0	0	0	0
+tjRaAN1wmrLy8dBv-2	1	AAC Heavyweight	1768314200	588	2	t	M10S	Samurai	0.01	0	0	0	0	0
+
+rhJx2BCHqwAFc1ya-18	1	AAC Heavyweight	1767831758	597	18	t	M10S	Samurai	0.01	0	0	0	0	0
+xprqYfLKvdGHMmPg-62	1	AAC Heavyweight	1767831758	597	62	t	M10S	Samurai	0.01	0	0	0	0	0
+
+ 
+
+HAXV1a8WxBbGg9dy-11
+pqbNmADZGFKkw183-3
+Qqm2wBR1gb6nkGy4-38

@@ -1,0 +1,214 @@
+{
+    "avoidable": null,
+    "deaths": [
+        {
+            "damage": {
+                "abilities": [
+                    {
+                        "name": "Blast Beat",
+                        "total": 99626,
+                        "type": 1024
+                    }
+                ],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [],
+                "overheal": 361516,
+                "sources": [
+                    {
+                        "name": "Vamp Fatale",
+                        "total": 99626,
+                        "type": "NPC"
+                    }
+                ],
+                "total": 99626
+            },
+            "deathWindow": 0,
+            "events": [
+                {
+                    "ability": {
+                        "abilityIcon": "000000-000405.png",
+                        "guid": 45942,
+                        "name": "Blast Beat",
+                        "type": 1024
+                    },
+                    "amount": 99626,
+                    "fight": 4,
+                    "hitType": 1,
+                    "mitigated": 361516,
+                    "multiplier": 2.56,
+                    "overkill": 3154017,
+                    "packetID": 65141,
+                    "sourceID": 156,
+                    "sourceInstance": 2,
+                    "sourceIsFriendly": false,
+                    "targetID": 151,
+                    "targetIsFriendly": true,
+                    "timestamp": 2191142,
+                    "type": "damage",
+                    "unmitigatedAmount": 3615159
+                }
+            ],
+            "fight": 4,
+            "guid": 1000151,
+            "healing": {
+                "abilities": [],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [],
+                "sources": [],
+                "total": 0
+            },
+            "icon": "Samurai",
+            "id": 151,
+            "killingBlow": {
+                "abilityIcon": "000000-000405.png",
+                "guid": 45942,
+                "name": "Blast Beat",
+                "type": 1024
+            },
+            "name":"\344\270\226\346\227\240\344\273\231",
+            "overkill": 3154017,
+            "timestamp": 2193143,
+            "type": "Samurai"
+        },
+        {
+            "damage": {
+                "abilities": [
+                    {
+                        "name": "Blast Beat",
+                        "total": 266255,
+                        "type": 1024
+                    }
+                ],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [],
+                "sources": [
+                    {
+                        "name": "Vamp Fatale",
+                        "total": 266255,
+                        "type": "NPC"
+                    }
+                ],
+                "total": 266255
+            },
+            "deathWindow": 0,
+            "events": [
+                {
+                    "ability": {
+                        "abilityIcon": "000000-000405.png",
+                        "guid": 45942,
+                        "name": "Blast Beat",
+                        "type": 1024
+                    },
+                    "amount": 266255,
+                    "fight": 4,
+                    "hitType": 1,
+                    "multiplier": 2.84,
+                    "overkill": 1726301,
+                    "packetID": 65141,
+                    "sourceID": 156,
+                    "sourceInstance": 2,
+                    "sourceIsFriendly": false,
+                    "targetID": 150,
+                    "targetIsFriendly": true,
+                    "timestamp": 2191184,
+                    "type": "damage",
+                    "unmitigatedAmount": 1992556
+                }
+            ],
+            "fight": 4,
+            "guid": 1000150,
+            "healing": {
+                "abilities": [],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [],
+                "sources": [],
+                "total": 0
+            },
+            "icon": "Paladin",
+            "id": 150,
+            "killingBlow": {
+                "abilityIcon": "000000-000405.png",
+                "guid": 45942,
+                "name": "Blast Beat",
+                "type": 1024
+            },
+            "name":"\347\214\253\350\221\211",
+            "overkill": 1726301,
+            "timestamp": 2193187,
+            "type": "Paladin"
+        },
+        {
+            "damage": {
+                "abilities": [
+                    {
+                        "name": "Blast Beat",
+                        "total": 97271,
+                        "type": 1024
+                    }
+                ],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [],
+                "sources": [
+                    {
+                        "name": "Vamp Fatale",
+                        "total": 97271,
+                        "type": "NPC"
+                    }
+                ],
+                "total": 97271
+            },
+            "deathWindow": 0,
+            "events": [
+                {
+                    "ability": {
+                        "abilityIcon": "000000-000405.png",
+                        "guid": 45942,
+                        "name": "Blast Beat",
+                        "type": 1024
+                    },
+                    "amount": 97271,
+                    "fight": 4,
+                    "hitType": 1,
+                    "multiplier": 2.84,
+                    "overkill": 3147344,
+                    "packetID": 65181,
+                    "sourceID": 156,
+                    "sourceInstance": 2,
+                    "sourceIsFriendly": false,
+                    "targetID": 38,
+                    "targetIsFriendly": true,
+                    "timestamp": 2197023,
+                    "type": "damage",
+                    "unmitigatedAmount": 3244615
+                }
+            ],
+            "fight": 4,
+            "guid": 1000038,
+            "healing": {
+                "abilities": [],
+                "activeTime": 0,
+                "activeTimeReduced": 0,
+                "damageAbilities": [],
+                "sources": [],
+                "total": 0
+            },
+            "icon": "Scholar",
+            "id": 38,
+            "killingBlow": {
+                "abilityIcon": "000000-000405.png",
+                "guid": 45942,
+                "name": "Blast Beat",
+                "type": 1024
+            },
+            "name":"\350\216\211\350\216\211\345\237\203\347\211\271",
+            "overkill": 3147344,
+            "timestamp": 2199027,
+            "type": "Scholar"
+        }
+    ]
+}

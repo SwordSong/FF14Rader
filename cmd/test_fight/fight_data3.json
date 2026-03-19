@@ -1,0 +1,2042 @@
+{
+  "fetchedTime": "2026-03-17T04:17:09+08:00",
+  "fight": {
+    "difficulty": 101,
+    "endTime": 7548690,
+    "gameZone": {
+      "id": 1323,
+      "name": "The X-Ring"
+    },
+    "id": 12,
+    "kill": true,
+    "name": "Red Hot / Deep Blue",
+    "startTime": 6977755
+  },
+  "masterData": {
+    "actors": [
+      {
+        "gameID": 0,
+        "id": -1,
+        "name": "Environment",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000001,
+        "id": 1,
+        "name": "月山槿",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000002,
+        "id": 2,
+        "name": "月山槿",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000003,
+        "id": 3,
+        "name": "狐尾酒",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000004,
+        "id": 4,
+        "name": "鹤見月",
+        "subType": "Bard"
+      },
+      {
+        "gameID": 1000005,
+        "id": 5,
+        "name": "鹤丸丸",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000006,
+        "id": 6,
+        "name": "Aurita",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000007,
+        "id": 7,
+        "name": "河流诞生之夜",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000008,
+        "id": 8,
+        "name": "初鸟创",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000009,
+        "id": 9,
+        "name": "Akira墨",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1008,
+        "id": 10,
+        "name": "Eos",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000011,
+        "id": 11,
+        "name": "Multiple Players",
+        "subType": "LimitBreak"
+      },
+      {
+        "gameID": 19167,
+        "id": 12,
+        "name": "Vamp Fatale",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 2000013,
+        "id": 13,
+        "name": "Vamp Fatale",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19503,
+        "id": 14,
+        "name": "Vampette Fatale",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 13961,
+        "id": 15,
+        "name": "liturgic bell",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 19168,
+        "id": 16,
+        "name": "Coffinmaker",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000017,
+        "id": 17,
+        "name": "Coffinmaker",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19189,
+        "id": 18,
+        "name": "Neckbiter",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000019,
+        "id": 19,
+        "name": "Neckbiter",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000020,
+        "id": 20,
+        "name": "Fatal Flail",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000021,
+        "id": 21,
+        "name": "Deadly Doornail",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19169,
+        "id": 22,
+        "name": "Fatal Flail",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19170,
+        "id": 23,
+        "name": "Deadly Doornail",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000024,
+        "id": 24,
+        "name": "Multiple Enemies",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 10487,
+        "id": 25,
+        "name": "Seraph",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 19187,
+        "id": 26,
+        "name": "Charnel Cell",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19171,
+        "id": 27,
+        "name": "Charnel Cell",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19188,
+        "id": 28,
+        "name": "Charnel Cell",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000029,
+        "id": 29,
+        "name": "Limit Break",
+        "subType": "LimitBreak"
+      },
+      {
+        "gameID": 1000030,
+        "id": 30,
+        "name": "月山槿",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000031,
+        "id": 31,
+        "name": "普拉顿桑克斯",
+        "subType": "Reaper"
+      },
+      {
+        "gameID": 1000032,
+        "id": 32,
+        "name": "決斷",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000033,
+        "id": 33,
+        "name": "Lenore",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 18510,
+        "id": 34,
+        "name": "Terminal Watchman",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18870,
+        "id": 35,
+        "name": "Terminal Watchman",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18511,
+        "id": 36,
+        "name": "Terminal Leptocyon",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18908,
+        "id": 37,
+        "name": "Terminal Watchman",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 10489,
+        "id": 38,
+        "name": "Esteem",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 18512,
+        "id": 39,
+        "name": "Preserved Medic",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18871,
+        "id": 40,
+        "name": "Preserved Medic",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18872,
+        "id": 41,
+        "name": "Preserved Medic",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18575,
+        "id": 42,
+        "name": "Chirurgeon General",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 2000043,
+        "id": 43,
+        "name": "Chirurgeon General",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000044,
+        "id": 44,
+        "name": "Multiple Enemies",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18515,
+        "id": 45,
+        "name": "Terminal Claw",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18874,
+        "id": 46,
+        "name": "Terminal Claw",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18873,
+        "id": 47,
+        "name": "Terminal Bot",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18518,
+        "id": 48,
+        "name": "Preserved Prisoner",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18517,
+        "id": 49,
+        "name": "Preserved Prisoner",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18516,
+        "id": 50,
+        "name": "Preserved Prisoner",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18875,
+        "id": 51,
+        "name": "Preserved Prisoner",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18577,
+        "id": 52,
+        "name": "Pale Headsman",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 18578,
+        "id": 53,
+        "name": "Ravenous Headsman",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 18579,
+        "id": 54,
+        "name": "Pestilent Headsman",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 18576,
+        "id": 55,
+        "name": "Bloody Headsman",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 18913,
+        "id": 56,
+        "name": "Hooded Headsman",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000057,
+        "id": 57,
+        "name": "Pale Headsman",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000058,
+        "id": 58,
+        "name": "Ravenous Headsman",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000059,
+        "id": 59,
+        "name": "Pestilent Headsman",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000060,
+        "id": 60,
+        "name": "Bloody Headsman",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18580,
+        "id": 61,
+        "name": "Sword of Justice",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000062,
+        "id": 62,
+        "name": "",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 18642,
+        "id": 63,
+        "name": "Hellmaker",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18519,
+        "id": 64,
+        "name": "Terminal Turret",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18520,
+        "id": 65,
+        "name": "Terminal Dataguarder",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18876,
+        "id": 66,
+        "name": "Terminal Dataguarder",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18978,
+        "id": 67,
+        "name": "Preserved Soldier",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18521,
+        "id": 68,
+        "name": "Preserved Soldier",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18981,
+        "id": 69,
+        "name": "Preserved Soldier",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18522,
+        "id": 70,
+        "name": "Preserved Soldier",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18622,
+        "id": 71,
+        "name": "Immortal Remains",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 18623,
+        "id": 72,
+        "name": "Bygone Aerostat",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 18624,
+        "id": 73,
+        "name": "Preserved Terror",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000074,
+        "id": 74,
+        "name": "Immortal Remains",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000075,
+        "id": 75,
+        "name": "",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000076,
+        "id": 76,
+        "name": "醍醐灌饼",
+        "subType": "Astrologian"
+      },
+      {
+        "gameID": 1000077,
+        "id": 77,
+        "name": "艾可莉莉",
+        "subType": "Machinist"
+      },
+      {
+        "gameID": 1000078,
+        "id": 78,
+        "name": "五木時鳥",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000079,
+        "id": 79,
+        "name": "Rokujo",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000080,
+        "id": 80,
+        "name": "中了羊毒",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000081,
+        "id": 81,
+        "name": "无声狂啸",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000082,
+        "id": 82,
+        "name": "弥提尔",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1008,
+        "id": 83,
+        "name": "Emerald Carbuncle",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 19287,
+        "id": 84,
+        "name": "Red Hot",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 7245,
+        "id": 85,
+        "name": "Earthly Star",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 10490,
+        "id": 86,
+        "name": "Automaton Queen",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000087,
+        "id": 87,
+        "name": "",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000088,
+        "id": 88,
+        "name": "Red Hot",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19288,
+        "id": 89,
+        "name": "Deep Blue",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 2000090,
+        "id": 90,
+        "name": "Deep Blue",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 10487,
+        "id": 91,
+        "name": "Seraph",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 19423,
+        "id": 92,
+        "name": "The Xtremes",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19289,
+        "id": 93,
+        "name": "Xtreme Aether",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000094,
+        "id": 94,
+        "name": "Multiple Enemies",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19136,
+        "id": 95,
+        "name": "Watery Grave",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19292,
+        "id": 96,
+        "name": "Watery Grave",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000097,
+        "id": 97,
+        "name": "森间某树",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000098,
+        "id": 98,
+        "name": "Key羽未",
+        "subType": "Astrologian"
+      },
+      {
+        "gameID": 1000099,
+        "id": 99,
+        "name": "漫漫雨季",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000100,
+        "id": 100,
+        "name": "冬日铃",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000101,
+        "id": 101,
+        "name": "沙拉酱誒",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000102,
+        "id": 102,
+        "name": "Dchord",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000103,
+        "id": 103,
+        "name": "藍雨",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000104,
+        "id": 104,
+        "name": "青山小饼干",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000105,
+        "id": 105,
+        "name": "深情薯饼",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000106,
+        "id": 106,
+        "name": "夜绯零",
+        "subType": "Machinist"
+      },
+      {
+        "gameID": 1000107,
+        "id": 107,
+        "name": "花山院長定",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000108,
+        "id": 108,
+        "name": "考尔德",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000109,
+        "id": 109,
+        "name": "紫电青霜",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000110,
+        "id": 110,
+        "name": "飛鳥井天華",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1008,
+        "id": 111,
+        "name": "Carbuncle",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 10489,
+        "id": 112,
+        "name": "Esteem",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 10490,
+        "id": 113,
+        "name": "Automaton Queen",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 13961,
+        "id": 114,
+        "name": "liturgic bell",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 10487,
+        "id": 115,
+        "name": "Seraph",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000116,
+        "id": 116,
+        "name": "寂念",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000117,
+        "id": 117,
+        "name": "新叶喵想吃饭",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000118,
+        "id": 118,
+        "name": "",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000119,
+        "id": 119,
+        "name": "笼中雀",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000120,
+        "id": 120,
+        "name": "焦糖大列巴",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000121,
+        "id": 121,
+        "name": "怪偶猫",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000122,
+        "id": 122,
+        "name": "弐",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000123,
+        "id": 123,
+        "name": "·露西恩·",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000124,
+        "id": 124,
+        "name": "超负荷",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000125,
+        "id": 125,
+        "name": "你哭了",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000126,
+        "id": 126,
+        "name": "渎神",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000127,
+        "id": 127,
+        "name": "綺麗囡囡",
+        "subType": "Dragoon"
+      },
+      {
+        "gameID": 1000128,
+        "id": 128,
+        "name": "阿尔博特席",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000129,
+        "id": 129,
+        "name": "释怀丶",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000130,
+        "id": 130,
+        "name": "半两",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000131,
+        "id": 131,
+        "name": "无稽烦忧",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000132,
+        "id": 132,
+        "name": "千束酱",
+        "subType": "RedMage"
+      },
+      {
+        "gameID": 1000133,
+        "id": 133,
+        "name": "小御门奈莉奈",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000134,
+        "id": 134,
+        "name": "司辰貓",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000135,
+        "id": 135,
+        "name": "水中八月",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000136,
+        "id": 136,
+        "name": "若析",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000137,
+        "id": 137,
+        "name": "很困",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000138,
+        "id": 138,
+        "name": "勇敢壮壮",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000139,
+        "id": 139,
+        "name": "勇敢壮壮",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000140,
+        "id": 140,
+        "name": "诡计大师",
+        "subType": "RedMage"
+      },
+      {
+        "gameID": 1000141,
+        "id": 141,
+        "name": "百态",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000142,
+        "id": 142,
+        "name": "勇敢壮壮",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000143,
+        "id": 143,
+        "name": "锁链",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000144,
+        "id": 144,
+        "name": "破極兵刃",
+        "subType": "Monk"
+      },
+      {
+        "gameID": 1000145,
+        "id": 145,
+        "name": "破極兵刃",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000146,
+        "id": 146,
+        "name": "月山槿",
+        "subType": "Monk"
+      },
+      {
+        "gameID": 1000147,
+        "id": 147,
+        "name": "缺缺",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000148,
+        "id": 148,
+        "name": "铁·憨憨",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000149,
+        "id": 149,
+        "name": "捏捏吗·捏吗",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000150,
+        "id": 150,
+        "name": "小御门奈莉奈",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000151,
+        "id": 151,
+        "name": "小·明",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000152,
+        "id": 152,
+        "name": "晔月",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000153,
+        "id": 153,
+        "name": "莊嚴哀悼",
+        "subType": "Bard"
+      },
+      {
+        "gameID": 1000154,
+        "id": 154,
+        "name": "希斯尔",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000155,
+        "id": 155,
+        "name": "Uriel",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000156,
+        "id": 156,
+        "name": "莊嚴哀悼",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000157,
+        "id": 157,
+        "name": "怪克丰川祥子",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000158,
+        "id": 158,
+        "name": "巴兹·克劳萨",
+        "subType": "Dragoon"
+      },
+      {
+        "gameID": 1000159,
+        "id": 159,
+        "name": "勇敢壮壮",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000160,
+        "id": 160,
+        "name": "勇敢壮壮",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000161,
+        "id": 161,
+        "name": "虎纹鲨鱼王后",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1008,
+        "id": 162,
+        "name": "Emerald Carbuncle",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000163,
+        "id": 163,
+        "name": "涳",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000164,
+        "id": 164,
+        "name": "莉波",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000165,
+        "id": 165,
+        "name": "莱尔斯塔亚",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000166,
+        "id": 166,
+        "name": "猫重置",
+        "subType": "Dragoon"
+      },
+      {
+        "gameID": 1000167,
+        "id": 167,
+        "name": "羽生结安",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000168,
+        "id": 168,
+        "name": "森亜露露卡",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000169,
+        "id": 169,
+        "name": "想死在阴雨天",
+        "subType": "Dragoon"
+      },
+      {
+        "gameID": 1000170,
+        "id": 170,
+        "name": "炽红",
+        "subType": "Astrologian"
+      },
+      {
+        "gameID": 1000171,
+        "id": 171,
+        "name": "牧茶",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000172,
+        "id": 172,
+        "name": "阿琪",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000173,
+        "id": 173,
+        "name": "不可愛",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000174,
+        "id": 174,
+        "name": "Mr仙人",
+        "subType": "RedMage"
+      },
+      {
+        "gameID": 1000175,
+        "id": 175,
+        "name": "甜猴",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000176,
+        "id": 176,
+        "name": "逆·转",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1008,
+        "id": 177,
+        "name": "Eos",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000178,
+        "id": 178,
+        "name": "莉波",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000179,
+        "id": 179,
+        "name": "琥曜",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000180,
+        "id": 180,
+        "name": "雪沉",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000181,
+        "id": 181,
+        "name": "领导先走",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1008,
+        "id": 182,
+        "name": "Ruby Carbuncle",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 10487,
+        "id": 183,
+        "name": "Seraph",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000184,
+        "id": 184,
+        "name": "希斯尔",
+        "subType": "RedMage"
+      },
+      {
+        "gameID": 1000185,
+        "id": 185,
+        "name": "阿琪",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1008,
+        "id": 186,
+        "name": "Selene",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000187,
+        "id": 187,
+        "name": "霧裡歩洐",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000188,
+        "id": 188,
+        "name": "恭弥",
+        "subType": "Ninja"
+      },
+      {
+        "gameID": 1000189,
+        "id": 189,
+        "name": "小只",
+        "subType": "Machinist"
+      },
+      {
+        "gameID": 1000190,
+        "id": 190,
+        "name": "阿修羅",
+        "subType": "Bard"
+      },
+      {
+        "gameID": 1000191,
+        "id": 191,
+        "name": "砯冰逝水",
+        "subType": "Summoner"
+      },
+      {
+        "gameID": 1000192,
+        "id": 192,
+        "name": "初鹿野唯",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000193,
+        "id": 193,
+        "name": "窝里giao",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000194,
+        "id": 194,
+        "name": "莱尔斯塔亚",
+        "subType": "Machinist"
+      },
+      {
+        "gameID": 1000195,
+        "id": 195,
+        "name": "贤者的叙狮谣",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000196,
+        "id": 196,
+        "name": "贤者的叙狮谣",
+        "subType": "Bard"
+      },
+      {
+        "gameID": 1000197,
+        "id": 197,
+        "name": "薄荷",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000198,
+        "id": 198,
+        "name": "",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000199,
+        "id": 199,
+        "name": "初鹿野唯",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000200,
+        "id": 200,
+        "name": "隆江辰辰",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000201,
+        "id": 201,
+        "name": "隆江辰辰",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000202,
+        "id": 202,
+        "name": "初鹿野唯",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 13498,
+        "id": 203,
+        "name": "Ruby Carbuncle",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000204,
+        "id": 204,
+        "name": "初鹿野唯",
+        "subType": "Astrologian"
+      },
+      {
+        "gameID": 1000205,
+        "id": 205,
+        "name": "初鹿野唯",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000206,
+        "id": 206,
+        "name": "无稽烦忧",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000207,
+        "id": 207,
+        "name": "良也",
+        "subType": "WhiteMage"
+      },
+      {
+        "gameID": 1000208,
+        "id": 208,
+        "name": "Mr仙人",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000209,
+        "id": 209,
+        "name": "Mr仙人",
+        "subType": "Summoner"
+      },
+      {
+        "gameID": 1000210,
+        "id": 210,
+        "name": "Blowup",
+        "subType": "Machinist"
+      },
+      {
+        "gameID": 1000211,
+        "id": 211,
+        "name": "Mr仙人",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000212,
+        "id": 212,
+        "name": "Mr仙人",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000213,
+        "id": 213,
+        "name": "秘奥闪光",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000214,
+        "id": 214,
+        "name": "艾莱奈希帕",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000215,
+        "id": 215,
+        "name": "我要六上天",
+        "subType": "RedMage"
+      },
+      {
+        "gameID": 1000216,
+        "id": 216,
+        "name": "怪偶猫",
+        "subType": "Astrologian"
+      },
+      {
+        "gameID": 1000217,
+        "id": 217,
+        "name": "千子留",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000218,
+        "id": 218,
+        "name": "卡尔玛兹",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000219,
+        "id": 219,
+        "name": "离别迷雾",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000220,
+        "id": 220,
+        "name": "故故小十",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000221,
+        "id": 221,
+        "name": "",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000222,
+        "id": 222,
+        "name": "酒寄彩葉",
+        "subType": "Dragoon"
+      },
+      {
+        "gameID": 1000223,
+        "id": 223,
+        "name": "维埃拉美少女",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1008,
+        "id": 224,
+        "name": "Eos",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 19180,
+        "id": 225,
+        "name": "The Tyrant",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 7245,
+        "id": 226,
+        "name": "Earthly Star",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 10489,
+        "id": 227,
+        "name": "Esteem",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 2000228,
+        "id": 228,
+        "name": "The Tyrant",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 10487,
+        "id": 229,
+        "name": "Seraph",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 19181,
+        "id": 230,
+        "name": "Comet",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19178,
+        "id": 231,
+        "name": "The Tyrant",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 13498,
+        "id": 232,
+        "name": "Carbuncle",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000233,
+        "id": 233,
+        "name": "修罗蝶",
+        "subType": "Summoner"
+      },
+      {
+        "gameID": 1000234,
+        "id": 234,
+        "name": "猫恋",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000235,
+        "id": 235,
+        "name": "猫恋",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000236,
+        "id": 236,
+        "name": "泪鸢",
+        "subType": "Monk"
+      },
+      {
+        "gameID": 1000237,
+        "id": 237,
+        "name": "樱良",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000238,
+        "id": 238,
+        "name": "恍惚夢",
+        "subType": "Summoner"
+      },
+      {
+        "gameID": 1000239,
+        "id": 239,
+        "name": "犯困",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000240,
+        "id": 240,
+        "name": "魚謊",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000241,
+        "id": 241,
+        "name": "在下喵桑",
+        "subType": "Bard"
+      },
+      {
+        "gameID": 1000242,
+        "id": 242,
+        "name": "史尔基",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000243,
+        "id": 243,
+        "name": "十六夜困困",
+        "subType": "BlackMage"
+      },
+      {
+        "gameID": 1000244,
+        "id": 244,
+        "name": "扑棱龙子",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000245,
+        "id": 245,
+        "name": "陆清酝",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000246,
+        "id": 246,
+        "name": "被宽恕的牺牲",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000247,
+        "id": 247,
+        "name": "Adamo",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000248,
+        "id": 248,
+        "name": "山无可落",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000249,
+        "id": 249,
+        "name": "祈祈",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000250,
+        "id": 250,
+        "name": "革洺",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000251,
+        "id": 251,
+        "name": "渔咕咕咕咕咕",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000252,
+        "id": 252,
+        "name": "纯白之礼",
+        "subType": "Bard"
+      },
+      {
+        "gameID": 1000253,
+        "id": 253,
+        "name": "革洺",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000254,
+        "id": 254,
+        "name": "Adamo",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000255,
+        "id": 255,
+        "name": "柠檬雪花",
+        "subType": "Reaper"
+      },
+      {
+        "gameID": 1000256,
+        "id": 256,
+        "name": "润色微尝",
+        "subType": "Summoner"
+      },
+      {
+        "gameID": 1000257,
+        "id": 257,
+        "name": "元涅不鸣",
+        "subType": "Summoner"
+      },
+      {
+        "gameID": 1000258,
+        "id": 258,
+        "name": "虎虎蛋糕卷",
+        "subType": "Astrologian"
+      },
+      {
+        "gameID": 1000259,
+        "id": 259,
+        "name": "盐酱",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000260,
+        "id": 260,
+        "name": "Svjkkd",
+        "subType": "Bard"
+      },
+      {
+        "gameID": 1000261,
+        "id": 261,
+        "name": "达朗",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000262,
+        "id": 262,
+        "name": "蘭懒懒",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000263,
+        "id": 263,
+        "name": "丈夫",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000264,
+        "id": 264,
+        "name": "快递不通l",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000265,
+        "id": 265,
+        "name": "熊沢哉零",
+        "subType": "Astrologian"
+      },
+      {
+        "gameID": 1000266,
+        "id": 266,
+        "name": "野九焱",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000267,
+        "id": 267,
+        "name": "Svjkkd",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000268,
+        "id": 268,
+        "name": "Saxibl",
+        "subType": "Marauder"
+      },
+      {
+        "gameID": 1000269,
+        "id": 269,
+        "name": "拾肆行狮",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000270,
+        "id": 270,
+        "name": "怎么办",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000271,
+        "id": 271,
+        "name": "",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000272,
+        "id": 272,
+        "name": "Saxibl",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000273,
+        "id": 273,
+        "name": "苍月衛人",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000274,
+        "id": 274,
+        "name": "丈夫",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000275,
+        "id": 275,
+        "name": "报告我不会",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000276,
+        "id": 276,
+        "name": "渔咕咕咕咕咕",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000277,
+        "id": 277,
+        "name": "Svjkkd",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000278,
+        "id": 278,
+        "name": "柯络",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000279,
+        "id": 279,
+        "name": "无情赞美终章",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000280,
+        "id": 280,
+        "name": "奶茶加冰",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 19198,
+        "id": 281,
+        "name": "Lindwurm",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000282,
+        "id": 282,
+        "name": "白泣",
+        "subType": "Warrior"
+      },
+      {
+        "gameID": 1000283,
+        "id": 283,
+        "name": "我的小熊在哪",
+        "subType": "Ninja"
+      },
+      {
+        "gameID": 19195,
+        "id": 284,
+        "name": "Lindwurm",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 10897,
+        "id": 285,
+        "name": "bunshin",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 19201,
+        "id": 286,
+        "name": "Lindwurm",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19200,
+        "id": 287,
+        "name": "Lindwurm",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19239,
+        "id": 288,
+        "name": "Lindwurm",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19197,
+        "id": 289,
+        "name": "Lindwurm",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19196,
+        "id": 290,
+        "name": "Lindwurm",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19240,
+        "id": 291,
+        "name": "Lindwurm",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 2000292,
+        "id": 292,
+        "name": "Lindwurm",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 10487,
+        "id": 293,
+        "name": "Seraph",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 19199,
+        "id": 294,
+        "name": "Blood Vessel",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19202,
+        "id": 295,
+        "name": "Lindwurm",
+        "subType": "Boss"
+      },
+      {
+        "gameID": 19204,
+        "id": 296,
+        "name": "lindschrat",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19210,
+        "id": 297,
+        "name": "understudy",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000298,
+        "id": 298,
+        "name": "",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19205,
+        "id": 299,
+        "name": "mana sphere",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19206,
+        "id": 300,
+        "name": "mana sphere",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19207,
+        "id": 301,
+        "name": "mana sphere",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19208,
+        "id": 302,
+        "name": "mana sphere",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 19209,
+        "id": 303,
+        "name": "mana sphere",
+        "subType": "NPC"
+      },
+      {
+        "gameID": 1000304,
+        "id": 304,
+        "name": "丰川祥子aa",
+        "subType": "RedMage"
+      },
+      {
+        "gameID": 1000305,
+        "id": 305,
+        "name": "巧克力圣代",
+        "subType": "Astrologian"
+      },
+      {
+        "gameID": 1000306,
+        "id": 306,
+        "name": "必逝舞姿",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000307,
+        "id": 307,
+        "name": "Yuhuac",
+        "subType": "RedMage"
+      },
+      {
+        "gameID": 1000308,
+        "id": 308,
+        "name": "奇变偶不变",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000309,
+        "id": 309,
+        "name": "Svjkkd",
+        "subType": "Lancer"
+      },
+      {
+        "gameID": 1000310,
+        "id": 310,
+        "name": "连营",
+        "subType": "Dragoon"
+      },
+      {
+        "gameID": 1000311,
+        "id": 311,
+        "name": "太米努斯",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000312,
+        "id": 312,
+        "name": "浅吻月泪",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000313,
+        "id": 313,
+        "name": "电波塔",
+        "subType": "Machinist"
+      },
+      {
+        "gameID": 1000314,
+        "id": 314,
+        "name": "形骸偏差",
+        "subType": "Gunbreaker"
+      },
+      {
+        "gameID": 1000315,
+        "id": 315,
+        "name": "祈默",
+        "subType": "Dancer"
+      },
+      {
+        "gameID": 1000316,
+        "id": 316,
+        "name": "曜阳",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000317,
+        "id": 317,
+        "name": "酒寄彩葉",
+        "subType": "Samurai"
+      },
+      {
+        "gameID": 1000318,
+        "id": 318,
+        "name": "桐卿",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000319,
+        "id": 319,
+        "name": "大葱儿",
+        "subType": "Summoner"
+      },
+      {
+        "gameID": 1000320,
+        "id": 320,
+        "name": "玉雪霓裳",
+        "subType": "Paladin"
+      },
+      {
+        "gameID": 1000321,
+        "id": 321,
+        "name": "毒瘾",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000322,
+        "id": 322,
+        "name": "妹骑",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000323,
+        "id": 323,
+        "name": "鹿岛千绪",
+        "subType": "BlueMage"
+      },
+      {
+        "gameID": 1000324,
+        "id": 324,
+        "name": "鹿岛千绪",
+        "subType": "Summoner"
+      },
+      {
+        "gameID": 1000325,
+        "id": 325,
+        "name": "带带大袋鼠",
+        "subType": "Ninja"
+      },
+      {
+        "gameID": 1000326,
+        "id": 326,
+        "name": "星引",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1000327,
+        "id": 327,
+        "name": "",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000328,
+        "id": 328,
+        "name": "豹破领域",
+        "subType": "Sage"
+      },
+      {
+        "gameID": 1008,
+        "id": 329,
+        "name": "Eos",
+        "subType": "Pet"
+      },
+      {
+        "gameID": 1000330,
+        "id": 330,
+        "name": "虛閃噤機",
+        "subType": "Scholar"
+      },
+      {
+        "gameID": 1000331,
+        "id": 331,
+        "name": "豹破领域",
+        "subType": "Viper"
+      },
+      {
+        "gameID": 1000332,
+        "id": 332,
+        "name": "一閃",
+        "subType": "DarkKnight"
+      },
+      {
+        "gameID": 1000333,
+        "id": 333,
+        "name": "",
+        "subType": "Unknown"
+      },
+      {
+        "gameID": 1000334,
+        "id": 334,
+        "name": "铁桶",
+        "subType": "RedMage"
+      },
+      {
+        "gameID": 1000335,
+        "id": 335,
+        "name": "豹破领域",
+        "subType": "Pictomancer"
+      },
+      {
+        "gameID": 1000336,
+        "id": 336,
+        "name": "映绯雪",
+        "subType": "Warrior"
+      }
+    ]
+  },
+  "reportCode": "m8BFq3jZ61GTDn9R"
+}
