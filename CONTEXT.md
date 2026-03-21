@@ -28,3 +28,9 @@
 ## 待讨论的逻辑细节
 - 职业细节逻辑的首批支持目标（如：武士、黑魔）。
 - 潜力值的具体加权参数。
+
+## 临时说明：xivanalysis HTTP 批量测试流程
+- 启动分析服务：`node scripts/xivanalysis-server.js`（可用 `PORT` 覆盖，默认 3000，内置 10MB 请求体上限）。
+- 运行 Go 测试工具（使用缓存数据即可）：`go run cmd/test_xivanalysis/main.go -skip-sync -api-url http://localhost:3000/analyze -limit N -batch-size 10`。
+- 请求体格式：`{fights:[{id,data}]}`，按批发送；单个战斗非 200/解析失败会标记跳过并继续后续。
+- 建议在数据量较大时调小 `-batch-size` 或增大服务端 `MAX_BODY_BYTES`，以避免单批过大导致 413。

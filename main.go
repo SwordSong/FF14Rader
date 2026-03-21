@@ -22,6 +22,8 @@ func main() {
 	fflogsClient := api.NewFFLogsClient(cfg.FFLogsClientID, cfg.FFLogsClientSecret)
 	syncManager := api.NewSyncManager(fflogsClient)
 	radarRenderer := render.NewRadarChart(800, 800)
+	_ = syncManager
+	_ = radarRenderer
 
 	log.Println("FF14Rader 服务正常运行中...")
 
