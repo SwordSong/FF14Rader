@@ -3,59 +3,72 @@ package models
 import (
 	"time"
 
-	"github.com/lib/pq"
+	"gorm.io/datatypes"
 )
 
 // Player 玩家基础信息
 type Player struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	Name      string    `gorm:"size:100;not null" json:"name"`
-	Server    string    `gorm:"size:50;not null" json:"server"`
-	Region    string    `gorm:"size:20;not null" json:"region"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Reports   []Report  `gorm:"foreignKey:PlayerID" json:"reports"`
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	Name           string    `gorm:"size:100;not null" json:"name"`
+	Server         string    `gorm:"size:50;not null" json:"server"`
+	Region         string    `gorm:"size:20;not null" json:"region"`
+	AllReportsCode string    `gorm:"size:150" json:"all_reports_code"`
+	AllReportCodes []string  `gorm:"type:jsonb;serializer:json" json:"all_report_codes"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Reports        []Report  `gorm:"foreignKey:PlayerID" json:"reports"`
 }
 
-// Report FFLogs 报告元数据
+// Report 报告解析记录（替代 report_parse_logs，表名: reports）
 type Report struct {
-	ID                string  `gorm:"primaryKey" json:"id"`
-	PlayerID          uint    `gorm:"index" json:"player_id"`
-	Title             string  `json:"title"`
-	StartTime         int64   `json:"start_time"`
-	Duration          int     `json:"duration"` // 毫秒
-	FightID           int     `json:"fight_id"`
-	Kill              bool    `json:"kill"`
-	BossName          string  `json:"boss_name"`
-	Job               string  `json:"job"`
-	WipeProgress      float64 `json:"wipe_progress"`
-	Deaths            int     `json:"deaths"`             // 死亡次数
-	VulnStacks        int     `json:"vuln_stacks"`        // 易伤/机制惩罚堆叠
-	AvoidableDamage   int     `json:"avoidable_damage"`   // 可规避伤害次数
-	DamageDown        int     `json:"damage_down"`        // 伤害降低 Buff 次数
-	Percentile        float64 `json:"percentile"`         // 排名百分比
+	ID             uint           `gorm:"primaryKey"`
+	PlayerID       uint           `gorm:"not null;index" json:"player_id"`
+	MasterReport   string         `gorm:"size:50;not null;index" json:"master_report"`
+	SourceReport   string         `gorm:"size:50;not null;uniqueIndex:idx_reports_player_source" json:"source_report"`
+	ParsedAt       time.Time      `json:"parsed_at"`
+	ParsedDone     bool           `gorm:"index" json:"parsed_done"`
+	Downloaded     bool           `gorm:"index" json:"downloaded"`
+	ReportMetadata datatypes.JSON `gorm:"type:jsonb" json:"report_metadata"`
+	StartTime      int64          `json:"start_time"`
+	EndTime        int64          `json:"end_time"`
+	Title          string         `json:"title"`
+	CreatedAt      time.Time      `json:"created_at"`
 }
 
 // FightCache 战斗详情缓存表
 type FightCache struct {
-	ID              string    `gorm:"primaryKey"`          // 格式: reportCode-fightID
-	Duration        int       `json:"duration"`            // 毫秒
-	Deaths          int       `json:"deaths"`              // 死亡
-	VulnStacks      int       `json:"vuln_stacks"`         // 易伤
-	AvoidableDamage int       `json:"avoidable_damage"`    // 可规避伤害
-	Percentile      float64   `json:"percentile"`          // 排名百分位
-	Timestamp       int64     `gorm:"index" json:"timestamp"` // 战斗发生的绝对时间
-	Data            []byte    `gorm:"type:bytea" json:"-"` // 原始原始 JSON 以后备扩展使用
+	ID              string  `gorm:"primaryKey"`             // 格式: reportCode-fightID
+	Duration        int     `json:"duration"`               // 毫秒
+	Deaths          int     `json:"deaths"`                 // 死亡
+	VulnStacks      int     `json:"vuln_stacks"`            // 易伤
+	AvoidableDamage int     `json:"avoidable_damage"`       // 可规避伤害
+	Percentile      float64 `json:"percentile"`             // 排名百分位
+	Timestamp       int64   `gorm:"index" json:"timestamp"` // 战斗发生的绝对时间
+	Data            []byte  `gorm:"type:bytea" json:"-"`    // 原始原始 JSON 以后备扩展使用
 }
 
 // FightSyncMap 战斗同步映射表 (用于多用户上传去重)
 type FightSyncMap struct {
-	ID        uint           `gorm:"primaryKey"`
-	MasterID  string         `gorm:"index;size:100"`      // 基准 ID (第一个入库的战斗记录)
-	SourceIDs pq.StringArray `gorm:"type:text[];index"`   // 包含的所有原始报告 ID 列表 (PostgreSQL 数组)
-	BossName  string         `gorm:"size:50;index"`
-	Timestamp int64          `gorm:"index"`               // 战斗开始时间 (Master 的时间)
-	Duration  int            `json:"duration"`            // 战斗时长
+	ID              uint           `gorm:"primaryKey"`
+	MasterID        string         `gorm:"index;size:100"`             // 基准 ID (第一个入库的战斗记录)
+	SourceIDs       []string       `gorm:"type:jsonb;serializer:json"` // 包含的所有原始报告 ID 列表 (JSON 数组)
+	PlayerID        uint           `gorm:"index" json:"player_id"`
+	Timestamp       int64          `gorm:"index"` // 战斗开始时间 (Master 的时间)
+	FightID         int            `json:"fight_id"`
+	Kill            bool           `json:"kill"`
+	Job             string         `json:"job"`
+	Downloaded      bool           `gorm:"index" json:"downloaded"`
+	DownloadedAt    time.Time      `json:"downloaded_at"`
+	ParsedDone      bool           `gorm:"index" json:"parsed_done"`
+	StartTime       int64          `json:"start_time"`
+	EndTime         int64          `json:"end_time"`
+	Name            string         `gorm:"size:100;index" json:"name"`
+	BossPercentage  float64        `json:"boss_percentage"`
+	FightPercentage float64        `json:"fight_percentage"`
+	Floor           string         `gorm:"size:20;index" json:"floor"`
+	GameZone        datatypes.JSON `gorm:"type:jsonb" json:"game_zone"`
+	Difficulty      int            `json:"difficulty"`
+	EncounterID     int            `json:"encounter_id"`
 }
 
 // Performance 指标汇总

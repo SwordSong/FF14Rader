@@ -4,3 +4,4 @@ logs/
 .DS_Store
 node_modules/
 external/xivanalysis/.git
+downloads/

@@ -4,12 +4,10 @@ import (
 	"log"
 	"math"
 	"sort"
-
-	"github.com/user/ff14rader/internal/models"
 )
 
 // CalculateOutput 算法: 输出能力 (偏向稳定性，使用中位数和平均值的混合加权)
-func (g *GlobalAnalyzer) CalculateOutput(history []models.Report) float64 {
+func (g *GlobalAnalyzer) CalculateOutput(history []AnalysisFight) float64 {
 	var logs []float64
 	for _, r := range history {
 		if r.Kill && r.Percentile > 0 {
@@ -61,7 +59,7 @@ func (g *GlobalAnalyzer) CalculateUtility(mitigationCasts, expectedCasts int) fl
 }
 
 // CalculateSurvivability 算法: 生存能力 (基于战斗时长加权的死亡与失误评估)
-func (g *GlobalAnalyzer) CalculateSurvivability(reports []models.Report) float64 {
+func (g *GlobalAnalyzer) CalculateSurvivability(reports []AnalysisFight) float64 {
 	if len(reports) == 0 {
 		return 0
 	}
@@ -99,7 +97,7 @@ func (g *GlobalAnalyzer) CalculateOverallScore(survivability, consistency, clear
 }
 
 // CalculateConsistency 算法: 稳定度 (Percentile 的标准差反比例)
-func (g *GlobalAnalyzer) CalculateConsistency(reports []models.Report) float64 {
+func (g *GlobalAnalyzer) CalculateConsistency(reports []AnalysisFight) float64 {
 	if len(reports) < 2 {
 		return 100
 	}
@@ -137,15 +135,15 @@ func (g *GlobalAnalyzer) CalculateConsistency(reports []models.Report) float64 {
 // CalculateClearRate 算法: 过本率 (首通锚点模型)
 // 排除首通前的开荒数据，仅计算首通后的稳定性。
 // 如果首次过本后存在大量 Wipe（如陪练、进老板队），逻辑上依然体现其“稳定性”或在该副本的“容错性”。
-func (g *GlobalAnalyzer) CalculateClearRate(reports []models.Report) float64 {
+func (g *GlobalAnalyzer) CalculateClearRate(reports []AnalysisFight) float64 {
 	if len(reports) == 0 {
 		return 0
 	}
 
-	// 按副本（BossName）分组处理，因为每个副本的首通时间不同
-	bossFights := make(map[string][]models.Report)
+	// 按副本名称分组处理，因为每个副本的首通时间不同
+	bossFights := make(map[string][]AnalysisFight)
 	for _, r := range reports {
-		bossFights[r.BossName] = append(bossFights[r.BossName], r)
+		bossFights[r.Name] = append(bossFights[r.Name], r)
 	}
 
 	var totalKills, totalSampled int
@@ -201,7 +199,7 @@ func (g *GlobalAnalyzer) CalculateClearRate(reports []models.Report) float64 {
 }
 
 // CalculateMechanics 算法: 机制处理 (基于可规避伤害和特定 Buff)
-func (g *GlobalAnalyzer) CalculateMechanics(reports []models.Report) float64 {
+func (g *GlobalAnalyzer) CalculateMechanics(reports []AnalysisFight) float64 {
 	// 逻辑与 Survivability 类似，但更侧重于不可原谅的机制失误
 	return g.CalculateSurvivability(reports) // 暂时复用逻辑
 }

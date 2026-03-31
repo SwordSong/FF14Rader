@@ -36,7 +36,7 @@ func NewGlobalAnalyzer(client *api.FFLogsClient) *GlobalAnalyzer {
 }
 
 // GetMostUsedJob 统计该玩家在该版本所有记录中使用次数最多的职业
-func (g *GlobalAnalyzer) GetMostUsedJob(history []models.Report) string {
+func (g *GlobalAnalyzer) GetMostUsedJob(history []AnalysisFight) string {
 	if len(history) == 0 {
 		return ""
 	}
@@ -60,7 +60,7 @@ func (g *GlobalAnalyzer) GetMostUsedJob(history []models.Report) string {
 }
 
 // CalculateOverallPerformance 综合计算 9 维度评分
-func (g *GlobalAnalyzer) CalculateOverallPerformance(playerID uint, job string, history []models.Report) *models.Performance {
+func (g *GlobalAnalyzer) CalculateOverallPerformance(playerID uint, job string, history []AnalysisFight) *models.Performance {
 	log.Printf("正在综合计算 [%s] 的全版本 9 维度水平指标...", job)
 
 	perf := &models.Performance{
