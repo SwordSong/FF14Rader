@@ -19,7 +19,7 @@ loadEnvFile(findEnvPath())
 
 const reportDir = path.resolve(args.dir)
 const reportCode = args.code || path.basename(reportDir)
-const apiUrl = args.apiUrl || 'http://localhost:3000/analyze'
+const apiUrl = args.apiUrl || 'http://localhost:22026/analyze'
 const outDir = path.resolve(args.outDir || reportDir)
 
 const reportFightsPath = path.join(reportDir, 'report_fights.json')
@@ -139,6 +139,7 @@ function buildReportMetadata(code, reportFights, reportMeta) {
 	const merged = {
 		...reportMeta,
 		code: reportMeta.code || code,
+		title: reportMeta.title || base.title || code || 'Untitled Report',
 		startTime: reportMeta.startTime != null ? reportMeta.startTime : base.startTime,
 		endTime: reportMeta.endTime != null ? reportMeta.endTime : base.endTime,
 		fights: mergeFights(reportMeta.fights || [], base.fights || []),
@@ -152,6 +153,10 @@ function buildReportMetadata(code, reportFights, reportMeta) {
 }
 
 function normalizeReportFights(code, data) {
+	const fallbackActors = Array.isArray(data.friendlyPlayers)
+		? data.friendlyPlayers
+		: undefined
+
 	const fights = Array.isArray(data.fights) ? data.fights.map(f => ({
 		id: f.id,
 		name: f.name,
@@ -167,11 +172,11 @@ function normalizeReportFights(code, data) {
 
 	return {
 		code: code || data.code || '',
-		title: data.title || '',
+		title: data.title || code || 'Untitled Report',
 		startTime: data.start != null ? data.start : data.startTime,
 		endTime: data.end != null ? data.end : data.endTime,
 		fights,
-		masterData: data.masterData,
+		masterData: data.masterData || (fallbackActors ? {actors: fallbackActors} : undefined),
 	}
 }
 
@@ -203,18 +208,27 @@ function loadReportMetadata(code) {
 		return null
 	}
 	const sqlCode = code.replace(/'/g, "''")
-	const sql = `select report_metadata from report_parse_logs where source_report='${sqlCode}' or master_report='${sqlCode}' order by updated_at desc nulls last limit 1;`
-	try {
-		const stdout = execFileSync('psql', [dsn, '-t', '-A', '-c', sql], {encoding: 'utf8'})
-		const trimmed = stdout.trim()
-		if (!trimmed) {
-			return null
+
+	const sqlCandidates = [
+		`select report_metadata from reports where source_report='${sqlCode}' or master_report='${sqlCode}' order by parsed_at desc nulls last, id desc limit 1;`,
+		`select report_metadata from report_parse_logs where source_report='${sqlCode}' or master_report='${sqlCode}' order by updated_at desc nulls last, id desc limit 1;`,
+	]
+
+	for (const sql of sqlCandidates) {
+		try {
+			const stdout = execFileSync('psql', [dsn, '-t', '-A', '-c', sql], {encoding: 'utf8'})
+			const trimmed = stdout.trim()
+			if (!trimmed) {
+				continue
+			}
+			return JSON.parse(trimmed)
+		} catch (err) {
+			continue
 		}
-		return JSON.parse(trimmed)
-	} catch (err) {
-		console.warn(`[warn] load report_metadata failed: ${err.message || err}`)
-		return null
 	}
+
+	console.warn('[warn] report_metadata not found in reports/report_parse_logs; using file fallback if available')
+	return null
 }
 
 function postJson(urlStr, payload) {

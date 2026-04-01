@@ -39,7 +39,7 @@ type sourceFight struct {
 type masterFight struct {
 	MasterID    string        `json:"master_id"`
 	EncounterID int           `json:"encounter_id"`
-	BossName    string        `json:"boss_name"`
+	Name        string        `json:"name"`
 	Start       int64         `json:"start"`
 	DurationMS  int64         `json:"duration_ms"`
 	Sources     []sourceFight `json:"sources"`
@@ -59,7 +59,7 @@ type sourceEvents struct {
 func main() {
 	rootDir := flag.String("root", "./downloads/fflogs", "root directory containing report folders")
 	outDir := flag.String("out", "./downloads/fflogs/merged", "output directory")
-	oleranceMS := flag.Int64("tolerance-ms", 5000, "tolerance window in milliseconds")
+	toleranceMS := flag.Int64("tolerance-ms", 5000, "tolerance window in milliseconds")
 	preferIDs := flag.String("prefer-player-id", "", "comma-separated player IDs to prefer when merging")
 	flag.Parse()
 
@@ -167,7 +167,7 @@ func buildMasters(reports []fightsResponse, toleranceMS int64) ([]masterFight, m
 				masters = append(masters, masterFight{
 					MasterID:    masterID,
 					EncounterID: encounterID,
-					BossName:    bossNameFromEncounter(encounterID),
+					Name:        nameFromEncounter(encounterID),
 					Start:       absStart,
 					DurationMS:  duration,
 					Sources:     []sourceFight{source},
@@ -331,7 +331,7 @@ func getString(ev map[string]interface{}, key string) string {
 	return ""
 }
 
-func bossNameFromEncounter(encounterID int) string {
+func nameFromEncounter(encounterID int) string {
 	return fmt.Sprintf("encounter_%d", encounterID)
 }
 

@@ -15,14 +15,131 @@ const PORT = Number(process.env.PORT || process.env.port || 22026) || 3000
 const HOST = process.env.HOST || '0.0.0.0'
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 20 * 1024 * 1024) || 20 * 1024 * 1024
 const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 2) || 2
+const ANALYZE_TIMEOUT_MS = Number(process.env.ANALYZE_TIMEOUT_MS || 90 * 1000) || 90 * 1000
+const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS || 30 * 1000) || 30 * 1000
+const API_KEY = process.env.XIVA_API_KEY || process.env.API_KEY || ''
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase()
+const OUTPUT_MODE = (process.env.XIVA_OUTPUT_MODE || 'numeric').toLowerCase()
+const OUTPUT_LOCALE = (process.env.XIVA_OUTPUT_LOCALE || process.env.XIVA_LOCALE || 'zh').toLowerCase()
+
+const LEVEL_WEIGHT = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+}
+
+const OPTIONAL_DEPENDENCY_HANDLES = new Set([
+  'cooldownDowntime',
+])
+
+const JOB_KEY_MAP = {
+  PALADIN: {reportJob: 'PALADIN', moduleJob: 'PLD'},
+  PLD: {reportJob: 'PALADIN', moduleJob: 'PLD'},
+  WARRIOR: {reportJob: 'WARRIOR', moduleJob: 'WAR'},
+  WAR: {reportJob: 'WARRIOR', moduleJob: 'WAR'},
+  DARKKNIGHT: {reportJob: 'DARK_KNIGHT', moduleJob: 'DRK'},
+  DARK_KNIGHT: {reportJob: 'DARK_KNIGHT', moduleJob: 'DRK'},
+  DRK: {reportJob: 'DARK_KNIGHT', moduleJob: 'DRK'},
+  GUNBREAKER: {reportJob: 'GUNBREAKER', moduleJob: 'GNB'},
+  GNB: {reportJob: 'GUNBREAKER', moduleJob: 'GNB'},
+
+  WHITEMAGE: {reportJob: 'WHITE_MAGE', moduleJob: 'WHM'},
+  WHITE_MAGE: {reportJob: 'WHITE_MAGE', moduleJob: 'WHM'},
+  WHM: {reportJob: 'WHITE_MAGE', moduleJob: 'WHM'},
+  SCHOLAR: {reportJob: 'SCHOLAR', moduleJob: 'SCH'},
+  SCH: {reportJob: 'SCHOLAR', moduleJob: 'SCH'},
+  ASTROLOGIAN: {reportJob: 'ASTROLOGIAN', moduleJob: 'AST'},
+  AST: {reportJob: 'ASTROLOGIAN', moduleJob: 'AST'},
+  SAGE: {reportJob: 'SAGE', moduleJob: 'SGE'},
+  SGE: {reportJob: 'SAGE', moduleJob: 'SGE'},
+
+  MONK: {reportJob: 'MONK', moduleJob: 'MNK'},
+  MNK: {reportJob: 'MONK', moduleJob: 'MNK'},
+  DRAGOON: {reportJob: 'DRAGOON', moduleJob: 'DRG'},
+  DRG: {reportJob: 'DRAGOON', moduleJob: 'DRG'},
+  NINJA: {reportJob: 'NINJA', moduleJob: 'NIN'},
+  NIN: {reportJob: 'NINJA', moduleJob: 'NIN'},
+  SAMURAI: {reportJob: 'SAMURAI', moduleJob: 'SAM'},
+  SAM: {reportJob: 'SAMURAI', moduleJob: 'SAM'},
+  REAPER: {reportJob: 'REAPER', moduleJob: 'RPR'},
+  RPR: {reportJob: 'REAPER', moduleJob: 'RPR'},
+  VIPER: {reportJob: 'VIPER', moduleJob: 'VPR'},
+  VPR: {reportJob: 'VIPER', moduleJob: 'VPR'},
+
+  BARD: {reportJob: 'BARD', moduleJob: 'BRD'},
+  BRD: {reportJob: 'BARD', moduleJob: 'BRD'},
+  MACHINIST: {reportJob: 'MACHINIST', moduleJob: 'MCH'},
+  MCH: {reportJob: 'MACHINIST', moduleJob: 'MCH'},
+  DANCER: {reportJob: 'DANCER', moduleJob: 'DNC'},
+  DNC: {reportJob: 'DANCER', moduleJob: 'DNC'},
+
+  BLACKMAGE: {reportJob: 'BLACK_MAGE', moduleJob: 'BLM'},
+  BLACK_MAGE: {reportJob: 'BLACK_MAGE', moduleJob: 'BLM'},
+  BLM: {reportJob: 'BLACK_MAGE', moduleJob: 'BLM'},
+  SUMMONER: {reportJob: 'SUMMONER', moduleJob: 'SMN'},
+  SMN: {reportJob: 'SUMMONER', moduleJob: 'SMN'},
+  REDMAGE: {reportJob: 'RED_MAGE', moduleJob: 'RDM'},
+  RED_MAGE: {reportJob: 'RED_MAGE', moduleJob: 'RDM'},
+  RDM: {reportJob: 'RED_MAGE', moduleJob: 'RDM'},
+  PICTOMANCER: {reportJob: 'PICTOMANCER', moduleJob: 'PCT'},
+  PCT: {reportJob: 'PICTOMANCER', moduleJob: 'PCT'},
+  BLUEMAGE: {reportJob: 'BLUE_MAGE', moduleJob: 'BLU'},
+  BLUE_MAGE: {reportJob: 'BLUE_MAGE', moduleJob: 'BLU'},
+  BLU: {reportJob: 'BLUE_MAGE', moduleJob: 'BLU'},
+
+  LIMITBREAK: {reportJob: 'UNKNOWN', moduleJob: undefined},
+  LIMIT_BREAK: {reportJob: 'UNKNOWN', moduleJob: undefined},
+}
+
+const serviceState = {
+  ready: false,
+  shuttingDown: false,
+  server: null,
+  sockets: new Set(),
+  requestSeq: 0,
+  metrics: {
+    startedAt: new Date().toISOString(),
+    requestsTotal: 0,
+    requestsSucceeded: 0,
+    requestsFailed: 0,
+    requestsRejected: 0,
+    requestsTimedOut: 0,
+    bytesInTotal: 0,
+  },
+}
 
 let inFlight = 0
 let cachedModules = null
+let cachedI18n = null
 
-bootstrap()
-startServer()
+try {
+  bootstrap()
+  serviceState.ready = true
+  startServer()
+} catch (err) {
+  logEvent('error', 'bootstrap failed', formatError(err))
+  process.exit(1)
+}
+
+function logEvent(level, message, extra = {}) {
+  const inputLevel = LEVEL_WEIGHT[level] != null ? level : 'info'
+  if (LEVEL_WEIGHT[inputLevel] < (LEVEL_WEIGHT[LOG_LEVEL] ?? LEVEL_WEIGHT.info)) {
+    return
+  }
+
+  const payload = {
+    timestamp: new Date().toISOString(),
+    level: inputLevel,
+    message,
+    ...extra,
+  }
+  process.stdout.write(`${JSON.stringify(payload)}\n`)
+}
 
 function bootstrap() {
+  ensureSymbolMetadata()
+
   if (!process.env.LINGUI_CONFIG) {
     process.env.LINGUI_CONFIG = path.join(xivaRoot, 'lingui.config.ts')
   }
@@ -40,7 +157,16 @@ function bootstrap() {
   registerAssetStubs()
   registerGlobals()
   loadModulesOnce()
+  patchInjection()
   patchMissingDependencies()
+}
+
+function ensureSymbolMetadata() {
+  if (typeof Symbol.metadata === 'undefined') {
+    // Babel decorators runtime stores metadata on Symbol.metadata (or Symbol.for fallback).
+    // Ensure both writer and reader use the same symbol in Node runtime.
+    Symbol.metadata = Symbol.for('Symbol.metadata')
+  }
 }
 
 function loadModulesOnce() {
@@ -71,70 +197,446 @@ function loadModulesOnce() {
   return cachedModules
 }
 
+function patchInjection() {
+  let Parser
+  let Analyser
+  let toposort
+  try {
+    Parser = require(path.join(xivaSrc, 'parser/core/Parser')).Parser
+    Analyser = require(path.join(xivaSrc, 'parser/core/Analyser')).Analyser
+    toposort = require(path.join(xivaRoot, 'node_modules', 'toposort'))
+  } catch (_err) {
+    return
+  }
+
+  if (!Parser || Parser.prototype._xivaInjectionPatched) {
+    return
+  }
+
+  Parser.prototype.configure = async function () {
+    const constructors = await this.loadModuleConstructors()
+    const nodes = Object.keys(constructors)
+    const edges = []
+    nodes.forEach(mod => constructors[mod].dependencies.forEach(dep => {
+      if (OPTIONAL_DEPENDENCY_HANDLES.has(dep.handle)) {
+        return
+      }
+      edges.push([mod, dep.handle])
+    }))
+
+    try {
+      this.executionOrder = toposort.array(nodes, edges).reverse()
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('unknown node')) {
+        throw error
+      }
+
+      const nodeSet = new Set(nodes)
+      const unknown = edges
+        .filter(([_source, target]) => !nodeSet.has(target))
+        .map(([source, target]) => `${source}→${target}`)
+
+      logEvent('warn', 'unregistered modules in dependency graph; pruning edges', {
+        unknownEdges: unknown,
+      })
+
+      const filteredEdges = edges.filter(([_source, target]) => nodeSet.has(target))
+      this.executionOrder = toposort.array(nodes, filteredEdges).reverse()
+    }
+
+    const loadedHandles = []
+    const failedHandles = new Set()
+
+    this.executionOrder.forEach(handle => {
+      const ctor = constructors[handle]
+      const missingDeps = ctor.dependencies
+        .map(dep => dep.handle)
+        .filter(depHandle => !OPTIONAL_DEPENDENCY_HANDLES.has(depHandle))
+        .filter(depHandle => this.container[depHandle] == null || failedHandles.has(depHandle))
+
+      if (missingDeps.length > 0) {
+        failedHandles.add(handle)
+        logEvent('warn', 'skip module due to missing dependencies', {
+          module: handle,
+          missingDependencies: missingDeps,
+        })
+        return
+      }
+
+      let injectable
+      try {
+        injectable = new ctor(this)
+        this.container[handle] = injectable
+        reinjectDependencies(injectable, this.container)
+
+        if (injectable instanceof Analyser) {
+          injectable.initialise()
+        } else {
+          throw new Error(`Unhandled injectable type for initialisation: ${handle}`)
+        }
+      } catch (error) {
+        failedHandles.add(handle)
+        delete this.container[handle]
+        logEvent('warn', 'skip module due to construction failure', {
+          module: handle,
+          error: error instanceof Error ? error.message : String(error),
+        })
+        return
+      }
+
+      loadedHandles.push(handle)
+    })
+
+    this.executionOrder = loadedHandles
+  }
+
+  Parser.prototype._xivaInjectionPatched = true
+}
+
+function reinjectDependencies(instance, container) {
+  const ctor = instance && instance.constructor
+  const deps = ctor && ctor.dependencies ? ctor.dependencies : []
+
+  for (const dependency of deps) {
+    const mapped = typeof dependency === 'string'
+      ? {handle: dependency, prop: dependency}
+      : dependency
+    if (OPTIONAL_DEPENDENCY_HANDLES.has(mapped.handle) && container[mapped.handle] == null) {
+      continue
+    }
+    instance[mapped.prop] = container[mapped.handle]
+  }
+
+  for (const [key, value] of Object.entries(container)) {
+    const proto = Object.getPrototypeOf(instance)
+    const descriptor = Object.getOwnPropertyDescriptor(proto, key)
+    if (descriptor && typeof descriptor.get === 'function') {
+      continue
+    }
+    if (instance[key] === undefined) {
+      instance[key] = value
+    }
+  }
+
+  const aliasMap = {
+    globalCooldown: 'gcd',
+  }
+  for (const [prop, handle] of Object.entries(aliasMap)) {
+    if (instance[prop] == null && container[handle]) {
+      instance[prop] = container[handle]
+    }
+  }
+}
+
 function startServer() {
   const server = http.createServer((req, res) => {
-    if (req.method === 'GET' && req.url === '/health') {
-      res.writeHead(200, {'Content-Type': 'application/json'})
-      res.end(JSON.stringify({status: 'ok'}))
+    const requestId = resolveRequestId(req)
+    res.setHeader('X-Request-Id', requestId)
+
+    const url = new URL(req.url || '/', 'http://localhost')
+    const pathname = url.pathname
+    const method = (req.method || 'GET').toUpperCase()
+
+    if (method === 'GET' && pathname === '/health') {
+      sendJson(res, 200, {
+        status: 'ok',
+        ready: serviceState.ready,
+        shuttingDown: serviceState.shuttingDown,
+        inFlight,
+      })
       return
     }
-    if (req.method !== 'POST' || req.url !== '/analyze') {
-      res.writeHead(404, {'Content-Type': 'application/json'})
-      res.end(JSON.stringify({error: 'not found'}))
+
+    if (method === 'GET' && pathname === '/ready') {
+      if (serviceState.ready && !serviceState.shuttingDown) {
+        sendJson(res, 200, {status: 'ready'})
+      } else {
+        sendJson(res, 503, {
+          status: 'not_ready',
+          ready: serviceState.ready,
+          shuttingDown: serviceState.shuttingDown,
+        })
+      }
+      return
+    }
+
+    if (method === 'GET' && pathname === '/metrics') {
+      sendJson(res, 200, {
+        ...serviceState.metrics,
+        inFlight,
+        uptimeMs: Math.max(0, Date.now() - Date.parse(serviceState.metrics.startedAt)),
+      })
+      return
+    }
+
+    if (method !== 'POST' || pathname !== '/analyze') {
+      sendJson(res, 404, {error: 'not found'})
+      return
+    }
+
+    if (serviceState.shuttingDown || !serviceState.ready) {
+      serviceState.metrics.requestsRejected += 1
+      sendJson(res, 503, {error: 'service unavailable', requestId})
+      return
+    }
+
+    if (API_KEY !== '') {
+      const headerApiKey = req.headers['x-api-key']
+      const suppliedKey = typeof headerApiKey === 'string' ? headerApiKey : ''
+      if (suppliedKey !== API_KEY) {
+        serviceState.metrics.requestsRejected += 1
+        sendJson(res, 401, {error: 'unauthorized', requestId})
+        return
+      }
+    }
+
+    if (!isJsonContentType(req.headers['content-type'])) {
+      serviceState.metrics.requestsRejected += 1
+      sendJson(res, 415, {error: 'content-type must be application/json', requestId})
       return
     }
 
     if (inFlight >= MAX_CONCURRENCY) {
-      res.writeHead(429, {'Content-Type': 'application/json'})
-      res.end(JSON.stringify({error: 'server busy'}))
+      serviceState.metrics.requestsRejected += 1
+      sendJson(res, 429, {error: 'server busy', requestId})
       return
     }
 
-    let body = Buffer.alloc(0)
+    const startedAt = Date.now()
+    const chunks = []
+    let receivedBytes = 0
+    let bodyRejected = false
+
     req.on('data', chunk => {
-      body = Buffer.concat([body, chunk])
-      if (body.length > MAX_BODY_BYTES) {
-        res.writeHead(413, {'Content-Type': 'application/json'})
-        res.end(JSON.stringify({error: 'payload too large'}))
-        req.destroy()
+      if (bodyRejected) {
+        return
       }
+
+      receivedBytes += chunk.length
+      if (receivedBytes > MAX_BODY_BYTES) {
+        bodyRejected = true
+        serviceState.metrics.requestsRejected += 1
+        sendJson(res, 413, {error: 'payload too large', requestId})
+        req.destroy()
+        return
+      }
+
+      chunks.push(chunk)
+    })
+
+    req.on('aborted', () => {
+      logEvent('warn', 'request aborted', {requestId})
+    })
+
+    req.on('error', err => {
+      serviceState.metrics.requestsFailed += 1
+      logEvent('error', 'request stream error', {
+        requestId,
+        error: err && err.message ? err.message : String(err),
+      })
+      sendJson(res, 500, {error: `request error: ${err.message}`, requestId})
     })
 
     req.on('end', async () => {
-      const parsed = parseJSONSafe(body)
+      if (bodyRejected) {
+        return
+      }
+
+      const parsed = parseJSONSafe(Buffer.concat(chunks))
       if (!parsed.ok) {
-        res.writeHead(400, {'Content-Type': 'application/json'})
-        res.end(JSON.stringify({error: `invalid JSON: ${parsed.error}`}))
+        serviceState.metrics.requestsRejected += 1
+        sendJson(res, 400, {error: `invalid JSON: ${parsed.error}`, requestId})
         return
       }
 
       inFlight += 1
+      serviceState.metrics.requestsTotal += 1
+      serviceState.metrics.bytesInTotal += receivedBytes
+
       try {
         const payload = parsed.value || {}
-        const results = await handleAnalyze(payload)
-        res.writeHead(200, {'Content-Type': 'application/json'})
-        res.end(JSON.stringify({results}))
+        const results = await withTimeout(
+          handleAnalyze(payload),
+          ANALYZE_TIMEOUT_MS,
+          `analyze timeout after ${ANALYZE_TIMEOUT_MS}ms`,
+        )
+
+        serviceState.metrics.requestsSucceeded += 1
+        sendJson(res, 200, {
+          requestId,
+          durationMs: Date.now() - startedAt,
+          results,
+        })
+
+        logEvent('info', 'request completed', {
+          requestId,
+          status: 200,
+          durationMs: Date.now() - startedAt,
+          inFlight,
+        })
       } catch (err) {
-    const payload = formatError(err)
-    console.error('[xiva] analyze error:', payload.error)
-    if (payload.stack) {
-      console.error(payload.stack)
-    }
-    res.writeHead(400, {'Content-Type': 'application/json'})
-    res.end(JSON.stringify(payload))
+        const isTimeout = err instanceof TimeoutError
+        if (isTimeout) {
+          serviceState.metrics.requestsTimedOut += 1
+        }
+        serviceState.metrics.requestsFailed += 1
+
+        const status = isTimeout ? 504 : 500
+        const payload = {
+          requestId,
+          ...formatError(err),
+        }
+        sendJson(res, status, payload)
+
+        logEvent('error', 'request failed', {
+          requestId,
+          status,
+          durationMs: Date.now() - startedAt,
+          ...payload,
+        })
       } finally {
         inFlight -= 1
       }
     })
-    req.on('error', err => {
-      res.writeHead(500, {'Content-Type': 'application/json'})
-      res.end(JSON.stringify({error: `request error: ${err.message}`}))
+  })
+
+  serviceState.server = server
+  server.requestTimeout = ANALYZE_TIMEOUT_MS + 5 * 1000
+  server.keepAliveTimeout = 5 * 1000
+
+  server.on('connection', socket => {
+    serviceState.sockets.add(socket)
+    socket.on('close', () => {
+      serviceState.sockets.delete(socket)
+    })
+    if (serviceState.shuttingDown) {
+      socket.destroy()
+    }
+  })
+
+  server.on('error', err => {
+    logEvent('error', 'server error', {
+      error: err && err.message ? err.message : String(err),
     })
   })
 
+  registerShutdownHandlers(server)
+
   server.listen(PORT, HOST, () => {
-    console.log(`xivanalysis server listening on http://${HOST}:${PORT}`)
+    logEvent('info', 'xivanalysis server listening', {
+      host: HOST,
+      port: PORT,
+      maxBodyBytes: MAX_BODY_BYTES,
+      maxConcurrency: MAX_CONCURRENCY,
+      analyzeTimeoutMs: ANALYZE_TIMEOUT_MS,
+      shutdownTimeoutMs: SHUTDOWN_TIMEOUT_MS,
+      apiKeyEnabled: API_KEY !== '',
+      metricsPath: '/metrics',
+      readyPath: '/ready',
+    })
   })
+}
+
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'TimeoutError'
+  }
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new TimeoutError(message))
+    }, timeoutMs)
+
+    Promise.resolve(promise)
+      .then(value => {
+        clearTimeout(timer)
+        resolve(value)
+      })
+      .catch(err => {
+        clearTimeout(timer)
+        reject(err)
+      })
+  })
+}
+
+function registerShutdownHandlers(server) {
+  const shutdown = signal => {
+    if (serviceState.shuttingDown) {
+      return
+    }
+
+    serviceState.shuttingDown = true
+    serviceState.ready = false
+
+    logEvent('warn', 'shutdown initiated', {
+      signal,
+      inFlight,
+      openSockets: serviceState.sockets.size,
+    })
+
+    const forceTimer = setTimeout(() => {
+      for (const socket of serviceState.sockets) {
+        socket.destroy()
+      }
+      logEvent('error', 'shutdown timeout reached; forcing exit', {
+        signal,
+        inFlight,
+        openSockets: serviceState.sockets.size,
+      })
+      process.exit(1)
+    }, SHUTDOWN_TIMEOUT_MS)
+
+    server.close(err => {
+      clearTimeout(forceTimer)
+      if (err) {
+        logEvent('error', 'server close failed', {
+          signal,
+          error: err && err.message ? err.message : String(err),
+        })
+        process.exit(1)
+        return
+      }
+
+      logEvent('info', 'server shutdown completed', {signal})
+      process.exit(0)
+    })
+  }
+
+  process.on('SIGINT', () => shutdown('SIGINT'))
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
+}
+
+function resolveRequestId(req) {
+  const raw = req.headers['x-request-id']
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    return raw.trim().slice(0, 128)
+  }
+
+  serviceState.requestSeq += 1
+  return `req-${Date.now()}-${serviceState.requestSeq}`
+}
+
+function isJsonContentType(contentType) {
+  if (typeof contentType !== 'string') {
+    return false
+  }
+  return contentType.toLowerCase().includes('application/json')
+}
+
+function sendJson(res, statusCode, payload) {
+  if (res.writableEnded) {
+    return
+  }
+
+  const body = JSON.stringify(payload)
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+  })
+  res.end(body)
 }
 
 function formatError(err) {
@@ -177,6 +679,7 @@ async function analyzeRequest(request, index) {
   const xvReport = buildReport(mods, code, report, [pull])
   const firstEvent = report.startTime + fight.startTime
   const adapted = mods.adaptEvents(xvReport, pull, events, firstEvent)
+  ensurePullActorsForAdaptedEvents(mods, pull, adapted)
 
   const resultsByActor = []
   for (const actor of pull.actors) {
@@ -184,6 +687,8 @@ async function analyzeRequest(request, index) {
       continue
     }
 
+    // AVAILABLE_MODULES.JOBS uses full job keys (e.g. WHITE_MAGE), not short aliases (e.g. WHM).
+    // Use actor.job to ensure job modules are merged and checklist contains full checks.
     const meta = buildMeta(mods, pull.encounter.key, actor.job)
     const parser = new mods.Parser({
       meta,
@@ -196,11 +701,30 @@ async function analyzeRequest(request, index) {
     await parser.configure()
     parser.parseEvents({events: adapted})
     const parsedResults = parser.generateResults()
+
+    const moduleErrors = parser._moduleErrors || {}
+    const moduleErrorKeys = Object.keys(moduleErrors)
+    if (process.env.DEBUG_MODULE_ERRORS === '1' && moduleErrorKeys.length > 0) {
+      const summarizedErrors = {}
+      for (const key of moduleErrorKeys) {
+        const err = moduleErrors[key]
+        summarizedErrors[key] = err && err.message ? err.message : String(err)
+      }
+      logEvent('warn', 'parser module errors detected', {
+        reportCode: code,
+        fightId,
+        actorId: actor.id,
+        actorName: actor.name,
+        actorJob: actor.job,
+        moduleErrors: summarizedErrors,
+      })
+    }
+
     resultsByActor.push({
       actorId: actor.id,
       name: actor.name,
       job: actor.job,
-      modules: serializeResults(parsedResults),
+      modules: serializeResults(parsedResults, parser),
     })
   }
 
@@ -324,7 +848,7 @@ function buildPull(mods, report, fight, actorIdsInFight) {
     : undefined
 
   const actors = report.masterData.actors
-    .filter(a => !actorIdsInFight || actorIdsInFight.has(a.id))
+    .filter(a => !actorIdsInFight || actorIdsInFight.has(toActorId(a.id)))
     .map(a => buildActor(mods, a))
 
   return {
@@ -349,35 +873,121 @@ function collectActorIds(events) {
   for (const event of events) {
     const sourceId = event.sourceID ?? event.sourceId
     const targetId = event.targetID ?? event.targetId
-    if (sourceId != null) ids.add(sourceId)
-    if (targetId != null) ids.add(targetId)
+    if (sourceId != null) ids.add(toActorId(sourceId))
+    if (targetId != null) ids.add(toActorId(targetId))
     if (Array.isArray(event.targets)) {
       for (const target of event.targets) {
         const tid = target.targetID ?? target.targetId
-        if (tid != null) ids.add(tid)
+        if (tid != null) ids.add(toActorId(tid))
       }
     }
   }
   return ids
 }
 
+function ensurePullActorsForAdaptedEvents(mods, pull, adaptedEvents) {
+  const existingActorIds = new Set(pull.actors.map(actor => actor.id))
+  const adaptedActorIds = collectAdaptedActorIds(adaptedEvents)
+
+  for (const actorId of adaptedActorIds) {
+    if (existingActorIds.has(actorId)) {
+      continue
+    }
+    pull.actors.push(buildPlaceholderActor(mods, actorId))
+    existingActorIds.add(actorId)
+  }
+}
+
+function collectAdaptedActorIds(events) {
+  const ids = new Set()
+  for (const event of events) {
+    if (event.actor != null) {
+      ids.add(toActorId(event.actor))
+    }
+    if (event.source != null) {
+      ids.add(toActorId(event.source))
+    }
+    if (event.target != null) {
+      ids.add(toActorId(event.target))
+    }
+    if (Array.isArray(event.targets)) {
+      for (const target of event.targets) {
+        if (target && target.target != null) {
+          ids.add(toActorId(target.target))
+        }
+      }
+    }
+  }
+  return ids
+}
+
+function buildPlaceholderActor(mods, actorId) {
+  return {
+    kind: actorId,
+    name: actorId.startsWith('unknown') ? 'Unknown' : `Actor ${actorId}`,
+    team: mods.Team.UNKNOWN != null ? mods.Team.UNKNOWN : mods.Team.FOE,
+    playerControlled: false,
+    job: 'UNKNOWN',
+    moduleJob: undefined,
+    id: actorId,
+  }
+}
+
+function toActorId(id) {
+  return String(id)
+}
+
 function buildActor(mods, actor) {
-  const isPlayer = actor.type === 'Player'
+  const job = normalizeJobKey(actor.subType)
+  const actorType = typeof actor.type === 'string' ? actor.type.toLowerCase() : ''
+  const isPlayer = actorType === 'player'
+  const isFriendly = inferFriendlyActor(actor, actorType)
   return {
     kind: actor.gameID != null ? String(actor.gameID) : String(actor.id),
     name: actor.name,
-    team: isPlayer ? mods.Team.FRIEND : mods.Team.FOE,
-    playerControlled: isPlayer,
-    job: normalizeJobKey(actor.subType),
-    id: actor.id,
+    team: isFriendly ? mods.Team.FRIEND : mods.Team.FOE,
+    playerControlled: isPlayer && job.reportJob !== 'UNKNOWN',
+    job: job.reportJob,
+    moduleJob: job.moduleJob,
+    id: toActorId(actor.id),
   }
+}
+
+function inferFriendlyActor(actor, actorType) {
+  if (actor && typeof actor.friendly === 'boolean') {
+    return actor.friendly
+  }
+  if (actor && typeof actor.hostile === 'boolean') {
+    return !actor.hostile
+  }
+
+  const type = typeof actorType === 'string' ? actorType : ''
+  if (type === 'player' || type === 'pet' || type === 'companion') {
+    return true
+  }
+  if (type === 'npc' || type === 'enemy' || type === 'boss') {
+    return false
+  }
+
+  return false
 }
 
 function normalizeJobKey(subType) {
   if (!subType || typeof subType !== 'string') {
-    return 'UNKNOWN'
+    return {reportJob: 'UNKNOWN', moduleJob: undefined}
   }
-  return subType.trim().toUpperCase().replace(/[-\s]+/g, '_')
+
+  const normalized = subType.trim().toUpperCase().replace(/[-\s]+/g, '_')
+  if (JOB_KEY_MAP[normalized]) {
+    return JOB_KEY_MAP[normalized]
+  }
+
+  const compact = normalized.replace(/_/g, '')
+  if (JOB_KEY_MAP[compact]) {
+    return JOB_KEY_MAP[compact]
+  }
+
+  return {reportJob: normalized, moduleJob: undefined}
 }
 
 function buildMeta(mods, encounterKey, job) {
@@ -385,31 +995,767 @@ function buildMeta(mods, encounterKey, job) {
   if (encounterKey && mods.AVAILABLE_MODULES.BOSSES[encounterKey]) {
     meta = meta.merge(mods.AVAILABLE_MODULES.BOSSES[encounterKey])
   }
-  if (mods.AVAILABLE_MODULES.JOBS[job]) {
+  if (job && mods.AVAILABLE_MODULES.JOBS[job]) {
     meta = meta.merge(mods.AVAILABLE_MODULES.JOBS[job])
   }
   return meta
 }
 
-function serializeResults(results) {
+function serializeResults(results, parser) {
   const React = require(path.join(xivaRoot, 'node_modules', 'react'))
   const {renderToStaticMarkup} = require(path.join(xivaRoot, 'node_modules', 'react-dom', 'server'))
+  const {I18nProvider} = require(path.join(xivaRoot, 'node_modules', '@lingui', 'react'))
+  const {Provider: DbTooltipProvider} = require(path.join(xivaSrc, 'components/ui/DbLink'))
+  const linguiI18n = getLinguiI18n()
+  const includeHtml = OUTPUT_MODE === 'html' || OUTPUT_MODE === 'both'
+
   return results.map(result => {
-    let html = ''
-    try {
-      html = renderToStaticMarkup(result.markup)
-    } catch (_err) {
-      html = '[render-error]'
+    const moduleInstance = parser && parser.container ? parser.container[result.handle] : undefined
+    const metrics = extractModuleMetrics(result.handle, moduleInstance)
+
+    let html
+    if (includeHtml) {
+      try {
+        const withTooltipProvider = React.createElement(
+          DbTooltipProvider,
+          null,
+          result.markup,
+        )
+        const wrapped = React.createElement(
+          I18nProvider,
+          {i18n: linguiI18n, defaultComponent: LinguiDefaultWrapper},
+          withTooltipProvider,
+        )
+        html = renderToStaticMarkup(wrapped)
+      } catch (err) {
+        html = '[render-error]'
+        if (process.env.DEBUG_RENDER_ERRORS === '1') {
+          logEvent('warn', 'module render failed', {
+            module: result.handle,
+            error: err && err.message ? err.message : String(err),
+          })
+        }
+      }
     }
-    const name = result.name && result.name.id ? result.name.id : result.handle
-    return {
+
+    const name = resolveResultName(result, parser)
+    const output = {
       handle: result.handle,
       name,
       mode: result.mode,
       order: result.order,
-      html,
+      metrics,
+    }
+
+    if (includeHtml) {
+      output.html = html
+    }
+
+    return output
+  })
+}
+
+function resolveResultName(result, parser) {
+  if (result && result.name && typeof result.name.id === 'string') {
+    return translateMessageId(result.name.id, typeof result.name.message === 'string' ? result.name.message : undefined)
+  }
+  const fallback = reactNodeToText(result ? result.name : undefined, parser)
+  return fallback || (result && result.handle ? result.handle : '')
+}
+
+function extractModuleMetrics(handle, moduleInstance) {
+  if (!moduleInstance || typeof moduleInstance !== 'object') {
+    return {}
+  }
+
+  const normalizedHandle = typeof handle === 'string' ? handle.toLowerCase() : ''
+  const metrics = {}
+
+  if (normalizedHandle === 'checklist') {
+    Object.assign(metrics, extractChecklistMetrics(moduleInstance))
+  } else if (normalizedHandle === 'suggestions') {
+    Object.assign(metrics, extractSuggestionsMetrics(moduleInstance))
+  } else if (normalizedHandle === 'statistics') {
+    Object.assign(metrics, extractStatisticsMetrics(moduleInstance))
+  } else if (normalizedHandle === 'defensives' || normalizedHandle === 'utilities') {
+    Object.assign(metrics, extractUtilitiesMetrics(moduleInstance))
+  } else if (normalizedHandle === 'meikyo' || normalizedHandle === 'tincture') {
+    Object.assign(metrics, extractActionWindowMetrics(moduleInstance))
+  } else if (normalizedHandle === 'sen') {
+    Object.assign(metrics, extractSenMetrics(moduleInstance))
+  } else if (normalizedHandle === 'higanbana') {
+    Object.assign(metrics, extractDotMetrics(moduleInstance))
+  } else if (normalizedHandle === 'aoeusages') {
+    Object.assign(metrics, extractAoEUsageMetrics(moduleInstance))
+  }
+
+  if (typeof moduleInstance.getTotalDelay === 'function') {
+    try {
+      metrics.totalDelayMs = Number(moduleInstance.getTotalDelay()) || 0
+    } catch (_err) {
+      // noop
+    }
+  }
+
+  if (typeof moduleInstance.getIssueData === 'function') {
+    try {
+      const issues = moduleInstance.getIssueData()
+      if (Array.isArray(issues)) {
+        metrics.issueCount = issues.length
+        if (issues.length > 0) {
+          metrics.issues = issues.map(issue => ({
+            timestamp: issue && issue.timestamp != null ? Number(issue.timestamp) : undefined,
+            startMs: issue && issue.start != null ? Number(issue.start) : undefined,
+            stopMs: issue && issue.stop != null ? Number(issue.stop) : undefined,
+            delayMs: issue && issue.delay != null ? Number(issue.delay) : undefined,
+          }))
+        }
+      }
+    } catch (_err) {
+      // noop
+    }
+  }
+
+  if (typeof moduleInstance.gcdsCounted === 'number') {
+    metrics.gcdCount = moduleInstance.gcdsCounted
+  }
+
+  if (Object.keys(metrics).length === 0) {
+    Object.assign(metrics, extractGenericModuleMetrics(handle, moduleInstance))
+  }
+
+  return metrics
+}
+
+function extractGenericModuleMetrics(handle, moduleInstance) {
+  const metrics = {
+    extractor: 'generic',
+    handle: typeof handle === 'string' ? handle : '',
+  }
+
+  const ctorName = moduleInstance && moduleInstance.constructor && moduleInstance.constructor.name
+  if (typeof ctorName === 'string' && ctorName.length > 0) {
+    metrics.moduleClass = ctorName
+  }
+
+  const counters = {}
+
+  if (Array.isArray(moduleInstance && moduleInstance.trackedActions)) {
+    counters.trackedActionCount = moduleInstance.trackedActions.length
+  }
+
+  if (Array.isArray(moduleInstance && moduleInstance.trackedStatuses)) {
+    counters.trackedStatusCount = moduleInstance.trackedStatuses.length
+  }
+
+  if (Array.isArray(moduleInstance && moduleInstance.senStateWindows)) {
+    counters.windowCount = moduleInstance.senStateWindows.length
+  }
+
+  const historyEntries = moduleInstance && moduleInstance.history && Array.isArray(moduleInstance.history.entries)
+    ? moduleInstance.history.entries
+    : undefined
+  if (Array.isArray(historyEntries)) {
+    counters.windowCount = historyEntries.length
+  }
+
+  if (moduleInstance && moduleInstance.badUsages && typeof moduleInstance.badUsages.size === 'number') {
+    counters.badUsageKeyCount = moduleInstance.badUsages.size
+  }
+
+  if (moduleInstance && moduleInstance.statusApplications && typeof moduleInstance.statusApplications.size === 'number') {
+    counters.statusApplicationTargetCount = moduleInstance.statusApplications.size
+  }
+
+  if (Object.keys(counters).length > 0) {
+    metrics.counters = counters
+  }
+
+  if (!metrics.moduleClass) {
+    metrics.moduleClass = 'UnknownModule'
+  }
+
+  return metrics
+}
+
+function extractActionWindowMetrics(moduleInstance) {
+  const parser = moduleInstance && moduleInstance.parser ? moduleInstance.parser : undefined
+  const pullStart = parser && parser.pull && typeof parser.pull.timestamp === 'number'
+    ? parser.pull.timestamp
+    : 0
+
+  const historyEntries = Array.isArray(moduleInstance && moduleInstance.history && moduleInstance.history.entries)
+    ? moduleInstance.history.entries
+    : []
+
+  const windows = historyEntries.map(entry => {
+    const start = entry && typeof entry.start === 'number' ? entry.start : undefined
+    const end = entry && typeof entry.end === 'number' ? entry.end : undefined
+    const actions = Array.isArray(entry && entry.data) ? entry.data : []
+    const actionCounts = countActionsById(actions)
+
+    return {
+      startMs: typeof start === 'number' ? Math.max(0, start - pullStart) : undefined,
+      endMs: typeof end === 'number' ? Math.max(0, end - pullStart) : undefined,
+      durationMs: typeof start === 'number' && typeof end === 'number' ? Math.max(0, end - start) : undefined,
+      actionCount: actions.length,
+      actions: actionCounts,
     }
   })
+
+  const totalTrackedActions = windows.reduce((sum, window) => sum + (window.actionCount || 0), 0)
+
+  return {
+    windowCount: windows.length,
+    totalTrackedActions,
+    averageActionsPerWindow: windows.length > 0 ? totalTrackedActions / windows.length : 0,
+    windows,
+  }
+}
+
+function extractSenMetrics(moduleInstance) {
+  const parser = moduleInstance && moduleInstance.parser ? moduleInstance.parser : undefined
+  const pullStart = parser && parser.pull && typeof parser.pull.timestamp === 'number'
+    ? parser.pull.timestamp
+    : 0
+
+  const windows = Array.isArray(moduleInstance && moduleInstance.senStateWindows)
+    ? moduleInstance.senStateWindows
+    : []
+
+  const serializedWindows = windows.map(window => {
+    const rotation = Array.isArray(window && window.rotation) ? window.rotation : []
+    const actionCounts = countActionsById(rotation)
+
+    return {
+      startMs: typeof window.start === 'number' ? Math.max(0, window.start - pullStart) : undefined,
+      endMs: typeof window.end === 'number' ? Math.max(0, window.end - pullStart) : undefined,
+      isNonStandard: !!(window && window.isNonStandard),
+      hasHagakure: !!(window && window.hasHagakure),
+      hasOverwrite: !!(window && window.hasOverwrite),
+      isDeath: !!(window && window.isDeath),
+      totalSenGenerated: numberFromUnknown(window ? window.totalSenGenerated : undefined),
+      wastedSens: numberFromUnknown(window ? window.wastedSens : undefined),
+      currentSens: numberFromUnknown(window ? window.currentSens : undefined),
+      kenkiGained: numberFromUnknown(window ? window.kenkiGained : undefined),
+      reason: reactNodeToText(window && window.senCode ? window.senCode.message : undefined, parser),
+      rotationCount: rotation.length,
+      actions: actionCounts,
+    }
+  })
+
+  return {
+    windowCount: serializedWindows.length,
+    nonStandardWindowCount: numberFromUnknown(moduleInstance && moduleInstance.nonStandardCount),
+    hagakureWindowCount: numberFromUnknown(moduleInstance && moduleInstance.hagakureCount),
+    wastedSens: numberFromUnknown(moduleInstance && moduleInstance.wasted),
+    windows: serializedWindows,
+  }
+}
+
+function extractDotMetrics(moduleInstance) {
+  const parser = moduleInstance && moduleInstance.parser ? moduleInstance.parser : undefined
+  const trackedStatuses = Array.isArray(moduleInstance && moduleInstance.trackedStatuses)
+    ? moduleInstance.trackedStatuses
+    : []
+
+  const statuses = trackedStatuses.map(statusId => {
+    const status = safeCall(() => moduleInstance.data.getStatus(statusId), undefined)
+    const name = reactNodeToText(status ? status.name : undefined, parser)
+    const uptimePercent = safeCall(() => moduleInstance.getUptimePercent(statusId), undefined)
+    const clippingAmount = safeCall(() => moduleInstance.getClippingAmount(statusId), undefined)
+
+    const statusApplications = moduleInstance && moduleInstance.statusApplications
+    const tracked = statusApplications && typeof statusApplications.get === 'function'
+      ? statusApplications.get(statusId)
+      : undefined
+
+    let targetCount = 0
+    let applicationCount = 0
+    if (tracked && typeof tracked.size === 'number') {
+      targetCount = tracked.size
+      if (typeof tracked.forEach === 'function') {
+        tracked.forEach(targetTracking => {
+          const timestamps = Array.isArray(targetTracking && targetTracking.applicationTimestamps)
+            ? targetTracking.applicationTimestamps
+            : []
+          applicationCount += timestamps.length
+        })
+      }
+    }
+
+    return {
+      id: Number(statusId),
+      name: name || `Status ${statusId}`,
+      uptimePercent: numberFromUnknown(uptimePercent),
+      clippingPerMinuteMs: numberFromUnknown(clippingAmount),
+      targetCount,
+      applicationCount,
+    }
+  })
+
+  const primaryUptime = statuses.length > 0 ? statuses[0].uptimePercent : undefined
+
+  return {
+    trackedStatusCount: statuses.length,
+    uptimePercent: primaryUptime,
+    statuses,
+  }
+}
+
+function extractAoEUsageMetrics(moduleInstance) {
+  const parser = moduleInstance && moduleInstance.parser ? moduleInstance.parser : undefined
+  const trackedActions = Array.isArray(moduleInstance && moduleInstance.trackedActions)
+    ? moduleInstance.trackedActions
+    : []
+
+  const badUsageMap = moduleInstance && moduleInstance.badUsages && typeof moduleInstance.badUsages.get === 'function'
+    ? moduleInstance.badUsages
+    : undefined
+
+  const actions = trackedActions.map(tracked => {
+    const aoeAction = tracked && tracked.aoeAction ? tracked.aoeAction : undefined
+    const aoeId = aoeAction && aoeAction.id != null ? Number(aoeAction.id) : undefined
+    const badUsages = badUsageMap && aoeId != null
+      ? Number(badUsageMap.get(aoeId) || 0)
+      : 0
+
+    const stActions = Array.isArray(tracked && tracked.stActions) ? tracked.stActions : []
+
+    return {
+      aoeActionId: aoeId,
+      aoeActionName: reactNodeToText(aoeAction ? aoeAction.name : undefined, parser) || (aoeId != null ? `Action ${aoeId}` : 'Action'),
+      minTargets: tracked && tracked.minTargets != null ? Number(tracked.minTargets) : undefined,
+      badUsages,
+      stAlternatives: stActions.map(action => ({
+        id: action && action.id != null ? Number(action.id) : undefined,
+        name: reactNodeToText(action ? action.name : undefined, parser) || (action && action.id != null ? `Action ${action.id}` : 'Action'),
+      })),
+    }
+  })
+
+  const totalBadUsages = actions.reduce((sum, action) => sum + (action.badUsages || 0), 0)
+
+  return {
+    trackedActionCount: actions.length,
+    badActionCount: actions.filter(action => (action.badUsages || 0) > 0).length,
+    totalBadUsages,
+    actions,
+  }
+}
+
+function countActionsById(events) {
+  const actionCountMap = new Map()
+
+  for (const event of events) {
+    const actionId = event && event.action != null ? Number(event.action) : undefined
+    if (!Number.isFinite(actionId)) {
+      continue
+    }
+    actionCountMap.set(actionId, (actionCountMap.get(actionId) || 0) + 1)
+  }
+
+  return Array.from(actionCountMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([id, count]) => ({id, count}))
+}
+
+function extractUtilitiesMetrics(moduleInstance) {
+  const parser = moduleInstance && moduleInstance.parser ? moduleInstance.parser : undefined
+  const trackedActions = Array.isArray(moduleInstance.trackedActions) ? moduleInstance.trackedActions : []
+
+  const actions = trackedActions.map(action => {
+    const uses = safeCall(() => moduleInstance.getUsageCount(action), undefined)
+    const maxUses = safeCall(() => moduleInstance.getMaxUses(action), undefined)
+    const actionName = reactNodeToText(action && action.name ? action.name : undefined, parser)
+
+    return {
+      id: action && action.id != null ? Number(action.id) : undefined,
+      name: actionName || (action && action.id != null ? `Action ${action.id}` : 'Action'),
+      uses: typeof uses === 'number' ? uses : undefined,
+      maxUses: typeof maxUses === 'number' ? maxUses : undefined,
+      usageRate: typeof uses === 'number' && typeof maxUses === 'number' && maxUses > 0
+        ? (uses / maxUses) * 100
+        : undefined,
+    }
+  })
+
+  const totalUses = actions.reduce((sum, action) => sum + (typeof action.uses === 'number' ? action.uses : 0), 0)
+  const totalMaxUses = actions.reduce((sum, action) => sum + (typeof action.maxUses === 'number' ? action.maxUses : 0), 0)
+
+  return {
+    trackedActionCount: actions.length,
+    totalUses,
+    totalMaxUses: totalMaxUses > 0 ? totalMaxUses : undefined,
+    overallUsageRate: totalMaxUses > 0 ? (totalUses / totalMaxUses) * 100 : undefined,
+    actions,
+  }
+}
+
+function safeCall(fn, fallback) {
+  try {
+    return fn()
+  } catch (_err) {
+    return fallback
+  }
+}
+
+function extractChecklistMetrics(moduleInstance) {
+  const parser = moduleInstance && moduleInstance.parser ? moduleInstance.parser : undefined
+  const rules = Array.isArray(moduleInstance.rules) ? moduleInstance.rules : []
+  const serializedRules = rules.map(rule => {
+    const requirements = Array.isArray(rule.requirements) ? rule.requirements : []
+    const serializedRequirements = requirements.map(req => {
+      const percent = req && req.percent != null ? Number(req.percent) : 0
+      const target = req && req.target != null ? Number(req.target) : 0
+      const value = req && req.value != null ? Number(req.value) : undefined
+      return {
+        name: reactNodeToText(req ? req.name : undefined, parser),
+        percent,
+        value,
+        target,
+        weight: req && req.weight != null ? Number(req.weight) : 1,
+        passed: percent >= target,
+        display: formatRequirementDisplay(value, target, percent),
+      }
+    })
+
+    const percent = rule && rule.percent != null ? Number(rule.percent) : 0
+    const target = rule && rule.target != null ? Number(rule.target) : 0
+    return {
+      name: reactNodeToText(rule ? rule.name : undefined, parser),
+      description: reactNodeToText(rule ? rule.description : undefined, parser),
+      percent,
+      target,
+      passed: !!(rule && rule.passed),
+      requirements: serializedRequirements,
+    }
+  })
+
+  const passedRules = serializedRules.filter(rule => rule.passed).length
+  const averagePercent = serializedRules.length > 0
+    ? serializedRules.reduce((sum, rule) => sum + rule.percent, 0) / serializedRules.length
+    : 0
+
+  const grouped = serializedRules.map((rule, ruleIndex) => ({
+    main: rule.name || `Rule ${ruleIndex + 1}`,
+    percent: rule.percent,
+    target: rule.target,
+    passed: rule.passed,
+    display: formatPercent(rule.percent),
+    internal: rule.requirements.map((requirement, reqIndex) => ({
+      name: requirement.name || `Requirement ${reqIndex + 1}`,
+      value: buildGroupedInternalDisplay(requirement),
+      passed: requirement.passed,
+      percent: requirement.percent,
+      target: requirement.target,
+    })),
+  }))
+
+  const groupedLines = []
+  for (const item of grouped) {
+    groupedLines.push(`主 ${item.main}`)
+    for (const inner of item.internal) {
+      groupedLines.push(`内部 ${inner.name}: ${inner.value}`)
+    }
+  }
+
+  return {
+    ruleCount: serializedRules.length,
+    passedRules,
+    failedRules: Math.max(0, serializedRules.length - passedRules),
+    averagePercent,
+    rules: serializedRules,
+    grouped,
+    groupedLines,
+  }
+}
+
+function extractSuggestionsMetrics(moduleInstance) {
+  const suggestions = Array.isArray(moduleInstance._suggestions) ? moduleInstance._suggestions : []
+  const serialized = suggestions.map(suggestion => {
+    const severityRaw = suggestion && suggestion.severity != null ? Number(suggestion.severity) : undefined
+    return {
+      severity: Number.isFinite(severityRaw) ? severityRaw : undefined,
+      severityRaw: severityRaw != null ? String(severityRaw) : undefined,
+      value: suggestion && suggestion.value != null ? Number(suggestion.value) : undefined,
+      content: reactNodeToText(suggestion ? suggestion.content : undefined, moduleInstance && moduleInstance.parser),
+      why: reactNodeToText(suggestion ? suggestion.why : undefined, moduleInstance && moduleInstance.parser),
+    }
+  })
+
+  const severityCount = {}
+  for (const item of serialized) {
+    const key = item.severity != null
+      ? String(item.severity)
+      : item.severityRaw || 'unknown'
+    severityCount[key] = (severityCount[key] || 0) + 1
+  }
+
+  return {
+    suggestionCount: serialized.length,
+    severityCount,
+    suggestions: serialized,
+  }
+}
+
+function extractStatisticsMetrics(moduleInstance) {
+  const stats = Array.isArray(moduleInstance.statistics) ? moduleInstance.statistics : []
+
+  const serialized = stats.map(stat => {
+    const one = {
+      type: stat && stat.constructor ? stat.constructor.name : 'UnknownStatistic',
+      width: stat && stat.width != null ? Number(stat.width) : undefined,
+      height: stat && stat.height != null ? Number(stat.height) : undefined,
+      displayOrder: stat && stat.statsDisplayOrder != null ? Number(stat.statsDisplayOrder) : undefined,
+    }
+
+    if (Array.isArray(stat && stat.data)) {
+      const values = stat.data
+        .map(item => (item && item.value != null ? Number(item.value) : 0))
+        .filter(value => !Number.isNaN(value))
+      one.series = values
+      one.total = values.reduce((sum, value) => sum + value, 0)
+    }
+
+    if (Array.isArray(stat && stat.rows)) {
+      one.rowCount = stat.rows.length
+    }
+
+    const numericValue = numberFromUnknown(stat ? stat.value : undefined)
+    if (numericValue != null) {
+      one.value = numericValue
+    }
+
+    one.title = reactNodeToText(stat ? stat.title : undefined, moduleInstance && moduleInstance.parser)
+    return one
+  })
+
+  return {
+    statisticCount: serialized.length,
+    statistics: serialized,
+  }
+}
+
+function numberFromUnknown(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string') {
+    const matched = value.replace(/,/g, '').match(/-?\d+(\.\d+)?/)
+    if (matched) {
+      return Number(matched[0])
+    }
+  }
+  return null
+}
+
+function formatPercent(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) {
+    return ''
+  }
+  return `${number.toFixed(2)}%`
+}
+
+function formatValue(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) {
+    return ''
+  }
+  if (Math.abs(number - Math.round(number)) < 1e-9) {
+    return String(Math.round(number))
+  }
+  return number.toFixed(2)
+}
+
+function formatRequirementDisplay(value, target, percent) {
+  if (value != null && target != null && Number.isFinite(Number(target)) && Number(target) > 0) {
+    return `${formatValue(value)} / ${formatValue(target)} (${formatPercent(percent)})`
+  }
+  return formatPercent(percent)
+}
+
+function buildGroupedInternalDisplay(requirement) {
+  if (!requirement) {
+    return ''
+  }
+  if (requirement.value != null && requirement.target != null && Number.isFinite(Number(requirement.target)) && Number(requirement.target) > 0) {
+    return `${formatValue(requirement.value)} / ${formatValue(requirement.target)} (${formatPercent(requirement.percent)})`
+  }
+  return formatPercent(requirement.percent)
+}
+
+function prettifyKey(key) {
+  if (!key || typeof key !== 'string') {
+    return ''
+  }
+  return key
+    .toLowerCase()
+    .split('_')
+    .filter(Boolean)
+    .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ')
+}
+
+function resolveActionName(actionKey, parser) {
+  const actions = parser && parser.container && parser.container.data && parser.container.data.actions
+  const action = actions && actionKey ? actions[actionKey] : undefined
+  const fromData = action && action.name ? reactNodeToText(action.name, parser) : ''
+  return fromData || prettifyKey(actionKey)
+}
+
+function resolveStatusName(statusKey, parser) {
+  const statuses = parser && parser.container && parser.container.data && parser.container.data.statuses
+  const status = statuses && statusKey ? statuses[statusKey] : undefined
+  const fromData = status && status.name ? reactNodeToText(status.name, parser) : ''
+  return fromData || prettifyKey(statusKey)
+}
+
+function decodeHtmlEntities(text) {
+  if (!text) {
+    return ''
+  }
+  return text
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#x27;/g, "'")
+    .replace(/&quot;/g, '"')
+}
+
+function htmlToPlainText(html) {
+  if (!html) {
+    return ''
+  }
+  const noTags = String(html).replace(/<[^>]+>/g, ' ')
+  return decodeHtmlEntities(noTags).replace(/\s+/g, ' ').trim()
+}
+
+function translateMessageId(id, fallback) {
+  if (!id || typeof id !== 'string') {
+    return fallback || ''
+  }
+  try {
+    const i18n = getLinguiI18n()
+    const translated = i18n._({id, message: fallback || id})
+    if (typeof translated === 'string' && translated.trim() !== '') {
+      return translated
+    }
+  } catch (_err) {
+    // noop
+  }
+  return fallback || id
+}
+
+function renderNodeToText(node, parser) {
+  try {
+    const React = require(path.join(xivaRoot, 'node_modules', 'react'))
+    const {renderToStaticMarkup} = require(path.join(xivaRoot, 'node_modules', 'react-dom', 'server'))
+    const {I18nProvider} = require(path.join(xivaRoot, 'node_modules', '@lingui', 'react'))
+    const {Provider: DbTooltipProvider} = require(path.join(xivaSrc, 'components/ui/DbLink'))
+    const {DataContextProvider} = require(path.join(xivaSrc, 'components/DataContext'))
+    const linguiI18n = getLinguiI18n()
+
+    let wrapped = node
+    if (parser && parser.patch) {
+      wrapped = React.createElement(DataContextProvider, {patch: parser.patch}, wrapped)
+    }
+    wrapped = React.createElement(DbTooltipProvider, null, wrapped)
+    wrapped = React.createElement(I18nProvider, {i18n: linguiI18n, defaultComponent: LinguiDefaultWrapper}, wrapped)
+
+    const html = renderToStaticMarkup(wrapped)
+    return htmlToPlainText(html)
+  } catch (_err) {
+    return ''
+  }
+}
+
+function reactNodeToText(node, parser) {
+  if (node == null || typeof node === 'boolean') {
+    return ''
+  }
+  if (typeof node === 'string' || typeof node === 'number') {
+    return String(node)
+  }
+  if (Array.isArray(node)) {
+    return node.map(item => reactNodeToText(item, parser)).join('').trim()
+  }
+  if (typeof node === 'object' && typeof node.id === 'string') {
+    return translateMessageId(node.id, typeof node.message === 'string' ? node.message : undefined)
+  }
+  if (typeof node === 'object' && node.props) {
+    if (typeof node.props.action === 'string') {
+      return resolveActionName(node.props.action, parser)
+    }
+    if (typeof node.props.status === 'string') {
+      return resolveStatusName(node.props.status, parser)
+    }
+    if (typeof node.props.item === 'string') {
+      return resolveActionName(node.props.item, parser)
+    }
+    if (typeof node.props.id === 'string') {
+      const renderedWithChildren = renderNodeToText(node, parser)
+      if (renderedWithChildren) {
+        return renderedWithChildren
+      }
+      return translateMessageId(node.props.id, typeof node.props.message === 'string' ? node.props.message : undefined)
+    }
+    if (typeof node.props.message === 'string') {
+      return node.props.message
+    }
+    const fromChildren = reactNodeToText(node.props.children, parser)
+    if (fromChildren) {
+      return fromChildren
+    }
+    const rendered = renderNodeToText(node, parser)
+    if (rendered) {
+      return rendered
+    }
+    return ''
+  }
+  return ''
+}
+
+function LinguiDefaultWrapper(props) {
+  return props && props.translation != null ? props.translation : null
+}
+
+function normalizeLinguiCatalog(rawCatalog) {
+  if (!rawCatalog || typeof rawCatalog !== 'object') {
+    return {}
+  }
+  if (rawCatalog.messages && typeof rawCatalog.messages === 'object') {
+    return rawCatalog.messages
+  }
+  return rawCatalog
+}
+
+function getLinguiI18n() {
+  if (cachedI18n) {
+    return cachedI18n
+  }
+
+  const {i18n} = require(path.join(xivaRoot, 'node_modules', '@lingui', 'core'))
+  const enCatalog = require(path.join(xivaRoot, 'locale', 'en', 'messages.json'))
+  i18n.load('en', normalizeLinguiCatalog(enCatalog))
+
+  let activeLocale = 'en'
+  if (OUTPUT_LOCALE !== 'en') {
+    try {
+      const targetCatalog = require(path.join(xivaRoot, 'locale', OUTPUT_LOCALE, 'messages.json'))
+      i18n.load(OUTPUT_LOCALE, normalizeLinguiCatalog(targetCatalog))
+      activeLocale = OUTPUT_LOCALE
+    } catch (_err) {
+      // Keep English fallback if target locale is unavailable.
+      activeLocale = 'en'
+    }
+  }
+
+  i18n.activate(activeLocale)
+  cachedI18n = i18n
+  return cachedI18n
 }
 
 function patchMissingDependencies() {
@@ -464,6 +1810,38 @@ function patchMissingDependencies() {
     return originalAddDataGroup.apply(this, args)
   }
   ResourceGraphs.prototype._xivaDepsPatched = true
+
+  const speedAdjustmentsPath = path.join(xivaSrc, 'parser/core/modules/SpeedAdjustments')
+  let SpeedAdjustments
+  try {
+    SpeedAdjustments = require(speedAdjustmentsPath).SpeedAdjustments
+  } catch (_err) {
+    return
+  }
+
+  if (!SpeedAdjustments || SpeedAdjustments.prototype._xivaFallbackPatched) {
+    return
+  }
+
+  const originalGetAdjustedDuration = SpeedAdjustments.prototype.getAdjustedDuration
+  SpeedAdjustments.prototype.getAdjustedDuration = function (opts) {
+    try {
+      return originalGetAdjustedDuration.call(this, opts)
+    } catch (_err) {
+      return opts?.duration ?? 2500
+    }
+  }
+
+  const originalIsAdjustmentEstimated = SpeedAdjustments.prototype.isAdjustmentEstimated
+  SpeedAdjustments.prototype.isAdjustmentEstimated = function (opts) {
+    try {
+      return originalIsAdjustmentEstimated.call(this, opts)
+    } catch (_err) {
+      return true
+    }
+  }
+
+  SpeedAdjustments.prototype._xivaFallbackPatched = true
 }
 
 function preseedCoreModules(parser) {

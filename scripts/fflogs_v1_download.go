@@ -43,6 +43,11 @@ type eventsResponse struct {
 	NextPageTimestamp *int64                   `json:"nextPageTimestamp"`
 }
 
+type savedEventsPayload struct {
+	Events []map[string]interface{} `json:"events"`
+	Count  int                      `json:"count"`
+}
+
 type fightSummary struct {
 	ID               int     `json:"id"`
 	Name             string  `json:"name"`
@@ -136,13 +141,20 @@ func main() {
 		}
 
 		eventsPath := filepath.Join(outputRoot, fmt.Sprintf("fight_%d_events.json", fight.ID))
-		writeJSON(eventsPath, events)
+		writeJSON(eventsPath, toSavedEventsPayload(events))
 
 		fightSummary := summarizeFight(fight, events)
 		summary.Fights = append(summary.Fights, fightSummary)
 	}
 
 	writeJSON(filepath.Join(outputRoot, "report_summary.json"), summary)
+}
+
+func toSavedEventsPayload(events []map[string]interface{}) savedEventsPayload {
+	return savedEventsPayload{
+		Events: events,
+		Count:  len(events),
+	}
 }
 
 func fetchFights(client *http.Client, baseURL, apiKey, code string) (*fightsResponse, error) {

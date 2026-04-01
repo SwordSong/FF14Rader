@@ -51,6 +51,11 @@ type v1EventsResponse struct {
 	NextPageTimestamp *int64                   `json:"nextPageTimestamp"`
 }
 
+type v1SavedEventsPayload struct {
+	Events []map[string]interface{} `json:"events"`
+	Count  int                      `json:"count"`
+}
+
 type allReportsFightEntry struct {
 	SourceID   string
 	AbsStart   int64
@@ -363,6 +368,13 @@ func truncate(input string, max int) string {
 	return input[:max]
 }
 
+func toV1SavedEventsPayload(events []map[string]interface{}) v1SavedEventsPayload {
+	return v1SavedEventsPayload{
+		Events: events,
+		Count:  len(events),
+	}
+}
+
 func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey, rootDir string, playerID uint, code string, pending []pendingFightEntry, fightWorkers int, fightTimeout time.Duration) (int, bool, error) {
 	fights, err := fetchV1Fights(ctx, client, baseURL, apiKey, code)
 	if err != nil {
@@ -439,7 +451,7 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 			}
 
 			eventsPath := filepath.Join(reportDir, fmt.Sprintf("fight_%d_events.json", fight.ID))
-			if err := writeJSON(eventsPath, events); err != nil {
+			if err := writeJSON(eventsPath, toV1SavedEventsPayload(events)); err != nil {
 				if firstErr.Load() == nil {
 					firstErr.Store(err)
 				}

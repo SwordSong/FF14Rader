@@ -182,6 +182,30 @@ BEGIN
 			SELECT 1 FROM information_schema.columns
 			WHERE table_name = 'fight_sync_maps' AND column_name = 'name'
 		)
+		OR NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'fight_sync_maps' AND column_name = 'boss_percentage'
+		)
+		OR NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'fight_sync_maps' AND column_name = 'fight_percentage'
+		)
+		OR NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'fight_sync_maps' AND column_name = 'floor'
+		)
+		OR NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'fight_sync_maps' AND column_name = 'game_zone'
+		)
+		OR NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'fight_sync_maps' AND column_name = 'difficulty'
+		)
+		OR NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name = 'fight_sync_maps' AND column_name = 'encounter_id'
+		)
 		OR EXISTS (
 			SELECT 1 FROM information_schema.columns
 			WHERE table_name = 'fight_sync_maps' AND column_name = 'boss_name'
@@ -193,14 +217,6 @@ BEGIN
 		OR EXISTS (
 			SELECT 1 FROM information_schema.columns
 			WHERE table_name = 'fight_sync_maps' AND column_name = 'title'
-		)
-		OR EXISTS (
-			SELECT 1 FROM information_schema.columns
-			WHERE table_name = 'fight_sync_maps' AND column_name = 'start_time'
-		)
-		OR EXISTS (
-			SELECT 1 FROM information_schema.columns
-			WHERE table_name = 'fight_sync_maps' AND column_name = 'end_time'
 		)
 		OR EXISTS (
 			SELECT 1 FROM information_schema.columns
@@ -233,25 +249,48 @@ BEGIN
 		INSERT INTO fight_sync_maps_new (
 			id, master_id, source_ids, player_id, timestamp,
 			fight_id, kill, job, downloaded, downloaded_at, parsed_done,
-			start_time, end_time, name, boss_percentage
+			start_time, end_time, name, boss_percentage,
+			fight_percentage, floor, game_zone, difficulty, encounter_id
 		)
 		SELECT
-			id,
-			master_id,
-			source_ids,
-			player_id,
-			timestamp,
-			fight_id,
-			kill,
-			job,
-			COALESCE(downloaded, false),
-			downloaded_at,
-			COALESCE(parsed_done, false),
-			start_time,
-			end_time,
-			boss_name,
-			wipe_progress
-		FROM fight_sync_maps;
+			src.id,
+			COALESCE(NULLIF(to_jsonb(src)->>'master_id', ''), src.id::text),
+			COALESCE(to_jsonb(src)->'source_ids', '[]'::jsonb),
+			NULLIF(to_jsonb(src)->>'player_id', '')::bigint,
+			COALESCE(
+				NULLIF(to_jsonb(src)->>'timestamp', '')::bigint,
+				NULLIF(to_jsonb(src)->>'start_time', '')::bigint,
+				0
+			),
+			COALESCE(NULLIF(to_jsonb(src)->>'fight_id', '')::integer, 0),
+			COALESCE(NULLIF(to_jsonb(src)->>'kill', '')::boolean, false),
+			COALESCE(to_jsonb(src)->>'job', ''),
+			COALESCE(NULLIF(to_jsonb(src)->>'downloaded', '')::boolean, false),
+			NULLIF(to_jsonb(src)->>'downloaded_at', '')::timestamptz,
+			COALESCE(NULLIF(to_jsonb(src)->>'parsed_done', '')::boolean, false),
+			COALESCE(NULLIF(to_jsonb(src)->>'start_time', '')::bigint, 0),
+			COALESCE(
+				NULLIF(to_jsonb(src)->>'end_time', '')::bigint,
+				COALESCE(NULLIF(to_jsonb(src)->>'start_time', '')::bigint, 0)
+				+ COALESCE(NULLIF(to_jsonb(src)->>'duration', '')::bigint, 0)
+			),
+			COALESCE(
+				NULLIF(to_jsonb(src)->>'name', ''),
+				NULLIF(to_jsonb(src)->>'boss_name', ''),
+				NULLIF(to_jsonb(src)->>'title', ''),
+				''
+			),
+			COALESCE(
+				NULLIF(to_jsonb(src)->>'boss_percentage', '')::double precision,
+				NULLIF(to_jsonb(src)->>'wipe_progress', '')::double precision,
+				0
+			),
+			COALESCE(NULLIF(to_jsonb(src)->>'fight_percentage', '')::double precision, 0),
+			COALESCE(NULLIF(to_jsonb(src)->>'floor', ''), ''),
+			COALESCE(to_jsonb(src)->'game_zone', '{}'::jsonb),
+			COALESCE(NULLIF(to_jsonb(src)->>'difficulty', '')::integer, 0),
+			COALESCE(NULLIF(to_jsonb(src)->>'encounter_id', '')::integer, 0)
+		FROM fight_sync_maps src;
 
 		DROP TABLE fight_sync_maps;
 		ALTER TABLE fight_sync_maps_new RENAME TO fight_sync_maps;
