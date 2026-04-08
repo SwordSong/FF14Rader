@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/user/ff14rader/internal/db"
 	"github.com/user/ff14rader/internal/models"
+	"github.com/user/ff14rader/internal/scoring"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -23,24 +25,40 @@ import (
 // SyncManager 同步管理器
 type SyncManager struct {
 	client *FFLogsClient
+	scorer *scoring.Service
 }
 
 func NewSyncManager(client *FFLogsClient) *SyncManager {
-	return &SyncManager{client: client}
+	return &SyncManager{client: client, scorer: scoring.NewServiceFromEnv()}
 }
 
 // StartIncrementalSync 开始增量同步
 func (s *SyncManager) StartIncrementalSync(ctx context.Context, playerID uint, name, server, region string) error {
 	log.Printf("开始同步玩家 [%s-%s] 的数据...", name, server)
 	region = "CN"
+	newlyCreated := false
 
 	if playerID == 0 {
-		resolvedID, err := ensurePlayerID(name, server, region)
+		resolvedID, created, err := ensurePlayerID(name, server, region)
 		if err != nil {
 			return fmt.Errorf("resolve player failed: %v", err)
 		}
 		playerID = resolvedID
+		newlyCreated = created
 	}
+
+	allowV2Query, reason, err := shouldRunV2ReportQuery(playerID, newlyCreated)
+	if err != nil {
+		return fmt.Errorf("check v2 query gate failed: %v", err)
+	}
+	if !allowV2Query {
+		log.Printf("[INFO] 跳过 V2 reports 查询: %s", reason)
+		if _, err := s.downloadV1Reports(ctx, playerID); err != nil {
+			return err
+		}
+		return s.refreshPlayerOutputAbilityFromLogs(ctx, playerID, name, server, region)
+	}
+	log.Printf("[INFO] 执行 V2 reports 查询: %s", reason)
 
 	// 确保去重键的唯一索引存在（避免并发创建重复 master 行）
 	// (name, timestamp) 足以区分同一场战斗
@@ -154,7 +172,16 @@ func (s *SyncManager) StartIncrementalSync(ctx context.Context, playerID uint, n
 	oldest, count := getOldestReportTimeFromReports(reports)
 	if count == 0 {
 		log.Printf("[INFO] 未发现报告数据，结束同步")
-		return nil
+		if err := s.scorePendingDownloadedFights(ctx, playerID); err != nil {
+			log.Printf("[SCORE] pending score pass failed on empty report set: %v", err)
+		}
+		if err := markCompletedReportParseLogs(playerID); err != nil {
+			return err
+		}
+		if err := s.refreshPlayerOutputAbilityFromLogs(ctx, playerID, name, serverSlug, region); err != nil {
+			return err
+		}
+		return touchPlayerV2ReportCheckedAt(playerID)
 	}
 
 	allReports := append([]interface{}{}, reports...)
@@ -265,14 +292,17 @@ func (s *SyncManager) StartIncrementalSync(ctx context.Context, playerID uint, n
 
 	log.Printf("[INFO] 汇总报告数量: %d", len(allReports))
 	// 5. 处理报告列表，构建战斗映射并存储 fight_sync_maps，同时记录 reports 以便后续解析和 V1 下载
-	allReportsCode, err := s.syncAllReportsMetadata(playerID, name, serverSlug, allReports)
-	if err != nil {
+	if err := s.syncAllReportsMetadata(playerID, name, allReports); err != nil {
 		return err
-	} else {
-		_, err := s.downloadV1Reports(ctx, playerID, allReportsCode)
-		if err != nil {
-			return err
-		}
+	}
+	if _, err := s.downloadV1Reports(ctx, playerID); err != nil {
+		return err
+	}
+	if err := s.refreshPlayerOutputAbilityFromLogs(ctx, playerID, name, serverSlug, region); err != nil {
+		return err
+	}
+	if err := touchPlayerV2ReportCheckedAt(playerID); err != nil {
+		return err
 	}
 
 	return nil
@@ -301,6 +331,151 @@ func (s *SyncManager) selfHealReportDownloadStatus(playerID uint) error {
 	}
 
 	return nil
+}
+
+func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID uint) error {
+	if s.scorer == nil {
+		return nil
+	}
+
+	var maps []models.FightSyncMap
+	if err := db.DB.Select("id", "master_id").
+		Where("player_id = ? AND downloaded = ? AND (parsed_done = ? OR scored_at IS NULL OR scored_at < ?)", playerID, true, false, time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC)).
+		Find(&maps).Error; err != nil {
+		return fmt.Errorf("load pending scoring fights failed: %v", err)
+	}
+	if len(maps) == 0 {
+		return nil
+	}
+
+	workerCount := getScoreConcurrency()
+	log.Printf("[SCORE] pending fights=%d workers=%d", len(maps), workerCount)
+	sem := make(chan struct{}, workerCount)
+	var wg sync.WaitGroup
+
+	for _, mapping := range maps {
+		code, fightID, ok := splitMasterID(mapping.MasterID)
+		if !ok {
+			continue
+		}
+
+		wg.Add(1)
+		go func(mappingID uint, reportCode string, fightID int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			scoreCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer cancel()
+
+			if err := s.scorer.ScoreFight(scoreCtx, playerID, reportCode, fightID); err != nil {
+				if scoring.IsNoMatchedActorError(err) {
+					if markErr := markFightSkippedNoMatch(mappingID); markErr != nil {
+						log.Printf("[SCORE] fight %s-%d skip-mark failed: %v", reportCode, fightID, markErr)
+						return
+					}
+					log.Printf("[SCORE] fight %s-%d skipped (player not in actor list)", reportCode, fightID)
+					return
+				}
+				log.Printf("[SCORE] fight %s-%d failed: %v", reportCode, fightID, err)
+				return
+			}
+
+			if err := db.DB.Model(&models.FightSyncMap{}).
+				Where("id = ?", mappingID).
+				Update("parsed_done", true).Error; err != nil {
+				log.Printf("[SCORE] mark parsed_done failed (%s-%d): %v", reportCode, fightID, err)
+				return
+			}
+			log.Printf("[SCORE] fight scored %s-%d", reportCode, fightID)
+		}(mapping.ID, code, fightID)
+	}
+
+	wg.Wait()
+	return nil
+}
+
+func getScoreConcurrency() int {
+	const defaultConcurrency = 2
+	if raw := strings.TrimSpace(os.Getenv("FFLOGS_SCORE_CONCURRENCY")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			return v
+		}
+	}
+
+	parsePositiveInt := func(key string) int {
+		raw := strings.TrimSpace(os.Getenv(key))
+		if raw == "" {
+			return 0
+		}
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			return 0
+		}
+		return v
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("XIVA_EXECUTION_MODE")))
+	threadWorkers := parsePositiveInt("XIVA_THREAD_POOL_SIZE")
+	if threadWorkers == 0 {
+		threadWorkers = parsePositiveInt("XIVA_PORT_COUNT")
+	}
+	perWorker := parsePositiveInt("XIVA_CALL_CONCURRENCY")
+	if perWorker == 0 {
+		perWorker = 1
+	}
+
+	switch mode {
+	case "thread", "threads":
+		if threadWorkers > 0 {
+			return threadWorkers * perWorker
+		}
+	case "process", "processes", "pool":
+		if threadWorkers > 0 {
+			return threadWorkers * perWorker
+		}
+	default:
+		// Keep default behavior aligned with xiva server: PORT_COUNT>1 means single-process thread pool unless forced process mode.
+		if threadWorkers > 0 {
+			return threadWorkers * perWorker
+		}
+	}
+
+	if v := parsePositiveInt("XIVA_CALL_CONCURRENCY"); v > 0 {
+		return v
+	}
+	return defaultConcurrency
+}
+
+func markFightSkippedNoMatch(mappingID uint) error {
+	var row models.FightSyncMap
+	if err := db.DB.Select("job").Where("id = ?", mappingID).First(&row).Error; err != nil {
+		return err
+	}
+
+	normalizedJob := scoring.CanonicalJobKey(row.Job)
+	if normalizedJob == "" {
+		normalizedJob = strings.ToUpper(strings.TrimSpace(row.Job))
+	}
+
+	return db.DB.Model(&models.FightSyncMap{}).
+		Where("id = ?", mappingID).
+		Updates(map[string]interface{}{
+			"job":                   normalizedJob,
+			"parsed_done":           true,
+			"scored_at":             time.Now(),
+			"score_actor_name":      "SKIPPED_NO_MATCH",
+			"checklist_abs":         0,
+			"checklist_confidence":  0,
+			"checklist_adj":         0,
+			"suggestion_penalty":    0,
+			"utility_score":         0,
+			"survival_penalty":      0,
+			"job_module_score":      0,
+			"battle_score":          0,
+			"fight_weight":          0,
+			"weighted_battle_score": 0,
+		}).Error
 }
 
 func (s *SyncManager) processSyncData(playerID uint, charName string, data map[string]interface{}) error {
@@ -385,6 +560,7 @@ func (s *SyncManager) processSyncReports(playerID uint, charName string, reports
 		if actorID == 0 {
 			continue
 		}
+		actorNameByID := resolveActorNameMap(reportMap)
 
 		filtered := make([]fightInfo, 0)
 		for _, f := range fights {
@@ -432,6 +608,7 @@ func (s *SyncManager) processSyncReports(playerID uint, charName string, reports
 				fEnd:           int64(fEnd),
 				actorID:        actorID,
 				playerJob:      playerJob,
+				friendPlayers:  resolveFriendlyPlayerNames(fight, actorNameByID),
 			})
 		}
 
@@ -518,23 +695,25 @@ func (s *SyncManager) processSyncReports(playerID uint, charName string, reports
 				// s.saveFightCache(master.reportFightID, master.fightTimestamp, int(master.fEnd-master.fStart), deaths, vulns, avoidable, percentile, combinedRaw)
 
 				batch = append(batch, models.FightSyncMap{
-					MasterID:        master.reportFightID,
-					SourceIDs:       master.sourceIDs,
-					PlayerID:        playerID,
-					Timestamp:       master.fightTimestamp,
-					FightID:         master.fightID,
-					Kill:            fight["kill"].(bool),
-					Job:             playerJob,
-					Downloaded:      false,
-					StartTime:       master.fStart,
-					EndTime:         master.fEnd,
-					Name:            master.name,
-					BossPercentage:  bossPercentage,
-					FightPercentage: fightPercentage,
-					Floor:           master.floor,
-					GameZone:        gameZoneJSON,
-					Difficulty:      difficulty,
-					EncounterID:     encounterID,
+					MasterID:            master.reportFightID,
+					SourceIDs:           master.sourceIDs,
+					FriendPlayers:       master.friendPlayers,
+					FriendPlayersUsable: isFriendPlayersUsable(master.friendPlayers),
+					PlayerID:            playerID,
+					Timestamp:           master.fightTimestamp,
+					FightID:             master.fightID,
+					Kill:                fight["kill"].(bool),
+					Job:                 playerJob,
+					Downloaded:          false,
+					StartTime:           master.fStart,
+					EndTime:             master.fEnd,
+					Name:                master.name,
+					BossPercentage:      bossPercentage,
+					FightPercentage:     fightPercentage,
+					Floor:               master.floor,
+					GameZone:            gameZoneJSON,
+					Difficulty:          difficulty,
+					EncounterID:         encounterID,
 				})
 			}
 
@@ -568,6 +747,8 @@ func (s *SyncManager) writeReports(playerID uint, masters []*masterFight, report
 			set = make(map[string]struct{})
 			entries[masterCode] = set
 		}
+		// Ensure a canonical self-row exists for each master report.
+		set[masterCode] = struct{}{}
 		for _, sourceID := range master.sourceIDs {
 			sourceCode, ok := splitReportCode(sourceID)
 			if !ok || sourceCode == "" {
@@ -597,7 +778,7 @@ func (s *SyncManager) writeReports(playerID uint, masters []*masterFight, report
 		}
 		if meta, ok := reportMetadata[masterCode]; ok {
 			if err := db.DB.Model(&models.Report{}).
-				Where("player_id = ? AND master_report = ? AND source_report = master_report", playerID, masterCode).
+				Where("player_id = ? AND master_report = ?", playerID, masterCode).
 				Update("report_metadata", meta).Error; err != nil {
 				return fmt.Errorf("update reports metadata failed: %v", err)
 			}
@@ -816,14 +997,14 @@ func getPageConcurrency() int {
 	return defaultConcurrency
 }
 
-// syncAllReportsMetadata 同步所有报告的元数据，返回生成的 allReportsCode、待下载的 V1 报告列表，以及可能的错误
-func (s *SyncManager) syncAllReportsMetadata(playerID uint, name, server string, reports []interface{}) (string, error) {
+// syncAllReportsMetadata 同步所有报告元数据并写入 reports/fight_sync_maps。
+func (s *SyncManager) syncAllReportsMetadata(playerID uint, name string, reports []interface{}) error {
 	if len(reports) == 0 {
-		return "", nil
+		return nil
 	}
 	//这里的逻辑是先处理报告列表，提取报告代码，并与数据库中已有的报告解析日志进行对比，确定哪些报告是新的需要下载的 V1 报告，同时更新数据库中的报告解析日志状态，以便后续下载和处理。
 	if err := s.processSyncReports(playerID, name, reports); err != nil {
-		return "", err
+		return err
 	}
 
 	// if err := os.MkdirAll(getAllReportsDir(), 0755); err != nil {
@@ -834,25 +1015,10 @@ func (s *SyncManager) syncAllReportsMetadata(playerID uint, name, server string,
 	// 	return "", nil, fmt.Errorf("write reports snapshot failed: %v", err)
 	// }
 
-	// 构建全量报告的唯一标识代码，格式为 ALL_REPORTS_{NAME}_{SERVER}，其中 NAME 和 SERVER 都是去除空格并替换为下划线的字符串
-	allReportsCode := buildAllReportsCode(name, server)
-	var player models.Player
-	// 先查询玩家记录，获取当前已知的 allReportsCode 和 allReportCodes 列表
-	if err := db.DB.Clauses(dbresolver.Write).Where("id = ?", playerID).First(&player).Error; err != nil {
-		return "", fmt.Errorf("load player failed: %v", err)
-	}
-	// 如果当前玩家记录的 allReportsCode 为空或与新生成的 allReportsCode 不同，则更新数据库中的 allReportsCode 字段，并更新 player 变量中的 allReportsCode 字段值，以保持内存和数据库的一致性
-	if player.AllReportsCode == "" || player.AllReportsCode != allReportsCode {
-		if err := db.DB.Model(&player).Update("all_reports_code", allReportsCode).Error; err != nil {
-			return "", fmt.Errorf("update all_reports_code failed: %v", err)
-		}
-		player.AllReportsCode = allReportsCode
-	}
-
-	return allReportsCode, nil
+	return nil
 }
 
-// buildAllReportsCode 构建全量报告的唯一标识代码，格式为 ALL_REPORTS_{NAME}_{SERVER}，其中 NAME 和 SERVER 都是去除空格并替换为下划线的字符串
+// finalizeAllReportsDownloads 将已完成下载的报告标记到 reports，并更新玩家 all_report_codes。
 func (s *SyncManager) finalizeAllReportsDownloads(playerID uint, downloaded []string) error {
 	if len(downloaded) == 0 {
 		return nil
@@ -916,6 +1082,14 @@ func (s *SyncManager) batchUpsertFightSyncMaps(maps []models.FightSyncMap) error
 					"UNION SELECT jsonb_array_elements(COALESCE(EXCLUDED.source_ids, '[]'::jsonb)) AS value" +
 					") AS merged)",
 			),
+			"friendplayers": gorm.Expr(
+				"CASE " +
+					"WHEN jsonb_array_length(COALESCE(EXCLUDED.friendplayers, '[]'::jsonb)) >= jsonb_array_length(COALESCE(fight_sync_maps.friendplayers, '[]'::jsonb)) " +
+					"THEN COALESCE(EXCLUDED.friendplayers, '[]'::jsonb) " +
+					"ELSE COALESCE(fight_sync_maps.friendplayers, '[]'::jsonb) " +
+					"END",
+			),
+			"friendplayers_usable": gorm.Expr("COALESCE(fight_sync_maps.friendplayers_usable, false) OR COALESCE(EXCLUDED.friendplayers_usable, false)"),
 		}),
 	}).CreateInBatches(maps, 200).Error
 }
@@ -942,25 +1116,122 @@ func uniqueReportCodes(reports []interface{}) []string {
 	return out
 }
 
-// 构建全量报告的唯一标识代码，格式为 ALL_REPORTS_{NAME}_{SERVER}，其中 NAME 和 SERVER 都是去除空格并替换为下划线的字符串
-func buildAllReportsCode(name, server string) string {
-	name = strings.TrimSpace(name)
-	server = strings.TrimSpace(server)
-	name = strings.ReplaceAll(name, " ", "_")
-	server = strings.ReplaceAll(server, " ", "_")
-	return fmt.Sprintf("ALL_REPORTS_%s_%s", name, server)
-}
-
 // 辅助函数：检查 Actor 是否在某场战斗中
 func (s *SyncManager) isActorInFight(fight map[string]interface{}, actorID int) bool {
-	if friends, ok := fight["friendlyPlayers"].([]interface{}); ok {
-		for _, fid := range friends {
-			if int(fid.(float64)) == actorID {
-				return true
-			}
+	for _, fid := range parseFriendlyPlayerIDs(fight["friendlyPlayers"]) {
+		if fid == actorID {
+			return true
 		}
 	}
 	return false
+}
+
+func resolveActorNameMap(reportMap map[string]interface{}) map[int]string {
+	out := make(map[int]string)
+	md, ok := reportMap["masterData"].(map[string]interface{})
+	if !ok {
+		return out
+	}
+	actors, ok := md["actors"].([]interface{})
+	if !ok {
+		return out
+	}
+	for _, actorAny := range actors {
+		actor, ok := actorAny.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		actorType, _ := actor["type"].(string)
+		if actorType != "" && !strings.EqualFold(strings.TrimSpace(actorType), "player") {
+			continue
+		}
+		idRaw, ok := actor["id"].(float64)
+		if !ok {
+			continue
+		}
+		name, _ := actor["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if shouldExcludeFriendlyPlayerName(name) {
+			continue
+		}
+		out[int(idRaw)] = name
+	}
+	return out
+}
+
+func resolveFriendlyPlayerNames(fight map[string]interface{}, actorNameByID map[int]string) []string {
+	ids := parseFriendlyPlayerIDs(fight["friendlyPlayers"])
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		name := strings.TrimSpace(actorNameByID[id])
+		if name == "" {
+			continue
+		}
+		if shouldExcludeFriendlyPlayerName(name) {
+			continue
+		}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func shouldExcludeFriendlyPlayerName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	return n == "multiple players" || n == "limit break" || n == "limitbreak"
+}
+
+func isFriendPlayersUsable(names []string) bool {
+	// 8人本要求完整队伍名单（含自己）才用于开荒速度计算。
+	return len(names) == 8
+}
+
+func parseFriendlyPlayerIDs(v interface{}) []int {
+	friends, ok := v.([]interface{})
+	if !ok || len(friends) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(friends))
+	out := make([]int, 0, len(friends))
+	for _, fid := range friends {
+		id, ok := parseFriendlyPlayerID(fid)
+		if !ok {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+func parseFriendlyPlayerID(v interface{}) (int, bool) {
+	switch val := v.(type) {
+	case float64:
+		return int(val), true
+	case int:
+		return val, true
+	case int64:
+		return int(val), true
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(val))
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }
 
 // containsString checks if a slice contains a string; avoids repeated linear scans inline.
@@ -994,6 +1265,7 @@ type fightInfo struct {
 	fEnd           int64
 	actorID        int
 	playerJob      string
+	friendPlayers  []string
 }
 
 type masterFight struct {
@@ -1219,11 +1491,11 @@ func (s *SyncManager) upsertFightSyncMap(newMap models.FightSyncMap) {
 }
 
 // ensurePlayerID 确保玩家记录存在，返回玩家 ID；如果不存在则创建新记录
-func ensurePlayerID(name, server, region string) (uint, error) {
+func ensurePlayerID(name, server, region string) (uint, bool, error) {
 	var player models.Player
 	err := db.DB.Clauses(dbresolver.Write).Where("name = ? AND server = ? AND region = ?", name, server, region).First(&player).Error
 	if err == nil {
-		return player.ID, nil
+		return player.ID, false, nil
 	}
 
 	newPlayer := models.Player{
@@ -1232,10 +1504,204 @@ func ensurePlayerID(name, server, region string) (uint, error) {
 		Region: region,
 	}
 	if errCreate := db.DB.Clauses(dbresolver.Write).Create(&newPlayer).Error; errCreate != nil {
-		return 0, errCreate
+		return 0, false, errCreate
 	}
 
-	return newPlayer.ID, nil
+	return newPlayer.ID, true, nil
+}
+
+func shouldRunV2ReportQuery(playerID uint, newlyCreated bool) (bool, string, error) {
+	if playerID == 0 {
+		return true, "player_id=0 fallback", nil
+	}
+	if newlyCreated {
+		return true, "新创建玩家，首次同步直接查询", nil
+	}
+
+	var player models.Player
+	if err := db.DB.Select("id", "created_at", "updated_at").Where("id = ?", playerID).First(&player).Error; err != nil {
+		return false, "", err
+	}
+
+	if player.UpdatedAt.IsZero() {
+		return true, "updated_at 为空，执行查询", nil
+	}
+
+	if player.CreatedAt.Equal(player.UpdatedAt) {
+		if time.Since(player.CreatedAt) < 24*time.Hour {
+			return true, "新创建玩家（created_at==updated_at 且 <24h）", nil
+		}
+	}
+
+	age := time.Since(player.UpdatedAt)
+	if age >= 24*time.Hour {
+		return true, fmt.Sprintf("updated_at 超过24小时（%.1fh）", age.Hours()), nil
+	}
+
+	return false, fmt.Sprintf("updated_at 距今 %.1fh，未超过24小时", age.Hours()), nil
+}
+
+func touchPlayerV2ReportCheckedAt(playerID uint) error {
+	if playerID == 0 {
+		return nil
+	}
+	return db.DB.Model(&models.Player{}).
+		Where("id = ?", playerID).
+		UpdateColumn("updated_at", time.Now()).Error
+}
+
+func (s *SyncManager) refreshPlayerOutputAbilityFromLogs(ctx context.Context, playerID uint, name, server, region string) error {
+	name = strings.TrimSpace(name)
+	server = strings.TrimSpace(server)
+	region = strings.TrimSpace(region)
+	if playerID == 0 || name == "" || server == "" || region == "" {
+		return nil
+	}
+
+	ability, err := s.fetchCharacterOutputAbility(ctx, name, server, region)
+	if err != nil {
+		return err
+	}
+
+	return db.DB.Model(&models.Player{}).
+		Where("id = ?", playerID).
+		UpdateColumn("output_ability", ability).Error
+}
+
+func (s *SyncManager) fetchCharacterOutputAbility(ctx context.Context, name, server, region string) (float64, error) {
+	query := `
+	query ($name: String, $server: String, $region: String) {
+		rateLimitData {
+			limitPerHour
+			pointsSpentThisHour
+			pointsResetIn
+		}
+		characterData {
+			character(name: $name, serverSlug: $server, serverRegion: $region) {
+				zoneRankings(difficulty: 101, metric: rdps)
+			}
+		}
+	}`
+
+	data, err := s.client.ExecuteQuery(ctx, query, map[string]interface{}{
+		"name":   name,
+		"server": server,
+		"region": region,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("fetch character logs ranking failed: %v", err)
+	}
+
+	characterData, _ := data["characterData"].(map[string]interface{})
+	character, _ := characterData["character"].(map[string]interface{})
+	if character == nil {
+		return 0, fmt.Errorf("character not found in logs ranking response")
+	}
+
+	zoneRankingsRaw, exists := character["zoneRankings"]
+	if !exists || zoneRankingsRaw == nil {
+		return 0, fmt.Errorf("zoneRankings missing in logs ranking response")
+	}
+
+	ability, ok := extractOutputAbilityFromZoneRankings(zoneRankingsRaw)
+	if !ok {
+		return 0, fmt.Errorf("unable to parse output ability from zoneRankings")
+	}
+
+	return clampPercent(ability), nil
+}
+
+func extractOutputAbilityFromZoneRankings(raw interface{}) (float64, bool) {
+	switch v := raw.(type) {
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, false
+		}
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+			return 0, false
+		}
+		return extractOutputAbilityFromZoneRankings(parsed)
+	case map[string]interface{}:
+		if val, ok := parseRankingEntryFloat(v, "bestPerformanceAverage", "medianPerformanceAverage", "averagePerformance"); ok && val > 0 {
+			return val, true
+		}
+		if rankings, ok := v["rankings"].([]interface{}); ok {
+			if avg, ok := extractPercentileFromRankingEntries(rankings); ok {
+				return avg, true
+			}
+		}
+		if entries, ok := v["data"].([]interface{}); ok {
+			if avg, ok := extractPercentileFromRankingEntries(entries); ok {
+				return avg, true
+			}
+		}
+	case []interface{}:
+		if avg, ok := extractPercentileFromRankingEntries(v); ok {
+			return avg, true
+		}
+	}
+	return 0, false
+}
+
+func extractPercentileFromRankingEntries(entries []interface{}) (float64, bool) {
+	if len(entries) == 0 {
+		return 0, false
+	}
+	sum := 0.0
+	count := 0.0
+	for _, item := range entries {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		percentile, ok := parseRankingEntryFloat(entry, "percentile", "rankPercent", "rank_percent")
+		if !ok || percentile <= 0 {
+			continue
+		}
+		sum += percentile
+		count++
+	}
+	if count == 0 {
+		return 0, false
+	}
+	return sum / count, true
+}
+
+func clampPercent(v float64) float64 {
+	if v < 0 {
+		v = 0
+	}
+	if v > 100 {
+		v = 100
+	}
+	return math.Round(v*100) / 100
+}
+
+func parseRankingEntryFloat(entry map[string]interface{}, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		value, ok := entry[key]
+		if !ok || value == nil {
+			continue
+		}
+		switch v := value.(type) {
+		case float64:
+			return v, true
+		case float32:
+			return float64(v), true
+		case int:
+			return float64(v), true
+		case int64:
+			return float64(v), true
+		case string:
+			parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+			if err == nil {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (s *SyncManager) fetchFullReportTableData(reportCode string) (map[string]interface{}, error) {

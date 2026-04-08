@@ -13,6 +13,8 @@ import (
 
 var DB *gorm.DB
 
+const currentDBSchemaVersion = "2026-04-07-v10"
+
 func InitDB(writeDSN, readDSN string) {
 	var err error
 
@@ -34,6 +36,11 @@ func InitDB(writeDSN, readDSN string) {
 	}, &models.Player{}, &models.Report{}, &models.FightSyncMap{}))
 	if err != nil {
 		log.Fatalf("无法注册读写分离插件 (dbresolver): %v", err)
+	}
+
+	if shouldSkip, reason := shouldSkipMigrations(DB); shouldSkip {
+		log.Printf("跳过数据库迁移：%s", reason)
+		return
 	}
 
 	// 3. 自动迁移表结构 (在 Master 执行)
@@ -108,6 +115,7 @@ END
 $$;`)
 	_ = DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_reports_player_source ON reports (player_id, source_report);`)
 	_ = DB.Exec(`DROP TABLE IF EXISTS fight_caches;`)
+	_ = DB.Exec(`DROP TABLE IF EXISTS fight_scores;`)
 	_ = DB.Exec(`DROP TABLE IF EXISTS performances;`)
 	// 先尝试将旧的 text[] source_ids 转为 jsonb，避免自动迁移失败
 	_ = DB.Exec(`DO $$
@@ -227,6 +235,8 @@ BEGIN
 			id bigserial PRIMARY KEY,
 			master_id varchar(100),
 			source_ids jsonb,
+			friendplayers jsonb,
+			friendplayers_usable boolean DEFAULT false,
 			player_id bigint,
 			timestamp bigint,
 			fight_id integer,
@@ -247,7 +257,7 @@ BEGIN
 		);
 
 		INSERT INTO fight_sync_maps_new (
-			id, master_id, source_ids, player_id, timestamp,
+			id, master_id, source_ids, friendplayers, friendplayers_usable, player_id, timestamp,
 			fight_id, kill, job, downloaded, downloaded_at, parsed_done,
 			start_time, end_time, name, boss_percentage,
 			fight_percentage, floor, game_zone, difficulty, encounter_id
@@ -256,6 +266,8 @@ BEGIN
 			src.id,
 			COALESCE(NULLIF(to_jsonb(src)->>'master_id', ''), src.id::text),
 			COALESCE(to_jsonb(src)->'source_ids', '[]'::jsonb),
+			COALESCE(to_jsonb(src)->'friendplayers', to_jsonb(src)->'friend_players', '[]'::jsonb),
+			COALESCE(NULLIF(to_jsonb(src)->>'friendplayers_usable', '')::boolean, NULLIF(to_jsonb(src)->>'friend_players_usable', '')::boolean, false),
 			NULLIF(to_jsonb(src)->>'player_id', '')::bigint,
 			COALESCE(
 				NULLIF(to_jsonb(src)->>'timestamp', '')::bigint,
@@ -302,6 +314,28 @@ $$;`)
 BEGIN
 	IF EXISTS (
 		SELECT 1 FROM information_schema.tables
+		WHERE table_name = 'players'
+	) THEN
+		ALTER TABLE players DROP COLUMN IF EXISTS output_percentile_sum;
+		ALTER TABLE players DROP COLUMN IF EXISTS output_percentile_count;
+		ALTER TABLE players DROP COLUMN IF EXISTS execution_percentile_sum;
+		ALTER TABLE players DROP COLUMN IF EXISTS execution_percentile_count;
+	END IF;
+
+	IF EXISTS (
+		SELECT 1 FROM information_schema.tables
+		WHERE table_name = 'fight_sync_maps'
+	) THEN
+		ALTER TABLE fight_sync_maps DROP COLUMN IF EXISTS percentile_aggregated;
+		ALTER TABLE fight_sync_maps DROP COLUMN IF EXISTS output_percentile;
+		ALTER TABLE fight_sync_maps DROP COLUMN IF EXISTS execution_percentile;
+	END IF;
+END
+$$;`)
+	_ = DB.Exec(`DO $$
+BEGIN
+	IF EXISTS (
+		SELECT 1 FROM information_schema.tables
 		WHERE table_name = 'fight_sync_maps'
 	) THEN
 		UPDATE fight_sync_maps
@@ -311,9 +345,158 @@ BEGIN
 	END IF;
 END
 $$;`)
+	_ = DB.Exec(`DO $$
+BEGIN
+	IF EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_name = 'players' AND column_name = 'all_reports_code'
+	) THEN
+		ALTER TABLE players DROP COLUMN all_reports_code;
+	END IF;
+END
+$$;`)
 	err = DB.AutoMigrate(&models.Player{}, &models.Report{}, &models.FightSyncMap{})
 	if err != nil {
 		log.Fatalf("数据库迁移失败: %v", err)
 	}
+	if err := setSchemaVersion(DB, currentDBSchemaVersion); err != nil {
+		log.Printf("[WARN] 写入数据库 schema 版本失败: %v", err)
+	}
 	log.Println("数据库表结构迁移成功。")
+}
+
+func shouldSkipMigrations(db *gorm.DB) (bool, string) {
+	if err := ensureSchemaMetaTable(db); err != nil {
+		log.Printf("[WARN] 初始化 schema_meta 失败，将使用结构探测: %v", err)
+	} else {
+		version, ok, err := getSchemaVersion(db)
+		if err != nil {
+			log.Printf("[WARN] 读取 schema 版本失败，将使用结构探测: %v", err)
+		} else if ok && version == currentDBSchemaVersion {
+			return true, "schema 版本已匹配"
+		}
+	}
+
+	if schemaLooksCurrent(db) {
+		if err := setSchemaVersion(db, currentDBSchemaVersion); err != nil {
+			log.Printf("[WARN] 回填 schema 版本失败: %v", err)
+		}
+		return true, "已满足当前表结构要求"
+	}
+
+	return false, "需要执行迁移"
+}
+
+func ensureSchemaMetaTable(db *gorm.DB) error {
+	return db.Exec(`CREATE TABLE IF NOT EXISTS schema_meta (
+		meta_key varchar(100) PRIMARY KEY,
+		meta_value text NOT NULL,
+		updated_at timestamptz NOT NULL DEFAULT now()
+	);`).Error
+}
+
+func getSchemaVersion(db *gorm.DB) (string, bool, error) {
+	type schemaMetaRow struct {
+		MetaValue string
+	}
+	var row schemaMetaRow
+	tx := db.Raw("SELECT meta_value FROM schema_meta WHERE meta_key = ?", "db_schema_version").Scan(&row)
+	if tx.Error != nil {
+		return "", false, tx.Error
+	}
+	if tx.RowsAffected == 0 {
+		return "", false, nil
+	}
+	return row.MetaValue, true, nil
+}
+
+func setSchemaVersion(db *gorm.DB, version string) error {
+	return db.Exec(`
+		INSERT INTO schema_meta (meta_key, meta_value, updated_at)
+		VALUES ('db_schema_version', ?, now())
+		ON CONFLICT (meta_key)
+		DO UPDATE SET meta_value = EXCLUDED.meta_value, updated_at = now();
+	`, version).Error
+}
+
+func schemaLooksCurrent(db *gorm.DB) bool {
+	requiredTables := []string{"players", "reports", "fight_sync_maps"}
+	for _, table := range requiredTables {
+		if !tableExists(db, table) {
+			return false
+		}
+	}
+
+	requiredColumns := map[string][]string{
+		"players": {
+			"id", "name", "server", "region", "race", "gender", "lodestone_id", "common_job", "all_report_codes",
+			"output_ability", "battle_ability", "team_contribution", "progression_speed",
+			"stability_score", "mechanics_score", "potential_score",
+			"created_at", "updated_at",
+		},
+		"reports": {
+			"id", "player_id", "master_report", "source_report", "parsed_done", "downloaded",
+			"report_metadata", "start_time", "end_time", "title", "created_at",
+		},
+		"fight_sync_maps": {
+			"id", "master_id", "source_ids", "friendplayers", "friendplayers_usable", "player_id", "timestamp", "fight_id", "kill", "job",
+			"downloaded", "downloaded_at", "parsed_done", "start_time", "end_time", "name",
+			"boss_percentage", "fight_percentage", "floor", "game_zone", "difficulty", "encounter_id",
+			"score_actor_name", "checklist_abs", "checklist_confidence", "checklist_adj", "suggestion_penalty",
+			"utility_score", "survival_penalty", "job_module_score", "battle_score", "fight_weight",
+			"weighted_battle_score", "raw_module_metrics", "scored_at",
+		},
+	}
+
+	for table, cols := range requiredColumns {
+		for _, col := range cols {
+			if !columnExists(db, table, col) {
+				return false
+			}
+		}
+	}
+
+	return indexExists(db, "reports", "idx_reports_player_source")
+}
+
+func tableExists(db *gorm.DB, tableName string) bool {
+	var exists bool
+	if err := db.Raw(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.tables
+			WHERE table_schema = 'public' AND table_name = ?
+		)
+	`, tableName).Scan(&exists).Error; err != nil {
+		return false
+	}
+	return exists
+}
+
+func columnExists(db *gorm.DB, tableName, columnName string) bool {
+	var exists bool
+	if err := db.Raw(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = ? AND column_name = ?
+		)
+	`, tableName, columnName).Scan(&exists).Error; err != nil {
+		return false
+	}
+	return exists
+}
+
+func indexExists(db *gorm.DB, tableName, indexName string) bool {
+	var exists bool
+	if err := db.Raw(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_indexes
+			WHERE schemaname = 'public' AND tablename = ? AND indexname = ?
+		)
+	`, tableName, indexName).Scan(&exists).Error; err != nil {
+		return false
+	}
+	return exists
 }

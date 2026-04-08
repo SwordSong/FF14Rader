@@ -8,15 +8,25 @@ import (
 
 // Player 玩家基础信息
 type Player struct {
-	ID             uint      `gorm:"primaryKey" json:"id"`
-	Name           string    `gorm:"size:100;not null" json:"name"`
-	Server         string    `gorm:"size:50;not null" json:"server"`
-	Region         string    `gorm:"size:20;not null" json:"region"`
-	AllReportsCode string    `gorm:"size:150" json:"all_reports_code"`
-	AllReportCodes []string  `gorm:"type:jsonb;serializer:json" json:"all_report_codes"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	Reports        []Report  `gorm:"foreignKey:PlayerID" json:"reports"`
+	ID               uint      `gorm:"primaryKey" json:"id"`
+	Name             string    `gorm:"size:100;not null" json:"name"`
+	Server           string    `gorm:"size:50;not null" json:"server"`
+	Region           string    `gorm:"size:20;not null" json:"region"`
+	Race             string    `gorm:"size:50" json:"race"`
+	Gender           string    `gorm:"size:20" json:"gender"`
+	LodestoneID      string    `gorm:"size:50" json:"lodestone_id"`
+	CommonJob        string    `gorm:"size:50" json:"common_job"`
+	AllReportCodes   []string  `gorm:"type:jsonb;serializer:json" json:"all_report_codes"`
+	OutputAbility    float64   `gorm:"default:0" json:"output_ability"`
+	BattleAbility    float64   `gorm:"default:0" json:"battle_ability"`
+	TeamContribution float64   `gorm:"default:0" json:"team_contribution"`
+	ProgressionSpeed float64   `gorm:"default:0" json:"progression_speed"`
+	StabilityScore   float64   `gorm:"default:0" json:"stability_score"`
+	MechanicsScore   float64   `gorm:"default:0" json:"mechanics_score"`
+	PotentialScore   float64   `gorm:"default:0" json:"potential_score"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+	Reports          []Report  `gorm:"foreignKey:PlayerID" json:"reports"`
 }
 
 // Report 报告解析记录（替代 report_parse_logs，表名: reports）
@@ -49,26 +59,43 @@ type FightCache struct {
 
 // FightSyncMap 战斗同步映射表 (用于多用户上传去重)
 type FightSyncMap struct {
-	ID              uint           `gorm:"primaryKey"`
-	MasterID        string         `gorm:"index;size:100"`             // 基准 ID (第一个入库的战斗记录)
-	SourceIDs       []string       `gorm:"type:jsonb;serializer:json"` // 包含的所有原始报告 ID 列表 (JSON 数组)
-	PlayerID        uint           `gorm:"index" json:"player_id"`
-	Timestamp       int64          `gorm:"index"` // 战斗开始时间 (Master 的时间)
-	FightID         int            `json:"fight_id"`
-	Kill            bool           `json:"kill"`
-	Job             string         `json:"job"`
-	Downloaded      bool           `gorm:"index" json:"downloaded"`
-	DownloadedAt    time.Time      `json:"downloaded_at"`
-	ParsedDone      bool           `gorm:"index" json:"parsed_done"`
-	StartTime       int64          `json:"start_time"`
-	EndTime         int64          `json:"end_time"`
-	Name            string         `gorm:"size:100;index" json:"name"`
-	BossPercentage  float64        `json:"boss_percentage"`
-	FightPercentage float64        `json:"fight_percentage"`
-	Floor           string         `gorm:"size:20;index" json:"floor"`
-	GameZone        datatypes.JSON `gorm:"type:jsonb" json:"game_zone"`
-	Difficulty      int            `json:"difficulty"`
-	EncounterID     int            `json:"encounter_id"`
+	ID                  uint           `gorm:"primaryKey"`
+	MasterID            string         `gorm:"index;size:100"`             // 基准 ID (第一个入库的战斗记录)
+	SourceIDs           []string       `gorm:"type:jsonb;serializer:json"` // 包含的所有原始报告 ID 列表 (JSON 数组)
+	FriendPlayers       []string       `gorm:"column:friendplayers;type:jsonb;serializer:json" json:"friendplayers"`
+	FriendPlayersUsable bool           `gorm:"column:friendplayers_usable;default:false;index" json:"friendplayers_usable"`
+	PlayerID            uint           `gorm:"index" json:"player_id"`
+	Timestamp           int64          `gorm:"index"` // 战斗开始时间 (Master 的时间)
+	FightID             int            `json:"fight_id"`
+	Kill                bool           `json:"kill"`
+	Job                 string         `json:"job"`
+	Downloaded          bool           `gorm:"index" json:"downloaded"`
+	DownloadedAt        time.Time      `json:"downloaded_at"`
+	ParsedDone          bool           `gorm:"index" json:"parsed_done"`
+	StartTime           int64          `json:"start_time"`
+	EndTime             int64          `json:"end_time"`
+	Name                string         `gorm:"size:100;index" json:"name"`
+	BossPercentage      float64        `json:"boss_percentage"`
+	FightPercentage     float64        `json:"fight_percentage"`
+	Floor               string         `gorm:"size:20;index" json:"floor"`
+	GameZone            datatypes.JSON `gorm:"type:jsonb" json:"game_zone"`
+	Difficulty          int            `json:"difficulty"`
+	EncounterID         int            `json:"encounter_id"`
+
+	// 单场评分字段（按 master_id 写入）
+	ScoreActorName      string         `gorm:"size:120" json:"score_actor_name"`
+	ChecklistAbs        float64        `json:"checklist_abs"`
+	ChecklistConfidence float64        `json:"checklist_confidence"`
+	ChecklistAdj        float64        `json:"checklist_adj"`
+	SuggestionPenalty   float64        `json:"suggestion_penalty"`
+	UtilityScore        float64        `json:"utility_score"`
+	SurvivalPenalty     float64        `json:"survival_penalty"`
+	JobModuleScore      float64        `json:"job_module_score"`
+	BattleScore         float64        `json:"battle_score"`
+	FightWeight         float64        `json:"fight_weight"`
+	WeightedBattleScore float64        `json:"weighted_battle_score"`
+	RawModuleMetrics    datatypes.JSON `gorm:"type:jsonb" json:"raw_module_metrics"`
+	ScoredAt            time.Time      `gorm:"index" json:"scored_at"`
 }
 
 // Performance 指标汇总

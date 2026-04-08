@@ -1,3 +1,7 @@
+// test_sync 是手工联调脚本：
+// 1) 根据 --name/--server（可选 --player-id）触发一次 FFLogs 增量同步；
+// 2) 写入/更新 players、reports、fight_sync_maps 等数据；
+// 3) 若存在待下载日志，会继续触发 V1 事件下载流程。
 package main
 
 import (

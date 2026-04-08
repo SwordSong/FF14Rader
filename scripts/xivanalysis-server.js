@@ -6,21 +6,72 @@ const http = require('http')
 const fs = require('fs')
 const path = require('path')
 const Module = require('module')
+const {fork} = require('child_process')
+const {Worker, isMainThread, parentPort} = require('worker_threads')
 
 const repoRoot = path.resolve(__dirname, '..')
 const xivaRoot = path.resolve(repoRoot, 'external', 'xivanalysis')
 const xivaSrc = path.resolve(xivaRoot, 'src')
 
+loadEnvFiles([
+  path.join(repoRoot, '.env'),
+  path.join(repoRoot, 'external', '.env'),
+])
+
 const PORT = Number(process.env.PORT || process.env.port || 22026) || 3000
 const HOST = process.env.HOST || '0.0.0.0'
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 20 * 1024 * 1024) || 20 * 1024 * 1024
-const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || 2) || 2
+const EXECUTION_MODE = (process.env.XIVA_EXECUTION_MODE || '').toLowerCase()
+const THREAD_WORKER_MODE = process.env.XIVA_THREAD_WORKER === '1'
+const CALL_CONCURRENCY_PER_WORKER = Number(process.env.XIVA_CALL_CONCURRENCY || 1) || 1
+const THREAD_POOL_SIZE = Number(process.env.XIVA_THREAD_POOL_SIZE || process.env.XIVA_PORT_COUNT || 1) || 1
+const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || (THREAD_POOL_SIZE * Math.max(1, CALL_CONCURRENCY_PER_WORKER)) || 2) || 2
 const ANALYZE_TIMEOUT_MS = Number(process.env.ANALYZE_TIMEOUT_MS || 90 * 1000) || 90 * 1000
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS || 30 * 1000) || 30 * 1000
 const API_KEY = process.env.XIVA_API_KEY || process.env.API_KEY || ''
 const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase()
 const OUTPUT_MODE = (process.env.XIVA_OUTPUT_MODE || 'numeric').toLowerCase()
 const OUTPUT_LOCALE = (process.env.XIVA_OUTPUT_LOCALE || process.env.XIVA_LOCALE || 'zh').toLowerCase()
+const WORKER_MODE = process.env.XIVA_WORKER_MODE === '1'
+const PORT_POOL_START = Number(process.env.XIVA_PORT_START || 22000) || 22000
+const PORT_POOL_COUNT = Number(process.env.XIVA_PORT_COUNT || 1) || 1
+
+function loadEnvFiles(files) {
+  for (const filePath of files) {
+    if (!fs.existsSync(filePath)) {
+      continue
+    }
+    loadEnvFile(filePath)
+  }
+}
+
+function loadEnvFile(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8')
+  const lines = raw.split(/\r?\n/)
+  for (const line of lines) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue
+    }
+
+    const idx = trimmed.indexOf('=')
+    if (idx <= 0) {
+      continue
+    }
+
+    const key = trimmed.slice(0, idx).trim()
+    if (!key || process.env[key] != null) {
+      continue
+    }
+
+    let value = trimmed.slice(idx + 1).trim()
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1)
+    }
+
+    process.env[key] = value
+  }
+}
 
 const LEVEL_WEIGHT = {
   debug: 10,
@@ -92,6 +143,32 @@ const JOB_KEY_MAP = {
   LIMIT_BREAK: {reportJob: 'UNKNOWN', moduleJob: undefined},
 }
 
+addJobKeyMapTitleCaseAliases(JOB_KEY_MAP)
+
+function addJobKeyMapTitleCaseAliases(map) {
+  for (const [key, value] of Object.entries(map)) {
+    const titleUnderscore = key
+      .split('_')
+      .filter(Boolean)
+      .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+      .join('_')
+
+    if (titleUnderscore && !map[titleUnderscore]) {
+      map[titleUnderscore] = value
+    }
+
+    const titleSpace = titleUnderscore.replace(/_/g, ' ')
+    if (titleSpace && !map[titleSpace]) {
+      map[titleSpace] = value
+    }
+
+    const titleCompact = titleSpace.replace(/\s+/g, '')
+    if (titleCompact && !map[titleCompact]) {
+      map[titleCompact] = value
+    }
+  }
+}
+
 const serviceState = {
   ready: false,
   shuttingDown: false,
@@ -112,14 +189,412 @@ const serviceState = {
 let inFlight = 0
 let cachedModules = null
 let cachedI18n = null
+let threadPoolManager = null
 
-try {
-  bootstrap()
+function startEntry() {
+  if (THREAD_WORKER_MODE) {
+    startThreadWorkerLoop()
+    return
+  }
+
+  if (!WORKER_MODE && shouldUseThreadPoolMode()) {
+    startThreadPoolServer()
+    return
+  }
+
+  if (!WORKER_MODE && PORT_POOL_COUNT > 1) {
+    startServerPool(PORT_POOL_START, PORT_POOL_COUNT)
+    return
+  }
+
+  try {
+    bootstrap()
+    serviceState.ready = true
+    startServer()
+  } catch (err) {
+    logEvent('error', 'bootstrap failed', formatError(err))
+    process.exit(1)
+  }
+}
+
+function shouldUseThreadPoolMode() {
+  if (WORKER_MODE || THREAD_WORKER_MODE) {
+    return false
+  }
+  if (EXECUTION_MODE === 'process' || EXECUTION_MODE === 'processes' || EXECUTION_MODE === 'pool') {
+    return false
+  }
+  if (EXECUTION_MODE === 'thread' || EXECUTION_MODE === 'threads') {
+    return THREAD_POOL_SIZE > 0
+  }
+  // Default behavior: if user configured multiple XIVA ports, run a single process with worker threads.
+  return PORT_POOL_COUNT > 1 && THREAD_POOL_SIZE > 1
+}
+
+function startThreadPoolServer() {
+  threadPoolManager = new ThreadWorkerPool(THREAD_POOL_SIZE)
   serviceState.ready = true
+  logEvent('info', 'starting xivanalysis thread pool server', {
+    mode: 'threads',
+    threadPoolSize: THREAD_POOL_SIZE,
+    maxConcurrency: MAX_CONCURRENCY,
+    analyzeTimeoutMs: ANALYZE_TIMEOUT_MS,
+  })
   startServer()
-} catch (err) {
-  logEvent('error', 'bootstrap failed', formatError(err))
-  process.exit(1)
+}
+
+function startThreadWorkerLoop() {
+  if (!isMainThread || parentPort == null) {
+    // Continue; worker_threads environment exposes parentPort and runs in-process.
+  }
+
+  try {
+    bootstrap()
+    serviceState.ready = true
+  } catch (err) {
+    if (parentPort) {
+      parentPort.postMessage({
+        type: 'fatal',
+        ...formatError(err),
+      })
+    }
+    process.exit(1)
+    return
+  }
+
+  if (!parentPort) {
+    process.exit(1)
+    return
+  }
+
+  parentPort.postMessage({type: 'ready'})
+  parentPort.on('message', async msg => {
+    if (!msg || typeof msg !== 'object') {
+      return
+    }
+
+    if (msg.type === 'shutdown') {
+      process.exit(0)
+      return
+    }
+
+    if (msg.type !== 'analyze') {
+      return
+    }
+
+    try {
+      const results = await withTimeout(
+        handleAnalyzeLocal(msg.payload),
+        ANALYZE_TIMEOUT_MS,
+        `worker analyze timeout after ${ANALYZE_TIMEOUT_MS}ms`,
+      )
+      parentPort.postMessage({
+        type: 'result',
+        taskId: msg.taskId,
+        ok: true,
+        results,
+      })
+    } catch (err) {
+      parentPort.postMessage({
+        type: 'result',
+        taskId: msg.taskId,
+        ok: false,
+        ...formatError(err),
+      })
+    }
+  })
+}
+
+class ThreadWorkerPool {
+  constructor(size) {
+    this.size = Math.max(1, Number(size) || 1)
+    this.queue = []
+    this.inFlight = new Map()
+    this.workers = new Array(this.size)
+    this.taskSeq = 0
+    this.shuttingDown = false
+
+    for (let i = 0; i < this.size; i++) {
+      this.workers[i] = this.spawnWorker(i)
+    }
+  }
+
+  spawnWorker(index) {
+    const worker = new Worker(__filename, {
+      env: {
+        ...process.env,
+        XIVA_THREAD_WORKER: '1',
+        XIVA_WORKER_MODE: '0',
+      },
+    })
+
+    const state = {
+      index,
+      worker,
+      ready: false,
+      busy: false,
+      currentTaskId: null,
+    }
+
+    worker.on('message', msg => this.onWorkerMessage(state, msg))
+    worker.on('error', err => {
+      logEvent('error', 'thread worker error', {
+        mode: 'threads',
+        index,
+        error: err && err.message ? err.message : String(err),
+      })
+    })
+    worker.on('exit', code => this.onWorkerExit(state, code))
+    return state
+  }
+
+  onWorkerMessage(state, msg) {
+    if (!msg || typeof msg !== 'object') {
+      return
+    }
+
+    if (msg.type === 'ready') {
+      state.ready = true
+      this.drain()
+      return
+    }
+
+    if (msg.type === 'fatal') {
+      logEvent('error', 'thread worker bootstrap failed', {
+        mode: 'threads',
+        index: state.index,
+        ...msg,
+      })
+      return
+    }
+
+    if (msg.type !== 'result') {
+      return
+    }
+
+    const taskId = Number(msg.taskId)
+    const slot = this.inFlight.get(taskId)
+    if (!slot) {
+      state.busy = false
+      state.currentTaskId = null
+      this.drain()
+      return
+    }
+
+    this.inFlight.delete(taskId)
+    state.busy = false
+    state.currentTaskId = null
+
+    if (msg.ok) {
+      slot.resolve(msg.results)
+    } else {
+      slot.reject(new Error(msg.error || 'thread analyze failed'))
+    }
+
+    this.drain()
+  }
+
+  onWorkerExit(state, code) {
+    const taskId = state.currentTaskId
+    if (taskId != null) {
+      const slot = this.inFlight.get(taskId)
+      if (slot) {
+        this.inFlight.delete(taskId)
+        if (!this.shuttingDown) {
+          this.queue.unshift({
+            id: slot.id,
+            payload: slot.payload,
+            resolve: slot.resolve,
+            reject: slot.reject,
+          })
+        } else {
+          slot.reject(new Error('thread pool shutting down'))
+        }
+      }
+    }
+
+    if (this.shuttingDown) {
+      return
+    }
+
+    logEvent('warn', 'thread worker exited; restarting', {
+      mode: 'threads',
+      index: state.index,
+      code,
+    })
+    this.workers[state.index] = this.spawnWorker(state.index)
+    this.drain()
+  }
+
+  runTask(payload) {
+    if (this.shuttingDown) {
+      return Promise.reject(new Error('thread pool shutting down'))
+    }
+
+    return new Promise((resolve, reject) => {
+      this.taskSeq += 1
+      this.queue.push({
+        id: this.taskSeq,
+        payload,
+        resolve,
+        reject,
+      })
+      this.drain()
+    })
+  }
+
+  drain() {
+    if (this.shuttingDown) {
+      return
+    }
+
+    for (const state of this.workers) {
+      if (!state || !state.ready || state.busy) {
+        continue
+      }
+      const task = this.queue.shift()
+      if (!task) {
+        return
+      }
+      state.busy = true
+      state.currentTaskId = task.id
+      this.inFlight.set(task.id, task)
+      state.worker.postMessage({
+        type: 'analyze',
+        taskId: task.id,
+        payload: task.payload,
+      })
+    }
+  }
+
+  async shutdown(timeoutMs) {
+    if (this.shuttingDown) {
+      return
+    }
+    this.shuttingDown = true
+
+    while (this.queue.length > 0) {
+      const task = this.queue.shift()
+      task.reject(new Error('thread pool shutting down'))
+    }
+
+    for (const [taskId, task] of this.inFlight.entries()) {
+      this.inFlight.delete(taskId)
+      task.reject(new Error('thread pool shutting down'))
+    }
+
+    const terminate = Promise.all(this.workers.map(async state => {
+      if (!state || !state.worker) {
+        return
+      }
+      try {
+        state.worker.postMessage({type: 'shutdown'})
+      } catch (_err) {
+      }
+      try {
+        await state.worker.terminate()
+      } catch (_err) {
+      }
+    }))
+
+    if (!timeoutMs || timeoutMs <= 0) {
+      await terminate
+      return
+    }
+
+    await Promise.race([
+      terminate,
+      new Promise(resolve => setTimeout(resolve, timeoutMs)),
+    ])
+  }
+
+  stats() {
+    let ready = 0
+    let busy = 0
+    for (const state of this.workers) {
+      if (!state) {
+        continue
+      }
+      if (state.ready) {
+        ready += 1
+      }
+      if (state.busy) {
+        busy += 1
+      }
+    }
+    return {
+      size: this.size,
+      ready,
+      busy,
+      queued: this.queue.length,
+      inFlight: this.inFlight.size,
+    }
+  }
+}
+
+startEntry()
+
+function startServerPool(portStart, count) {
+  const workers = []
+
+  logEvent('info', 'starting xivanalysis server pool', {
+    mode: 'pool',
+    portStart,
+    count,
+  })
+
+  for (let i = 0; i < count; i++) {
+    const port = portStart + i
+    const worker = fork(__filename, [], {
+      env: {
+        ...process.env,
+        PORT: String(port),
+        XIVA_WORKER_MODE: '1',
+        XIVA_PORT_COUNT: '1',
+      },
+      stdio: 'inherit',
+    })
+
+    workers.push({worker, port})
+
+    worker.on('exit', (code, signal) => {
+      logEvent('warn', 'xivanalysis worker exited', {
+        mode: 'pool',
+        port,
+        pid: worker.pid,
+        code,
+        signal,
+      })
+    })
+  }
+
+  const shutdownPool = signal => {
+    logEvent('warn', 'shutting down xivanalysis server pool', {
+      mode: 'pool',
+      signal,
+      count: workers.length,
+    })
+
+    for (const item of workers) {
+      const child = item.worker
+      if (!child.killed) {
+        child.kill('SIGTERM')
+      }
+    }
+
+    setTimeout(() => {
+      for (const item of workers) {
+        const child = item.worker
+        if (!child.killed) {
+          child.kill('SIGKILL')
+        }
+      }
+      process.exit(0)
+    }, SHUTDOWN_TIMEOUT_MS)
+  }
+
+  process.on('SIGINT', () => shutdownPool('SIGINT'))
+  process.on('SIGTERM', () => shutdownPool('SIGTERM'))
 }
 
 function logEvent(level, message, extra = {}) {
@@ -343,6 +818,8 @@ function startServer() {
         ready: serviceState.ready,
         shuttingDown: serviceState.shuttingDown,
         inFlight,
+        mode: threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single'),
+        threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
       })
       return
     }
@@ -364,6 +841,8 @@ function startServer() {
       sendJson(res, 200, {
         ...serviceState.metrics,
         inFlight,
+        mode: threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single'),
+        threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
         uptimeMs: Math.max(0, Date.now() - Date.parse(serviceState.metrics.startedAt)),
       })
       return
@@ -600,8 +1079,21 @@ function registerShutdownHandlers(server) {
         return
       }
 
-      logEvent('info', 'server shutdown completed', {signal})
-      process.exit(0)
+      const finalizeExit = async () => {
+        if (threadPoolManager) {
+          await threadPoolManager.shutdown(Math.max(0, SHUTDOWN_TIMEOUT_MS - 500))
+        }
+        logEvent('info', 'server shutdown completed', {signal})
+        process.exit(0)
+      }
+
+      finalizeExit().catch(err => {
+        logEvent('error', 'thread pool shutdown failed', {
+          signal,
+          error: err && err.message ? err.message : String(err),
+        })
+        process.exit(1)
+      })
     })
   }
 
@@ -648,6 +1140,13 @@ function formatError(err) {
 }
 
 async function handleAnalyze(payload) {
+  if (threadPoolManager) {
+    return threadPoolManager.runTask(payload)
+  }
+  return handleAnalyzeLocal(payload)
+}
+
+async function handleAnalyzeLocal(payload) {
   const requests = Array.isArray(payload.requests) ? payload.requests : [payload]
   if (requests.length === 0) {
     throw new Error('requests must be a non-empty array')
@@ -975,6 +1474,16 @@ function inferFriendlyActor(actor, actorType) {
 function normalizeJobKey(subType) {
   if (!subType || typeof subType !== 'string') {
     return {reportJob: 'UNKNOWN', moduleJob: undefined}
+  }
+
+  const raw = subType.trim()
+  if (JOB_KEY_MAP[raw]) {
+    return JOB_KEY_MAP[raw]
+  }
+
+  const rawUnderscore = raw.replace(/[-\s]+/g, '_')
+  if (JOB_KEY_MAP[rawUnderscore]) {
+    return JOB_KEY_MAP[rawUnderscore]
   }
 
   const normalized = subType.trim().toUpperCase().replace(/[-\s]+/g, '_')

@@ -1,0 +1,333 @@
+# 七维评分算法（草案）
+
+## 维度定义
+- 输出能力：直接使用 logs 的输出相关指标。
+- 战斗能力：基于 xivanalysis 的模块结果计算（清单、建议等）。
+- 团队贡献：减伤与团队辅助覆盖情况（xivanalysis）-> 防御性技能。
+- 开荒速度：结合 logs 进度与队伍变化进行加权。
+- 稳定度：死亡、可规避伤害、重大失误次数、开荒死亡情况（在第一次击杀前的权重为0.7，第一次击杀后算1）、波动率。
+- 潜力值：由战斗能力、团队贡献、稳定度、开荒表现、机制处理综合得到。
+
+## 当前实现总览（players 字段）
+
+当前玩家评分落库字段如下：
+- output_ability
+- battle_ability
+- team_contribution
+- progression_speed
+- stability_score
+- potential_score
+
+其中：
+- output_ability 来源于 FFLogs 角色排名接口聚合。
+- 其余维度由单场评分聚合与回填得到。
+
+## 战斗能力算法（v0.1）
+
+### 1) 单场战斗进度权重
+先根据是否击杀和进度给这场战斗一个权重。
+
+定义：
+
+$$
+progress = clip\left(100 - \frac{fightPercentage}{100}, 0, 100\right)
+$$
+
+其中：
+- kill 为 true 时，权重固定为 1。
+- kill 为 false 时，每多 10% 进度加 0.1，最高 1。
+
+$$
+w_{fight}=
+\begin{cases}
+1, & kill=true \\
+min\left(1,\left\lfloor \frac{progress}{10} \right\rfloor \cdot 0.1\right), & kill=false
+\end{cases}
+$$
+
+备注：如果某条记录缺少 fightPercentage，可降级使用 bossPercentage；若两者都缺失，默认权重可先设为 0.2（后续再调）。
+
+### 2) 模块层评分
+每个模块单独计算 0-100 分，记为 $S_m$。
+
+其中 checklist 模块当前采用（标准配置）：
+
+$$
+S_{check,abs}=S_{check,raw}\cdot(0.7+0.3A)\cdot F_{gcd}
+$$
+
+$$
+F_{gcd}=\alpha+(1-\alpha)\cdot g^{\beta},\ \alpha=0.15,\ \beta=3,\ g=\frac{GCDCoverage}{100}
+$$
+
+说明：该门控用于体现 GCD 覆盖率对输出底盘的决定性影响。
+
+建议第一版先接入这些模块：
+- checklist
+- suggestions
+- utilities 或 defensives
+- dot/aoe 等职业关键模块（按职业存在与否启用）
+
+### 3) 单场战斗能力分
+设模块权重为 $\alpha_m$，则该场原始战斗能力分：
+
+$$
+S_{fight}=\frac{\sum_m \alpha_m S_m}{\sum_m \alpha_m}
+$$
+
+再乘以该场进度权重：
+
+$$
+S_{fight}^{eff}=w_{fight}\cdot S_{fight}
+$$
+
+### 4) 跨战斗汇总（建议）
+最终战斗能力维度，使用加权平均而不是简单平均：
+
+$$
+S_{battle}=\frac{\sum_f w_f S_{fight,f}}{\sum_f w_f}
+$$
+
+这样击杀战斗权重最高，低进度开荒战斗影响会更合理。
+
+## 团队贡献算法（v0.1，当前实现口径）
+
+### 1) 单场团队贡献分定义
+
+单场团队贡献使用 `utility_score`（范围 0-100）。
+数据来源优先读取两类模块：
+- `utilities`
+- `defensives`
+
+每个模块会提取两个层级的使用率候选值：
+
+1. 模块总使用率：
+
+$$
+r_{overall}=overallUsageRate
+$$
+
+2. 动作使用率均值（若有 actions）：
+
+$$
+r_{actions}=\frac{1}{n}\sum_{i=1}^{n} usageRate_i
+$$
+
+把所有可用候选值组成集合 $R$，则：
+
+$$
+utility\_score=
+\begin{cases}
+clamp_{[0,100]}\left(\frac{1}{|R|}\sum_{r\in R}r\right), & |R|>0 \\
+60, & |R|=0
+\end{cases}
+$$
+
+说明：
+- 当前实现中，若两个模块都缺失可用指标，会回退到 60 分（中性分）。
+- `utility_score` 会参与单场战斗分 `S_fight` 的组合（按 T/N/DPS 模板权重）。
+
+### 2) 玩家维度团队贡献（七维中的“团队贡献”）
+
+建议玩家层汇总与战斗能力保持一致，按战斗权重做加权平均：
+
+$$
+S_{team}=\frac{\sum_f w_f\cdot utility\_score_f}{\sum_f w_f}
+$$
+
+实现状态（截至当前代码）：
+- 已有单场 `utility_score` 计算并参与 `battle_score`。
+- `players.team_contribution` 已接入自动刷新：单场评分成功后会按战斗权重聚合并回写玩家表。
+
+其中：
+- $w_f$ 使用“单场战斗进度权重”。
+- 若分母为 0，回退为 0 或中性值（由业务决定，推荐 0 并标记样本不足）。
+
+### 3) 角色组差异建议
+
+若要增强“团队贡献”维度本身的区分度，可按角色组对 `utility_score` 再做组内校准：
+
+1. 坦克（T）：
+- 强调减伤覆盖、团减命中关键时段。
+
+2. 治疗（N）：
+- 强调团辅/减伤覆盖与救场技能使用率。
+
+3. 输出（DPS）：
+- 强调团队增益技能覆盖与资源利用。
+
+当前代码对战斗分已通过角色组模板区分权重；团队贡献维度若单独展示，建议再补一层组内标准化（后续迭代）。
+
+### 5) 默认模块权重（可先用）
+- checklist: 0.45
+- suggestions: 0.25
+- utilities/defensives: 0.20
+- 职业关键模块集合: 0.10
+
+说明：职业关键模块只在该职业存在时参与分母；不存在就自动跳过，不惩罚该职业。
+
+### 6) 小示例
+- Fight A: kill=true, $S_{fight}=78$，则 $w=1.0$。
+- Fight B: kill=false, progress=43%，则 $w=0.4$，若 $S_{fight}=72$。
+
+汇总：
+
+$$
+S_{battle}=\frac{1.0\cdot78 + 0.4\cdot72}{1.0+0.4}=76.29
+$$
+
+## 稳定度算法（v0.1，当前实现口径）
+
+### 1) 单场稳定度分
+
+单场稳定度以“惩罚制”计算，基础分 100，按失误扣分：
+
+$$
+S_{stable,fight}=clamp_{[0,100]}(100-P_{fight})
+$$
+
+其中总惩罚：
+
+$$
+P_{fight}=0.45\cdot survival\_penalty+0.25\cdot suggestion\_penalty+0.30\cdot P_{extra}
+$$
+
+额外惩罚项来自 `raw_module_metrics` 提取的死亡、可规避伤害命中、重大失误信号：
+
+$$
+P_{extra}=clamp_{[0,35]}(12\cdot deaths+2.5\cdot avoidable+5\cdot major)
+$$
+
+说明：
+- `survival_penalty` 与 `suggestion_penalty` 为现有单场评分字段。
+- `deaths/avoidable/major` 从模块原始指标中按关键字段提取（如 death、avoidable、major/critical mistake、failed mechanics、bad usages 等）。
+
+### 2) 开荒期权重（首杀前 0.7，首杀后 1）
+
+按 encounter 维度找第一次击杀时间戳 `first_kill_ts`，单场阶段权重：
+
+$$
+w_{phase,f}=\begin{cases}
+0.7, & timestamp_f < first\_kill\_ts \\
+1.0, & timestamp_f \ge first\_kill\_ts
+\end{cases}
+$$
+
+若该 encounter 尚无击杀记录，则其全部尝试按 0.7。
+
+综合单场权重：
+
+$$
+w_f=fight\_weight_f\cdot w_{phase,f}
+$$
+
+### 3) 玩家稳定度汇总与波动率
+
+先做加权均值：
+
+$$
+\mu=\frac{\sum_f w_f\cdot S_{stable,fight,f}}{\sum_f w_f}
+$$
+
+计算加权标准差（波动率）：
+
+$$
+\sigma_w=\sqrt{\frac{\sum_f w_f\cdot(S_{stable,fight,f}-\mu)^2}{\sum_f w_f}}
+$$
+
+波动率惩罚：
+
+$$
+P_{vol}=min(18,0.6\cdot\sigma_w)
+$$
+
+最终稳定度：
+
+$$
+S_{stability}=clamp_{[0,100]}(\mu-P_{vol})
+$$
+
+### 4) 实现状态（截至当前代码）
+
+- 已接入 `players.stability_score` 自动刷新。
+- 刷新时机：单场评分成功后，和战斗能力/团队贡献/开荒速度一起更新。
+- 若玩家暂无可用已评分战斗（`fight_weight>0`），稳定度回写为 0。
+
+### 5) 回填（把历史数据填入 players）
+
+若要把历史已评分战斗一次性回填到玩家维度（团队贡献+稳定度+潜力值），可执行：
+
+```bash
+go run ./cmd/backfill_team_stability/main.go
+```
+
+仅回填某个玩家：
+
+```bash
+go run ./cmd/backfill_team_stability/main.go --player-id 123
+```
+
+## 潜力值算法（v0.1，当前实现口径）
+
+### 1) 基础加权分
+
+潜力值由 5 个维度线性组合：
+
+$$
+S_{potential,raw}=0.35\cdot battle+0.10\cdot team+0.20\cdot stability+0.20\cdot progression+0.15\cdot mechanics
+$$
+
+### 2) 核心项一致性加成
+
+设
+
+$$
+core\_min=min(battle, stability, mechanics)
+$$
+
+则：
+- 当 $core\_min\ge 85$ 时，额外 +3 分。
+- 当 $75\le core\_min<85$ 时，额外 +1.5 分。
+
+### 3) 样本收缩（防止小样本过拟合）
+
+按玩家已评分战斗总权重计算置信度：
+
+$$
+confidence=clamp_{[0,1]}\left(\frac{\sum fight\_weight}{8}\right)
+$$
+
+最终潜力值：
+
+$$
+S_{potential}=clamp_{[0,100]}\left(confidence\cdot S_{potential,raw} + (1-confidence)\cdot 60\right)
+$$
+
+说明：
+- 当样本较少时，分数会向 60 分中性值回归。
+- 写库前会进行 0-100 截断并保留 2 位小数。
+
+## 后续迭代方向
+- 加入样本量保护：$\sum w_f$ 太小时，标记“样本不足”。
+- 按角色（T/H/DPS）做一层基线权重，再叠职业微调。
+- 逐步引入模块难度系数（达标率低且稳定区分度高的模块适当升权）。
+
+## 六维图生成（按 name + server）
+
+当前已支持通过 `players.name + players.server` 直接读取以下六项并绘制雷达图：
+- output_ability
+- battle_ability
+- team_contribution
+- progression_speed
+- stability_score
+- potential_score
+
+命令：
+
+```bash
+go run ./cmd/draw_player_radar/main.go --name "玩家名" --server "服务器名"
+```
+
+可选参数：
+- `--output`：输出图片路径（默认 `./radar_<name>_<server>.png`）
+- `--width` / `--height`：图片尺寸（默认 900x900）

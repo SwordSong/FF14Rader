@@ -74,7 +74,7 @@ type pendingFightEntry struct {
 // downloadV1Reports 并行下载多个报告的战斗详情和事件数据，返回成功下载的报告代码列表
 
 // downloadV1Reports 根据 fight_sync_maps 的 MasterID 下载 V1 事件数据
-func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint, allReportsCode string) ([]string, error) {
+func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]string, error) {
 	reportWorkers := 1
 	fightWorkers := getV1DownloadConcurrency()
 	reportTimeout := getV1ReportTimeout()
@@ -84,11 +84,11 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint, allR
 	}
 
 	baseURL := getV1BaseURL()
-	rootDir := filepath.Join(getAllReportsDir(), allReportsCode)
+	rootDir := getAllReportsDir()
 	client := &http.Client{Timeout: reportTimeout}
 
 	if err := os.MkdirAll(rootDir, 0755); err != nil {
-		return nil, fmt.Errorf("create allreports dir failed: %v", err)
+		return nil, fmt.Errorf("create reports dir failed: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -103,10 +103,18 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint, allR
 			return downloaded, err
 		}
 		if len(allPending) == 0 {
+			// 即使没有待下载战斗，也尝试补跑一次已下载但未解析的战斗评分。
+			if err := s.scorePendingDownloadedFights(ctx, playerID); err != nil {
+				log.Printf("[SCORE] final pending score pass failed: %v", err)
+			}
+			if err := markCompletedReportParseLogs(playerID); err != nil {
+				return downloaded, err
+			}
 			return downloaded, nil
 		}
 
 		pass++
+
 		grouped := groupPendingFights(allPending)
 		reportCodes := make([]string, 0, len(grouped))
 		for code := range grouped {
@@ -151,7 +159,8 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint, allR
 			for _, code := range reportCodes {
 				select {
 				case <-ctx.Done():
-					break
+					close(jobs)
+					return
 				case jobs <- code:
 				}
 			}
@@ -185,6 +194,9 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint, allR
 			if err := s.finalizeAllReportsDownloads(playerID, passDone); err != nil {
 				return downloaded, err
 			}
+		}
+		if err := s.scorePendingDownloadedFights(ctx, playerID); err != nil {
+			log.Printf("[SCORE] pending score pass failed: %v", err)
 		}
 		if err := markCompletedReportParseLogs(playerID); err != nil {
 			return downloaded, err
@@ -431,6 +443,30 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 				continue
 			}
 
+			eventsPath := filepath.Join(reportDir, fmt.Sprintf("fight_%d_events.json", fight.ID))
+			reuseByMaster := false
+			if downloaded, err := isFightDownloadedByMasterID(entry.MasterID); err != nil {
+				log.Printf("[V1] 检查 master 下载状态失败 %s: %v", entry.MasterID, err)
+			} else {
+				reuseByMaster = downloaded
+			}
+
+			if isUsableV1EventsFile(eventsPath) {
+				if err := markFightDownloadedByID(entry.MappingID); err != nil {
+					if firstErr.Load() == nil {
+						firstErr.Store(err)
+					}
+					continue
+				}
+				if reuseByMaster {
+					log.Printf("[V1] 复用已下载战斗(master) %s -> %s", entry.MasterID, eventsPath)
+				} else {
+					log.Printf("[V1] 复用本地 events 文件 %s", eventsPath)
+				}
+				atomic.AddInt64(&successCount, 1)
+				continue
+			}
+
 			attempts := 1
 			var events []map[string]interface{}
 			var err error
@@ -450,7 +486,6 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 				continue
 			}
 
-			eventsPath := filepath.Join(reportDir, fmt.Sprintf("fight_%d_events.json", fight.ID))
 			if err := writeJSON(eventsPath, toV1SavedEventsPayload(events)); err != nil {
 				if firstErr.Load() == nil {
 					firstErr.Store(err)
@@ -497,6 +532,40 @@ func markFightDownloadedByID(mappingID uint) error {
 	return db.DB.Model(&models.FightSyncMap{}).
 		Where("id = ?", mappingID).
 		Updates(map[string]interface{}{"downloaded": true, "downloaded_at": time.Now()}).Error
+}
+
+func isFightDownloadedByMasterID(masterID string) (bool, error) {
+	var count int64
+	if err := db.DB.Model(&models.FightSyncMap{}).
+		Where("master_id = ? AND downloaded = ?", masterID, true).
+		Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func isUsableV1EventsFile(eventsPath string) bool {
+	data, err := os.ReadFile(eventsPath)
+	if err != nil || len(data) == 0 {
+		return false
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return false
+	}
+
+	if eventsRaw, ok := payload["events"]; ok {
+		switch v := eventsRaw.(type) {
+		case []interface{}:
+			return true
+		case map[string]interface{}:
+			_, ok := v["events"].([]interface{})
+			return ok
+		}
+	}
+
+	return false
 }
 
 func isReportDownloadedByMaster(playerID uint, code string) (bool, error) {
@@ -562,15 +631,59 @@ func splitMasterID(masterID string) (string, int, bool) {
 	return code, fightID, true
 }
 
-func buildAllReportsIndex(allReportsCode string) (map[string]int, error) {
-	if strings.TrimSpace(allReportsCode) == "" {
-		return nil, nil
+// BackfillPlayerOutputPercentiles 兼容旧命名：直接通过 FFLogs 接口刷新指定玩家 output_ability。
+func (s *SyncManager) BackfillPlayerOutputPercentiles(playerID uint) (int, error) {
+	if playerID == 0 {
+		return 0, nil
 	}
 
-	rootDir := filepath.Join(getAllReportsDir(), allReportsCode)
+	var player models.Player
+	if err := db.DB.Select("id", "name", "server", "region").Where("id = ?", playerID).First(&player).Error; err != nil {
+		return 0, err
+	}
+
+	region := strings.TrimSpace(player.Region)
+	if region == "" {
+		region = "CN"
+	}
+	if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), player.ID, player.Name, player.Server, region); err != nil {
+		return 0, err
+	}
+
+	return 1, nil
+}
+
+// BackfillAllOutputPercentiles 兼容旧命名：批量通过 FFLogs 接口刷新所有玩家 output_ability。
+// 返回处理玩家数量和成功刷新数量。
+func (s *SyncManager) BackfillAllOutputPercentiles() (int, int, error) {
+	var players []models.Player
+	if err := db.DB.Select("id", "name", "server", "region").
+		Where("name <> '' AND server <> ''").
+		Find(&players).Error; err != nil {
+		return 0, 0, err
+	}
+
+	success := 0
+	for _, player := range players {
+		region := strings.TrimSpace(player.Region)
+		if region == "" {
+			region = "CN"
+		}
+		if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), player.ID, player.Name, player.Server, region); err != nil {
+			log.Printf("[WARN] 刷新玩家输出能力失败 player_id=%d name=%s: %v", player.ID, player.Name, err)
+			continue
+		}
+		success++
+	}
+
+	return len(players), success, nil
+}
+
+func buildAllReportsIndex() (map[string]int, error) {
+	rootDir := getAllReportsDir()
 	entries, err := os.ReadDir(rootDir)
 	if err != nil {
-		return nil, fmt.Errorf("read allreports dir failed: %v", err)
+		return nil, fmt.Errorf("read reports dir failed: %v", err)
 	}
 
 	var fights []allReportsFightEntry

@@ -1,3 +1,7 @@
+// test_xivanalysis_http 是手工联调脚本：
+// 1) 从本地报告目录读取 fight_*_events.json；
+// 2) 组合 DB 中的 report_metadata/fight 信息，请求 xivanalysis HTTP 服务；
+// 3) 将返回结果写入 fight_*_analysis.json 供后续评分使用。
 package main
 
 import (
@@ -13,7 +17,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/user/ff14rader/internal/config"
@@ -65,14 +71,32 @@ type requestPayload struct {
 	Events  any           `json:"events"`
 }
 
+type fightTask struct {
+	ID   int
+	File string
+}
+
 func main() {
+	// Load .env first so flag defaults can inherit environment values.
+	cfg := config.LoadConfig()
+
+	defaultAPIURL := envString("XIVA_API_URL", "http://127.0.0.1:22026")
+	defaultAPIHost := envString("XIVA_API_HOST", "http://127.0.0.1")
+	defaultAPIPortStart := envInt("XIVA_PORT_START", 0)
+	defaultAPIPortCount := envInt("XIVA_PORT_COUNT", 10)
+	defaultCallConcurrency := envInt("XIVA_CALL_CONCURRENCY", 0)
+
 	var (
-		reportDir = flag.String("dir", "", "Report directory containing fight_*_events.json")
-		code      = flag.String("code", "", "Report code (master_report) to query")
-		fightID   = flag.Int("fight-id", 0, "Fight ID to analyze (0 = all fights in dir)")
-		apiURL    = flag.String("api-url", "http://127.0.0.1:22026", "xivanalysis API base URL")
-		outDir    = flag.String("out-dir", "", "Output directory for analysis JSON (default report dir)")
-		playerID  = flag.Uint("player-id", 0, "Optional player_id to scope DB queries")
+		reportDir    = flag.String("dir", "", "Report directory containing fight_*_events.json")
+		code         = flag.String("code", "", "Report code (master_report) to query")
+		fightID      = flag.Int("fight-id", 0, "Fight ID to analyze (0 = all fights in dir)")
+		apiURL       = flag.String("api-url", defaultAPIURL, "xivanalysis API base URL (default from XIVA_API_URL)")
+		apiHost      = flag.String("api-host", defaultAPIHost, "API host when using multi-port mode (default from XIVA_API_HOST)")
+		apiPortStart = flag.Int("api-port-start", defaultAPIPortStart, "start API port for multi-port mode (default from XIVA_PORT_START)")
+		apiPortCount = flag.Int("api-port-count", defaultAPIPortCount, "API port count for multi-port mode (default from XIVA_PORT_COUNT)")
+		concurrency  = flag.Int("concurrency", defaultCallConcurrency, "request concurrency (0 = auto, default from XIVA_CALL_CONCURRENCY)")
+		outDir       = flag.String("out-dir", "", "Output directory for analysis JSON (default report dir)")
+		playerID     = flag.Uint("player-id", 0, "Optional player_id to scope DB queries")
 	)
 	flag.Parse()
 
@@ -90,20 +114,28 @@ func main() {
 		*outDir = resolvedDir
 	}
 
-	cfg := config.LoadConfig()
 	if cfg.PostgresWriteDSN == "" || cfg.PostgresReadDSN == "" {
 		log.Fatalf("Postgres DSN missing (POSTGRES_WRITE_DSN/POSTGRES_READ_DSN)")
 	}
 	db.InitDB(cfg.PostgresWriteDSN, cfg.PostgresReadDSN)
 
+	log.Printf("[config] api_url=%s api_host=%s api_port_start=%d api_port_count=%d concurrency=%d", *apiURL, *apiHost, *apiPortStart, *apiPortCount, *concurrency)
+
+	apiEndpoints, err := resolveAPIEndpoints(*apiURL, *apiHost, *apiPortStart, *apiPortCount)
+	if err != nil {
+		log.Fatalf("resolve api endpoints failed: %v", err)
+	}
+
 	reportRow, err := loadReportRow(*code, *playerID)
 	if err != nil {
 		log.Fatalf("load report failed: %v", err)
 	}
+
 	masterData, err := extractMasterData(reportRow.ReportMetadata)
 	if err != nil {
 		log.Fatalf("parse report_metadata failed: %v", err)
 	}
+
 	fights, err := loadFights(*code, *playerID)
 	if err != nil {
 		log.Fatalf("load fights failed: %v", err)
@@ -129,12 +161,7 @@ func main() {
 		log.Fatalf("no fight_*_events.json files found in %s", resolvedDir)
 	}
 
-	client := &http.Client{Timeout: 90 * time.Second}
-	apiEndpoint, err := normalizeAPIURL(*apiURL)
-	if err != nil {
-		log.Fatalf("invalid api-url: %v", err)
-	}
-
+	tasks := make([]fightTask, 0, len(fightFiles))
 	for _, file := range fightFiles {
 		id := extractFightID(file)
 		if id == 0 {
@@ -143,49 +170,227 @@ func main() {
 		if *fightID > 0 && id != *fightID {
 			continue
 		}
+		tasks = append(tasks, fightTask{ID: id, File: file})
+	}
 
-		events, err := readEvents(filepath.Join(resolvedDir, file))
-		if err != nil {
-			log.Printf("[skip] fight %d events: %v", id, err)
-			continue
-		}
+	if len(tasks) == 0 {
+		log.Fatalf("no fight files matched (--fight-id=%d)", *fightID)
+	}
 
-		payload := requestPayload{
-			Code:    *code,
-			FightID: id,
-			Report:  report,
-			Events:  events,
-		}
+	workerCount := *concurrency
+	if workerCount <= 0 {
+		workerCount = len(apiEndpoints)
+	}
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	if workerCount > len(tasks) {
+		workerCount = len(tasks)
+	}
 
-		log.Printf("[request] fight %d (%d events)", id, eventCount(events))
-		respBody, err := postJSON(client, apiEndpoint, payload)
-		if err != nil {
-			log.Fatalf("request failed: %v", err)
-		}
-
-		outPath := filepath.Join(*outDir, fmt.Sprintf("fight_%d_analysis.json", id))
-		if err := os.WriteFile(outPath, respBody, 0644); err != nil {
-			log.Fatalf("write output failed: %v", err)
-		}
-		log.Printf("[written] %s", outPath)
+	log.Printf("[info] dispatch fights=%d workers=%d endpoints=%d", len(tasks), workerCount, len(apiEndpoints))
+	if err := processFightTasks(tasks, resolvedDir, *outDir, *code, report, apiEndpoints, workerCount); err != nil {
+		log.Fatalf("analyze failed: %v", err)
 	}
 }
 
+func processFightTasks(tasks []fightTask, reportDir, outDir, reportCode string, report reportPayload, endpoints []string, workerCount int) error {
+	jobs := make(chan fightTask)
+	results := make(chan error, len(tasks))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		endpoint := endpoints[i%len(endpoints)]
+		workerID := i + 1
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := &http.Client{Timeout: 90 * time.Second}
+			for task := range jobs {
+				events, err := readEvents(filepath.Join(reportDir, task.File))
+				if err != nil {
+					results <- fmt.Errorf("worker=%d fight=%d read events: %w", workerID, task.ID, err)
+					continue
+				}
+
+				payload := requestPayload{
+					Code:    reportCode,
+					FightID: task.ID,
+					Report:  report,
+					Events:  events,
+				}
+
+				log.Printf("[request] worker=%d fight=%d endpoint=%s events=%d", workerID, task.ID, endpoint, eventCount(events))
+				respBody, err := postJSON(client, endpoint, payload)
+				if err != nil {
+					results <- fmt.Errorf("worker=%d fight=%d request: %w", workerID, task.ID, err)
+					continue
+				}
+
+				outPath := filepath.Join(outDir, fmt.Sprintf("fight_%d_analysis.json", task.ID))
+				if err := os.WriteFile(outPath, respBody, 0644); err != nil {
+					results <- fmt.Errorf("worker=%d fight=%d write output: %w", workerID, task.ID, err)
+					continue
+				}
+
+				log.Printf("[written] fight=%d path=%s", task.ID, outPath)
+				results <- nil
+			}
+		}()
+	}
+
+	for _, task := range tasks {
+		jobs <- task
+	}
+	close(jobs)
+
+	wg.Wait()
+	close(results)
+
+	failCount := 0
+	for err := range results {
+		if err == nil {
+			continue
+		}
+		failCount++
+		log.Printf("[fail] %v", err)
+	}
+	if failCount > 0 {
+		return fmt.Errorf("%d fights failed", failCount)
+	}
+	return nil
+}
+
+func resolveAPIEndpoints(apiURL, apiHost string, portStart, portCount int) ([]string, error) {
+	if portStart > 0 {
+		if portCount <= 0 {
+			return nil, fmt.Errorf("invalid --api-port-count: %d", portCount)
+		}
+		host := strings.TrimSpace(apiHost)
+		if host == "" {
+			host = "http://127.0.0.1"
+		}
+		host = strings.TrimRight(host, "/")
+
+		endpoints := make([]string, 0, portCount)
+		for i := 0; i < portCount; i++ {
+			raw := fmt.Sprintf("%s:%d", host, portStart+i)
+			ep, err := normalizeAPIURL(raw)
+			if err != nil {
+				return nil, fmt.Errorf("invalid endpoint %s: %w", raw, err)
+			}
+			endpoints = append(endpoints, ep)
+		}
+		return endpoints, nil
+	}
+
+	ep, err := normalizeAPIURL(apiURL)
+	if err != nil {
+		return nil, err
+	}
+	return []string{ep}, nil
+}
+
 func loadReportRow(code string, playerID uint) (*models.Report, error) {
-	var report models.Report
+	var reports []models.Report
 	query := db.DB.Model(&models.Report{}).
 		Where("master_report = ? OR source_report = ?", code, code).
 		Order("id desc")
 	if playerID > 0 {
 		query = query.Where("player_id = ?", playerID)
 	}
-	if err := query.First(&report).Error; err != nil {
+	if err := query.Find(&reports).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("report not found: %s", code)
 		}
 		return nil, err
 	}
-	return &report, nil
+	if len(reports) == 0 {
+		return nil, fmt.Errorf("report not found: %s", code)
+	}
+
+	if selected := selectPreferredReportRow(reports, code); selected != nil {
+		return selected, nil
+	}
+
+	for i := range reports {
+		if reportMetadataHasMasterData(reports[i].ReportMetadata) {
+			return &reports[i], nil
+		}
+	}
+
+	fallback := reports[0]
+	if fallback.MasterReport != "" {
+		var sameMaster []models.Report
+		masterQuery := db.DB.Model(&models.Report{}).
+			Where("master_report = ?", fallback.MasterReport).
+			Order("id desc")
+		if playerID > 0 {
+			masterQuery = masterQuery.Where("player_id = ?", playerID)
+		}
+		if err := masterQuery.Find(&sameMaster).Error; err == nil {
+			for i := range sameMaster {
+				if reportMetadataHasMasterData(sameMaster[i].ReportMetadata) {
+					return &sameMaster[i], nil
+				}
+			}
+		}
+	}
+
+	return &fallback, nil
+}
+
+func selectPreferredReportRow(reports []models.Report, code string) *models.Report {
+	normalizedCode := strings.TrimSpace(code)
+	bestIndex := -1
+	bestRank := 1 << 30
+
+	for i := range reports {
+		rank := reportRowRank(reports[i], normalizedCode)
+		if rank >= 100 {
+			continue
+		}
+		if !reportMetadataHasMasterData(reports[i].ReportMetadata) {
+			rank += 10
+		}
+		if rank < bestRank {
+			bestRank = rank
+			bestIndex = i
+		}
+	}
+
+	if bestIndex >= 0 {
+		return &reports[bestIndex]
+	}
+	return nil
+}
+
+func reportRowRank(report models.Report, code string) int {
+	masterMatch := strings.EqualFold(strings.TrimSpace(report.MasterReport), code)
+	sourceMatch := strings.EqualFold(strings.TrimSpace(report.SourceReport), code)
+
+	switch {
+	case masterMatch && sourceMatch:
+		return 0
+	case masterMatch:
+		return 1
+	case sourceMatch:
+		return 2
+	default:
+		return 100
+	}
+}
+
+func reportMetadataHasMasterData(raw datatypes.JSON) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return false
+	}
+	_, ok := payload["masterData"]
+	return ok
 }
 
 func loadFights(code string, playerID uint) ([]fightRow, error) {
@@ -352,4 +557,24 @@ func postJSON(client *http.Client, endpoint string, payload any) ([]byte, error)
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 	return respBody, nil
+}
+
+func envString(key, fallback string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+func envInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
 }
