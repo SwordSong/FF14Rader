@@ -263,8 +263,33 @@ func buildAnalyzeURLsFromHostEntries(entries []analyzeHostEntry) []string {
 
 // RecommendedWorkerCount 返回根据当前解析服务配置计算的建议并发。
 func (s *Service) RecommendedWorkerCount() int {
-	unique := uniqueAnalyzeURLs(s.apiURLs)
-	if len(unique) == 0 {
+	if live := s.recommendedWorkerCountFromHealth(); live > 0 {
+		return clampRecommendedConcurrency(live)
+	}
+	return clampRecommendedConcurrency(s.recommendedWorkerCountFromConfig())
+}
+
+func (s *Service) recommendedWorkerCountFromHealth() int {
+	endpoints := uniqueAnalyzeURLs(s.apiURLs)
+	if len(endpoints) == 0 {
+		return 0
+	}
+
+	client := &http.Client{Timeout: 1200 * time.Millisecond}
+	total := 0
+	for _, endpoint := range endpoints {
+		c := probeAnalyzeEndpointConcurrency(client, endpoint)
+		if c <= 0 {
+			continue
+		}
+		total += c
+	}
+	return total
+}
+
+func (s *Service) recommendedWorkerCountFromConfig() int {
+	slots := normalizeAnalyzeURLs(s.apiURLs)
+	if len(slots) == 0 {
 		return 1
 	}
 
@@ -273,29 +298,147 @@ func (s *Service) RecommendedWorkerCount() int {
 		perWorker = 1
 	}
 
-	mode := strings.ToLower(strings.TrimSpace(os.Getenv("XIVA_EXECUTION_MODE")))
+	// Thread pool mode as default: env thread worker count still has highest fallback priority.
 	threadWorkers := envInt("XIVA_THREAD_POOL_SIZE", 0)
 	if threadWorkers == 0 {
 		threadWorkers = envInt("XIVA_PORT_COUNT", 0)
 	}
-	if (mode == "thread" || mode == "threads" || mode == "process" || mode == "processes" || mode == "pool") && threadWorkers > 0 {
-		return clampRecommendedConcurrency(threadWorkers * perWorker)
+	if threadWorkers > 0 {
+		return threadWorkers * perWorker
 	}
 
-	localCount := countLocalAnalyzeURLs(unique)
-	if localCount > 0 {
+	localSlots := countLocalAnalyzeURLs(slots)
+	remoteSlots := len(slots) - localSlots
+	if localSlots < 0 {
+		localSlots = 0
+	}
+	if remoteSlots < 0 {
+		remoteSlots = 0
+	}
+
+	if localSlots > 0 {
 		cpuCap := runtime.NumCPU() * 2
 		if cpuCap <= 0 {
 			cpuCap = 1
 		}
-		recommended := localCount * perWorker
-		if recommended > cpuCap {
-			recommended = cpuCap
+		localRecommended := localSlots * perWorker
+		if localRecommended > cpuCap {
+			localRecommended = cpuCap
 		}
-		return clampRecommendedConcurrency(recommended)
+		return localRecommended + remoteSlots*perWorker
 	}
 
-	return clampRecommendedConcurrency(len(unique) * perWorker)
+	return len(slots) * perWorker
+}
+
+func probeAnalyzeEndpointConcurrency(client *http.Client, analyzeURL string) int {
+	healthURL, err := analyzeURLToHealthURL(analyzeURL)
+	if err != nil {
+		return 0
+	}
+
+	req, err := http.NewRequest(http.MethodGet, healthURL, nil)
+	if err != nil {
+		return 0
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+	if err != nil {
+		return 0
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return 0
+	}
+
+	if v := parsePositiveIntAny(payload["maxConcurrency"]); v > 0 {
+		return v
+	}
+	if v := parsePositiveIntAny(payload["threadPoolSize"]); v > 0 {
+		return v
+	}
+
+	if threadPoolRaw, ok := payload["threadPool"]; ok {
+		if threadPool, ok := threadPoolRaw.(map[string]any); ok {
+			if v := parsePositiveIntAny(threadPool["desiredSize"]); v > 0 {
+				return v
+			}
+			if v := parsePositiveIntAny(threadPool["size"]); v > 0 {
+				return v
+			}
+		}
+	}
+
+	return 1
+}
+
+func analyzeURLToHealthURL(analyzeURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(analyzeURL))
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid analyze url: %s", analyzeURL)
+	}
+	parsed.Path = "/health"
+	parsed.RawQuery = ""
+	return parsed.String(), nil
+}
+
+func parsePositiveIntAny(v any) int {
+	switch value := v.(type) {
+	case int:
+		if value > 0 {
+			return value
+		}
+	case int32:
+		if value > 0 {
+			return int(value)
+		}
+	case int64:
+		if value > 0 {
+			return int(value)
+		}
+	case float64:
+		if value > 0 {
+			return int(math.Floor(value))
+		}
+	case json.Number:
+		if parsed, err := strconv.Atoi(value.String()); err == nil && parsed > 0 {
+			return parsed
+		}
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func normalizeAnalyzeURLs(urls []string) []string {
+	if len(urls) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(urls))
+	for _, raw := range urls {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		out = append(out, u)
+	}
+	return out
 }
 
 func uniqueAnalyzeURLs(urls []string) []string {
@@ -563,22 +706,28 @@ func BuildChecklistGCDGateFromRaw(raw datatypes.JSON) *ChecklistGCDGate {
 }
 
 func (s *Service) ScoreFight(ctx context.Context, playerID uint, reportCode string, fightID int) error {
+	_, err := s.ScoreFightWithEndpoint(ctx, playerID, reportCode, fightID)
+	return err
+}
+
+// ScoreFightWithEndpoint 执行评分并返回实际执行解析的主机地址（host:port）。
+func (s *Service) ScoreFightWithEndpoint(ctx context.Context, playerID uint, reportCode string, fightID int) (string, error) {
 	report, err := loadReportRow(playerID, reportCode)
 	if err != nil {
-		return err
+		return "", err
 	}
 	fight, err := loadFightRow(playerID, reportCode, fightID)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	masterData, err := extractMasterData(report.ReportMetadata)
 	if err != nil {
-		return fmt.Errorf("parse report metadata failed: %v", err)
+		return "", fmt.Errorf("parse report metadata failed: %v", err)
 	}
 	events, err := readEvents(filepath.Join(s.root, reportCode, fmt.Sprintf("fight_%d_events.json", fightID)))
 	if err != nil {
-		return fmt.Errorf("read events failed: %v", err)
+		return "", fmt.Errorf("read events failed: %v", err)
 	}
 
 	payload := analyzeRequest{
@@ -594,13 +743,14 @@ func (s *Service) ScoreFight(ctx context.Context, playerID uint, reportCode stri
 		Events: events,
 	}
 
-	resp, rawBody, err := s.postAnalyze(ctx, payload)
+	resp, rawBody, endpoint, err := s.postAnalyze(ctx, payload)
+	analyzeHost := analyzeEndpointHost(endpoint)
 	if err != nil {
-		return err
+		return analyzeHost, err
 	}
 
 	if err := os.WriteFile(filepath.Join(s.root, reportCode, fmt.Sprintf("fight_%d_analysis.json", fightID)), rawBody, 0644); err != nil {
-		return fmt.Errorf("write analysis output failed: %v", err)
+		return analyzeHost, fmt.Errorf("write analysis output failed: %v", err)
 	}
 
 	playerName := loadPlayerName(playerID)
@@ -618,7 +768,7 @@ func (s *Service) ScoreFight(ctx context.Context, playerID uint, reportCode stri
 
 	selectedActor, ok := selectScoringActor(playerName, fight.Job, masterData, allActors)
 	if !ok {
-		return &NoMatchedActorError{
+		return analyzeHost, &NoMatchedActorError{
 			ReportCode:  reportCode,
 			FightID:     fightID,
 			PlayerName:  playerName,
@@ -629,27 +779,27 @@ func (s *Service) ScoreFight(ctx context.Context, playerID uint, reportCode stri
 
 	score, err := s.buildScoreRow(playerID, reportCode, fight, selectedActor)
 	if err != nil {
-		return err
+		return analyzeHost, err
 	}
 	if err := updateFightSyncScore(score); err != nil {
-		return err
+		return analyzeHost, err
 	}
 	if err := refreshPlayerBattleAbility(playerID); err != nil {
-		return fmt.Errorf("refresh player battle ability failed: %v", err)
+		return analyzeHost, fmt.Errorf("refresh player battle ability failed: %v", err)
 	}
 	if err := refreshPlayerTeamContribution(playerID); err != nil {
-		return fmt.Errorf("refresh player team contribution failed: %v", err)
+		return analyzeHost, fmt.Errorf("refresh player team contribution failed: %v", err)
 	}
 	if err := refreshPlayerStabilityScore(playerID); err != nil {
-		return fmt.Errorf("refresh player stability score failed: %v", err)
+		return analyzeHost, fmt.Errorf("refresh player stability score failed: %v", err)
 	}
 	if err := refreshPlayerProgressionSpeed(playerID); err != nil {
-		return fmt.Errorf("refresh player progression speed failed: %v", err)
+		return analyzeHost, fmt.Errorf("refresh player progression speed failed: %v", err)
 	}
 	if err := refreshPlayerPotentialScore(playerID); err != nil {
-		return fmt.Errorf("refresh player potential score failed: %v", err)
+		return analyzeHost, fmt.Errorf("refresh player potential score failed: %v", err)
 	}
-	return nil
+	return analyzeHost, nil
 }
 
 // RefreshPlayerTeamAndStability 回填单个玩家的团队贡献、稳定度与潜力值。
@@ -1036,20 +1186,22 @@ func uniqueActorNames(actors []analyzedActor) []string {
 	return names
 }
 
-func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*analyzeResponse, []byte, error) {
+func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*analyzeResponse, []byte, string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	const maxAttempts = 3
 	var lastErr error
+	lastEndpoint := ""
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		endpoint := s.pickAnalyzeURL()
+		lastEndpoint = endpoint
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if reqErr != nil {
-			return nil, nil, reqErr
+			return nil, nil, endpoint, reqErr
 		}
 		req.Header.Set("Content-Type", "application/json")
 
@@ -1058,11 +1210,11 @@ func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*ana
 			lastErr = doErr
 			if attempt < maxAttempts && isTransientAnalyzeError(doErr) {
 				if err := waitRetry(ctx, attempt); err != nil {
-					return nil, nil, err
+					return nil, nil, endpoint, err
 				}
 				continue
 			}
-			return nil, nil, doErr
+			return nil, nil, endpoint, doErr
 		}
 
 		respBody, readErr := io.ReadAll(resp.Body)
@@ -1071,11 +1223,11 @@ func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*ana
 			lastErr = readErr
 			if attempt < maxAttempts && isTransientAnalyzeError(readErr) {
 				if err := waitRetry(ctx, attempt); err != nil {
-					return nil, nil, err
+					return nil, nil, endpoint, err
 				}
 				continue
 			}
-			return nil, nil, readErr
+			return nil, nil, endpoint, readErr
 		}
 
 		if resp.StatusCode >= 400 {
@@ -1083,24 +1235,40 @@ func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*ana
 			lastErr = err
 			if attempt < maxAttempts && (resp.StatusCode == 429 || resp.StatusCode >= 500) {
 				if err := waitRetry(ctx, attempt); err != nil {
-					return nil, nil, err
+					return nil, nil, endpoint, err
 				}
 				continue
 			}
-			return nil, nil, err
+			return nil, nil, endpoint, err
 		}
 
 		var parsed analyzeResponse
 		if err := json.Unmarshal(respBody, &parsed); err != nil {
-			return nil, nil, err
+			return nil, nil, endpoint, err
 		}
-		return &parsed, respBody, nil
+		return &parsed, respBody, endpoint, nil
 	}
 
 	if lastErr == nil {
 		lastErr = fmt.Errorf("analyze failed after retries")
 	}
-	return nil, nil, lastErr
+	return nil, nil, lastEndpoint, lastErr
+}
+
+func analyzeEndpointHost(endpoint string) string {
+	trimmed := strings.TrimSpace(endpoint)
+	if trimmed == "" {
+		return ""
+	}
+
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	if u.Host != "" {
+		return u.Host
+	}
+	return trimmed
 }
 
 func (s *Service) pickAnalyzeURL() string {

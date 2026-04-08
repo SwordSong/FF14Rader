@@ -382,7 +382,7 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 	var parsedCount int64
 	var activeCount int64
 
-	logProgress := func(reportCode string, fightID int, status string) {
+	logProgress := func(reportCode string, fightID int, status string, analyzeHost string) {
 		parsed := atomic.LoadInt64(&parsedCount)
 		active := atomic.LoadInt64(&activeCount)
 
@@ -401,8 +401,13 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 			eta = etaAt.Format("15:04:05")
 		}
 
-		log.Printf("[SCORE] %s-%d %s | 已解析=%d/%d 当前并发=%d/%d 当前速度=%.2f fights/s 预计完成=%s",
-			reportCode, fightID, status, parsed, totalCount, active, int64(workerCount), speed, eta)
+		hostLabel := strings.TrimSpace(analyzeHost)
+		if hostLabel == "" {
+			hostLabel = "未知"
+		}
+
+		log.Printf("[SCORE] %s-%d %s | 已解析=%d/%d 当前并发=%d/%d 当前速度=%.2f fights/s 预计完成=%s 解析主机=%s",
+			reportCode, fightID, status, parsed, totalCount, active, int64(workerCount), speed, eta, hostLabel)
 	}
 
 	log.Printf("[SCORE] 解析进度启动 | 已解析=0/%d 当前并发=0/%d 当前速度=0.00 fights/s 预计完成=--", totalCount, workerCount)
@@ -423,19 +428,20 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 			scoreCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
 
-			if err := s.scorer.ScoreFight(scoreCtx, playerID, reportCode, fightID); err != nil {
+			analyzeHost, err := s.scorer.ScoreFightWithEndpoint(scoreCtx, playerID, reportCode, fightID)
+			if err != nil {
 				if scoring.IsNoMatchedActorError(err) {
 					if markErr := markFightSkippedNoMatch(mappingID); markErr != nil {
 						log.Printf("[SCORE] fight %s-%d skip-mark failed: %v", reportCode, fightID, markErr)
-						logProgress(reportCode, fightID, "失败(标记跳过)")
+						logProgress(reportCode, fightID, "失败(标记跳过)", analyzeHost)
 						return
 					}
 					atomic.AddInt64(&parsedCount, 1)
-					logProgress(reportCode, fightID, "跳过(无匹配角色)")
+					logProgress(reportCode, fightID, "跳过(无匹配角色)", analyzeHost)
 					return
 				}
 				log.Printf("[SCORE] fight %s-%d failed: %v", reportCode, fightID, err)
-				logProgress(reportCode, fightID, "失败(评分)")
+				logProgress(reportCode, fightID, "失败(评分)", analyzeHost)
 				return
 			}
 
@@ -443,11 +449,11 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 				Where("id = ?", mappingID).
 				Update("parsed_done", true).Error; err != nil {
 				log.Printf("[SCORE] mark parsed_done failed (%s-%d): %v", reportCode, fightID, err)
-				logProgress(reportCode, fightID, "失败(更新parsed_done)")
+				logProgress(reportCode, fightID, "失败(更新parsed_done)", analyzeHost)
 				return
 			}
 			atomic.AddInt64(&parsedCount, 1)
-			logProgress(reportCode, fightID, "完成")
+			logProgress(reportCode, fightID, "完成", analyzeHost)
 		}(task.mappingID, task.reportCode, task.fightID)
 	}
 
@@ -469,6 +475,12 @@ func getScoreConcurrency(scorer *scoring.Service) int {
 		}
 	}
 
+	if scorer != nil {
+		if v := scorer.RecommendedWorkerCount(); v > 0 {
+			return v
+		}
+	}
+
 	parsePositiveInt := func(key string) int {
 		raw := strings.TrimSpace(os.Getenv(key))
 		if raw == "" {
@@ -481,7 +493,6 @@ func getScoreConcurrency(scorer *scoring.Service) int {
 		return v
 	}
 
-	mode := strings.ToLower(strings.TrimSpace(os.Getenv("XIVA_EXECUTION_MODE")))
 	threadWorkers := parsePositiveInt("XIVA_THREAD_POOL_SIZE")
 	if threadWorkers == 0 {
 		threadWorkers = parsePositiveInt("XIVA_PORT_COUNT")
@@ -490,30 +501,12 @@ func getScoreConcurrency(scorer *scoring.Service) int {
 	if perWorker == 0 {
 		perWorker = 1
 	}
-
-	switch mode {
-	case "thread", "threads":
-		if threadWorkers > 0 {
-			return threadWorkers * perWorker
-		}
-	case "process", "processes", "pool":
-		if threadWorkers > 0 {
-			return threadWorkers * perWorker
-		}
-	default:
-		// Keep default behavior aligned with xiva server: PORT_COUNT>1 means single-process thread pool unless forced process mode.
-		if threadWorkers > 0 {
-			return threadWorkers * perWorker
-		}
+	if threadWorkers > 0 {
+		return threadWorkers * perWorker
 	}
 
 	if v := parsePositiveInt("XIVA_CALL_CONCURRENCY"); v > 0 {
 		return v
-	}
-	if scorer != nil {
-		if v := scorer.RecommendedWorkerCount(); v > 0 {
-			return v
-		}
 	}
 	return defaultConcurrency
 }

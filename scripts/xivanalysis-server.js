@@ -36,19 +36,25 @@ const OUTPUT_LOCALE = (process.env.XIVA_OUTPUT_LOCALE || process.env.XIVA_LOCALE
 const WORKER_MODE = process.env.XIVA_WORKER_MODE === '1'
 const PORT_POOL_START = parsePositiveInt(process.env.XIVA_PORT_START, 22000)
 const PORT_POOL_COUNT = parsePositiveInt(process.env.XIVA_PORT_COUNT, 1)
+const THREAD_POOL_AUTOSCALE_INTERVAL_MS = Math.max(
+  1000,
+  Number(process.env.XIVA_THREAD_POOL_AUTOSCALE_INTERVAL_MS || 15 * 1000) || 15 * 1000,
+)
 const THREAD_POOL_RECOMMENDATION_INFO = computeRecommendedThreadPoolSize()
 const THREAD_POOL_SIZE = THREAD_POOL_RECOMMENDATION_INFO.recommended
 const THREAD_POOL_SIZE_SOURCE = `recommended:${THREAD_POOL_RECOMMENDATION_INFO.reason}`
 const RECOMMENDED_CONCURRENCY_INFO = computeLocalRecommendedConcurrency(THREAD_POOL_SIZE)
 const EXPLICIT_MAX_CONCURRENCY = parsePositiveInt(process.env.MAX_CONCURRENCY, 0)
-const MAX_CONCURRENCY = EXPLICIT_MAX_CONCURRENCY > 0 ? EXPLICIT_MAX_CONCURRENCY : RECOMMENDED_CONCURRENCY_INFO.recommended
-const MAX_CONCURRENCY_SOURCE = EXPLICIT_MAX_CONCURRENCY > 0
+const DEFAULT_MAX_CONCURRENCY = EXPLICIT_MAX_CONCURRENCY > 0 ? EXPLICIT_MAX_CONCURRENCY : RECOMMENDED_CONCURRENCY_INFO.recommended
+const DEFAULT_MAX_CONCURRENCY_SOURCE = EXPLICIT_MAX_CONCURRENCY > 0
   ? 'env:MAX_CONCURRENCY'
   : `recommended:${RECOMMENDED_CONCURRENCY_INFO.reason}`
 
 const RECOMMEND_REASON_ZH = {
   'single-default': '单机默认策略',
   'thread-pool-default': '线程池默认策略',
+  'host-performance': '主机性能评估',
+  'thread-pool-autoscale': '线程池自动伸缩联动',
   'cpu-parallelism': 'CPU 并行度',
   'hosts-config': '解析主机配置',
   'execution-mode': '执行模式配置',
@@ -115,6 +121,20 @@ function clampInt(value, min, max) {
     return max
   }
   return value
+}
+
+function clampFloat(value, min, max) {
+  const n = Number(value)
+  if (!Number.isFinite(n)) {
+    return min
+  }
+  if (n < min) {
+    return min
+  }
+  if (n > max) {
+    return max
+  }
+  return n
 }
 
 function resolveHostsConfigPath(rawPath) {
@@ -261,30 +281,51 @@ function computeRecommendedThreadPoolSize() {
   const localHostSet = getLocalHostSet()
   const hostEntries = loadAnalyzeHostEntriesFromConfig(HOSTS_CONFIG_PATH)
   const slots = summarizeHostSlots(hostEntries, localHostSet)
-  const cpuCap = clampInt(getCpuParallelism(), 1, 64)
+  const cpuParallelism = clampInt(getCpuParallelism(), 1, 64)
+  const loadAvg1 = clampFloat(os.loadavg()[0], 0, 9999)
+  const loadPerCore = cpuParallelism > 0 ? loadAvg1 / cpuParallelism : 0
 
-  let reason = 'thread-pool-default'
-  let rawRecommended = Math.max(1, Math.floor(cpuCap / 2))
+  const memoryTotalBytes = Math.max(1, Number(os.totalmem()) || 1)
+  const memoryFreeBytes = clampFloat(os.freemem(), 0, memoryTotalBytes)
+  const memoryFreeRatio = clampFloat(memoryFreeBytes / memoryTotalBytes, 0, 1)
 
-  if (PORT_POOL_COUNT > 1) {
-    rawRecommended = PORT_POOL_COUNT
-    reason = 'port-pool'
-  } else if (slots.localHostSlots > 0) {
-    rawRecommended = slots.localHostSlots
-    reason = 'hosts-config-local'
-  } else if (slots.totalHostSlots > 0) {
-    rawRecommended = slots.totalHostSlots
-    reason = 'hosts-config'
-  } else {
-    reason = 'cpu-parallelism'
+  // Conservative down-scaling when host load or memory pressure is high.
+  let cpuFactor = 1
+  if (loadPerCore >= 1.5) {
+    cpuFactor = 0.45
+  } else if (loadPerCore >= 1.2) {
+    cpuFactor = 0.6
+  } else if (loadPerCore >= 1.0) {
+    cpuFactor = 0.75
+  } else if (loadPerCore >= 0.75) {
+    cpuFactor = 0.9
   }
 
-  const recommended = clampInt(rawRecommended, 1, cpuCap)
+  let memoryFactor = 1
+  if (memoryFreeRatio <= 0.1) {
+    memoryFactor = 0.45
+  } else if (memoryFreeRatio <= 0.2) {
+    memoryFactor = 0.65
+  } else if (memoryFreeRatio <= 0.3) {
+    memoryFactor = 0.8
+  }
+
+  const rawRecommended = Math.floor(cpuParallelism * cpuFactor * memoryFactor)
+  const recommended = clampInt(rawRecommended, 1, cpuParallelism)
+  const reason = 'host-performance'
 
   return {
     recommended,
     reason,
-    cpuCap,
+    cpuCap: cpuParallelism,
+    cpuParallelism,
+    loadAvg1,
+    loadPerCore,
+    cpuFactor,
+    memoryTotalBytes,
+    memoryFreeBytes,
+    memoryFreeRatio,
+    memoryFactor,
     portPoolCount: PORT_POOL_COUNT,
     hostsConfigPath: HOSTS_CONFIG_PATH,
     hostEntries: hostEntries.length,
@@ -405,6 +446,12 @@ function buildRecommendedThreadPoolZh(info) {
   return {
     推荐线程池大小: info.recommended,
     推荐原因: toReasonZh(info.reason),
+    CPU并行度: info.cpuParallelism,
+    当前1分钟负载: info.loadAvg1,
+    每核负载: info.loadPerCore,
+    CPU调整系数: info.cpuFactor,
+    内存可用比例: info.memoryFreeRatio,
+    内存调整系数: info.memoryFactor,
     CPU上限: info.cpuCap,
     端口池数量: info.portPoolCount,
     主机配置路径: info.hostsConfigPath,
@@ -414,16 +461,72 @@ function buildRecommendedThreadPoolZh(info) {
   }
 }
 
-function buildConcurrencyCompatFields(mode) {
+function getThreadPoolConfigInfo() {
+  if (threadPoolManager && typeof threadPoolManager.getSizingInfo === 'function') {
+    return threadPoolManager.getSizingInfo()
+  }
+
+  return {
+    threadPoolSize: THREAD_POOL_SIZE,
+    threadPoolSizeSource: THREAD_POOL_SIZE_SOURCE,
+    recommendedThreadPool: THREAD_POOL_RECOMMENDATION_INFO,
+    autoScaleIntervalMs: THREAD_POOL_AUTOSCALE_INTERVAL_MS,
+  }
+}
+
+function buildDynamicRecommendedConcurrency(poolInfo) {
+  const threadPoolSize = parsePositiveInt(poolInfo && poolInfo.threadPoolSize, 1)
+  const perWorker = Math.max(1, CALL_CONCURRENCY_PER_WORKER)
+  const dynamicRecommended = clampInt(threadPoolSize * perWorker, 1, 128)
+
+  return {
+    ...RECOMMENDED_CONCURRENCY_INFO,
+    recommended: dynamicRecommended,
+    reason: 'thread-pool-autoscale',
+    perWorker,
+    threadPoolSize,
+  }
+}
+
+function getCurrentConcurrencyInfo(threadPoolConfigInfo) {
+  if (EXPLICIT_MAX_CONCURRENCY > 0) {
+    return {
+      maxConcurrency: EXPLICIT_MAX_CONCURRENCY,
+      maxConcurrencySource: 'env:MAX_CONCURRENCY',
+      recommendedConcurrency: RECOMMENDED_CONCURRENCY_INFO,
+    }
+  }
+
+  const poolInfo = threadPoolConfigInfo || getThreadPoolConfigInfo()
+  if (threadPoolManager && poolInfo && parsePositiveInt(poolInfo.threadPoolSize, 0) > 0) {
+    const recommendedConcurrency = buildDynamicRecommendedConcurrency(poolInfo)
+    return {
+      maxConcurrency: recommendedConcurrency.recommended,
+      maxConcurrencySource: 'recommended:thread-pool-autoscale',
+      recommendedConcurrency,
+    }
+  }
+
+  return {
+    maxConcurrency: DEFAULT_MAX_CONCURRENCY,
+    maxConcurrencySource: DEFAULT_MAX_CONCURRENCY_SOURCE,
+    recommendedConcurrency: RECOMMENDED_CONCURRENCY_INFO,
+  }
+}
+
+function buildConcurrencyCompatFields(mode, threadPoolConfigInfo, concurrencyInfo) {
+  const poolInfo = threadPoolConfigInfo || getThreadPoolConfigInfo()
+  const runtimeConcurrency = concurrencyInfo || getCurrentConcurrencyInfo(poolInfo)
   return {
     modeZh: toModeZh(mode),
     maxBodyBytesZh: formatBytesZh(MAX_BODY_BYTES),
-    threadPoolSizeZh: THREAD_POOL_SIZE,
-    threadPoolSizeSourceZh: toThreadPoolSourceZh(THREAD_POOL_SIZE_SOURCE),
-    recommendedThreadPoolZh: buildRecommendedThreadPoolZh(THREAD_POOL_RECOMMENDATION_INFO),
-    maxConcurrencyZh: MAX_CONCURRENCY,
-    maxConcurrencySourceZh: toMaxConcurrencySourceZh(MAX_CONCURRENCY_SOURCE),
-    recommendedConcurrencyZh: buildRecommendedConcurrencyZh(RECOMMENDED_CONCURRENCY_INFO),
+    threadPoolSizeZh: poolInfo.threadPoolSize,
+    threadPoolSizeSourceZh: toThreadPoolSourceZh(poolInfo.threadPoolSizeSource),
+    recommendedThreadPoolZh: buildRecommendedThreadPoolZh(poolInfo.recommendedThreadPool),
+    threadPoolAutoScaleIntervalMsZh: poolInfo.autoScaleIntervalMs,
+    maxConcurrencyZh: runtimeConcurrency.maxConcurrency,
+    maxConcurrencySourceZh: toMaxConcurrencySourceZh(runtimeConcurrency.maxConcurrencySource),
+    recommendedConcurrencyZh: buildRecommendedConcurrencyZh(runtimeConcurrency.recommendedConcurrency),
   }
 }
 
@@ -581,12 +684,15 @@ function shouldUseThreadPoolMode() {
   if (EXECUTION_MODE === 'thread' || EXECUTION_MODE === 'threads') {
     return THREAD_POOL_SIZE > 0
   }
-  // Default behavior: if user configured multiple XIVA ports, run a single process with worker threads.
-  return PORT_POOL_COUNT > 1 && THREAD_POOL_SIZE > 1
+  // Default behavior: prefer in-process worker thread pool whenever recommended size is greater than 1.
+  return THREAD_POOL_SIZE > 1
 }
 
 function startThreadPoolServer() {
-  threadPoolManager = new ThreadWorkerPool(THREAD_POOL_SIZE)
+  threadPoolManager = new ThreadWorkerPool(THREAD_POOL_SIZE, {
+    recommendFn: computeRecommendedThreadPoolSize,
+    autoScaleIntervalMs: THREAD_POOL_AUTOSCALE_INTERVAL_MS,
+  })
   serviceState.ready = true
   startServer()
 }
@@ -654,20 +760,175 @@ function startThreadWorkerLoop() {
 }
 
 class ThreadWorkerPool {
-  constructor(size) {
+  constructor(size, options = {}) {
     this.size = Math.max(1, Number(size) || 1)
+    this.desiredSize = this.size
     this.queue = []
     this.inFlight = new Map()
-    this.workers = new Array(this.size)
+    this.workers = []
+    this.workerSeq = 0
     this.taskSeq = 0
     this.shuttingDown = false
+    this.recommendFn = typeof options.recommendFn === 'function' ? options.recommendFn : null
+    this.autoScaleIntervalMs = parsePositiveInt(options.autoScaleIntervalMs, THREAD_POOL_AUTOSCALE_INTERVAL_MS)
+    this.autoScaleTimer = null
+    this.recommendedInfo = this.normalizeRecommendation(
+      this.recommendFn
+        ? this.recommendFn()
+        : {recommended: this.size, reason: 'thread-pool-default'},
+    )
+    this.sizeSource = `recommended:${this.recommendedInfo.reason}`
 
     for (let i = 0; i < this.size; i++) {
-      this.workers[i] = this.spawnWorker(i)
+      this.workers.push(this.spawnWorker())
+    }
+
+    this.startAutoScaleLoop()
+  }
+
+  normalizeRecommendation(info) {
+    const fallbackCpuCap = clampInt(getCpuParallelism(), 1, 64)
+    const base = info && typeof info === 'object' ? info : {}
+    const cpuCap = clampInt(parsePositiveInt(base.cpuCap, fallbackCpuCap), 1, 256)
+    const recommended = clampInt(parsePositiveInt(base.recommended, this.desiredSize), 1, cpuCap)
+    const reason = typeof base.reason === 'string' && base.reason !== ''
+      ? base.reason
+      : 'thread-pool-default'
+
+    return {
+      ...base,
+      cpuCap,
+      recommended,
+      reason,
     }
   }
 
-  spawnWorker(index) {
+  startAutoScaleLoop() {
+    if (!this.recommendFn || this.autoScaleIntervalMs <= 0) {
+      return
+    }
+
+    this.autoScaleTimer = setInterval(() => {
+      this.refreshAutoScale()
+    }, this.autoScaleIntervalMs)
+
+    if (this.autoScaleTimer && typeof this.autoScaleTimer.unref === 'function') {
+      this.autoScaleTimer.unref()
+    }
+  }
+
+  stopAutoScaleLoop() {
+    if (this.autoScaleTimer) {
+      clearInterval(this.autoScaleTimer)
+      this.autoScaleTimer = null
+    }
+  }
+
+  refreshAutoScale() {
+    if (this.shuttingDown || !this.recommendFn) {
+      return
+    }
+
+    const previousSize = this.desiredSize
+    const nextInfo = this.normalizeRecommendation(this.recommendFn())
+
+    this.recommendedInfo = nextInfo
+    this.sizeSource = `recommended:${nextInfo.reason}`
+
+    if (nextInfo.recommended === previousSize) {
+      return
+    }
+
+    this.resize(nextInfo.recommended)
+    logEvent('info', '线程池已自动伸缩', {
+      mode: 'threads',
+      previousSize,
+      targetSize: this.desiredSize,
+      recommendedThreadPool: this.recommendedInfo,
+      autoScaleIntervalMs: this.autoScaleIntervalMs,
+    })
+  }
+
+  replaceWorkerState(oldState, newState) {
+    const index = this.workers.indexOf(oldState)
+    if (index >= 0) {
+      this.workers[index] = newState
+      return
+    }
+    this.workers.push(newState)
+  }
+
+  removeWorkerState(state) {
+    const index = this.workers.indexOf(state)
+    if (index >= 0) {
+      this.workers.splice(index, 1)
+    }
+  }
+
+  terminateWorkerState(state) {
+    if (!state || !state.worker) {
+      return
+    }
+
+    try {
+      state.worker.postMessage({type: 'shutdown'})
+    } catch (_err) {
+    }
+
+    state.worker.terminate().catch(() => {})
+  }
+
+  retireWorkerState(state) {
+    if (!state || state.retiring) {
+      return
+    }
+
+    state.retiring = true
+    if (!state.busy) {
+      this.terminateWorkerState(state)
+    }
+  }
+
+  resize(targetSize) {
+    if (this.shuttingDown) {
+      return
+    }
+
+    const target = clampInt(parsePositiveInt(targetSize, this.desiredSize), 1, 128)
+    if (target === this.desiredSize) {
+      return
+    }
+
+    this.desiredSize = target
+    const activeWorkers = this.workers.filter(state => state && !state.retiring)
+
+    if (target > activeWorkers.length) {
+      const grow = target - activeWorkers.length
+      for (let i = 0; i < grow; i++) {
+        this.workers.push(this.spawnWorker())
+      }
+      this.drain()
+      return
+    }
+
+    const shrink = activeWorkers.length - target
+    const candidates = activeWorkers
+      .slice()
+      .sort((a, b) => {
+        if (a.busy === b.busy) {
+          return 0
+        }
+        return a.busy ? 1 : -1
+      })
+
+    for (let i = 0; i < shrink && i < candidates.length; i++) {
+      this.retireWorkerState(candidates[i])
+    }
+  }
+
+  spawnWorker() {
+    this.workerSeq += 1
+    const workerId = this.workerSeq
     const worker = new Worker(__filename, {
       env: {
         ...process.env,
@@ -677,11 +938,12 @@ class ThreadWorkerPool {
     })
 
     const state = {
-      index,
+      index: workerId,
       worker,
       ready: false,
       busy: false,
       currentTaskId: null,
+      retiring: false,
     }
 
     worker.on('message', msg => this.onWorkerMessage(state, msg))
@@ -703,6 +965,10 @@ class ThreadWorkerPool {
 
     if (msg.type === 'ready') {
       state.ready = true
+      if (state.retiring) {
+        this.terminateWorkerState(state)
+        return
+      }
       this.drain()
       return
     }
@@ -725,6 +991,10 @@ class ThreadWorkerPool {
     if (!slot) {
       state.busy = false
       state.currentTaskId = null
+      if (state.retiring) {
+        this.terminateWorkerState(state)
+        return
+      }
       this.drain()
       return
     }
@@ -739,6 +1009,11 @@ class ThreadWorkerPool {
       slot.reject(new Error(msg.error || '线程解析失败'))
     }
 
+    if (state.retiring) {
+      this.terminateWorkerState(state)
+      return
+    }
+
     this.drain()
   }
 
@@ -748,7 +1023,7 @@ class ThreadWorkerPool {
       const slot = this.inFlight.get(taskId)
       if (slot) {
         this.inFlight.delete(taskId)
-        if (!this.shuttingDown) {
+        if (!this.shuttingDown && !state.retiring) {
           this.queue.unshift({
             id: slot.id,
             payload: slot.payload,
@@ -761,7 +1036,9 @@ class ThreadWorkerPool {
       }
     }
 
-    if (this.shuttingDown) {
+    if (this.shuttingDown || state.retiring) {
+      this.removeWorkerState(state)
+      this.drain()
       return
     }
 
@@ -770,7 +1047,8 @@ class ThreadWorkerPool {
       index: state.index,
       code,
     })
-    this.workers[state.index] = this.spawnWorker(state.index)
+    const replacement = this.spawnWorker()
+    this.replaceWorkerState(state, replacement)
     this.drain()
   }
 
@@ -797,7 +1075,7 @@ class ThreadWorkerPool {
     }
 
     for (const state of this.workers) {
-      if (!state || !state.ready || state.busy) {
+      if (!state || state.retiring || !state.ready || state.busy) {
         continue
       }
       const task = this.queue.shift()
@@ -820,6 +1098,7 @@ class ThreadWorkerPool {
       return
     }
     this.shuttingDown = true
+    this.stopAutoScaleLoop()
 
     while (this.queue.length > 0) {
       const task = this.queue.shift()
@@ -856,13 +1135,30 @@ class ThreadWorkerPool {
     ])
   }
 
+  getSizingInfo() {
+    return {
+      threadPoolSize: this.desiredSize,
+      threadPoolSizeSource: this.sizeSource,
+      recommendedThreadPool: this.recommendedInfo,
+      autoScaleIntervalMs: this.autoScaleIntervalMs,
+    }
+  }
+
   stats() {
     let ready = 0
     let busy = 0
+    let retiring = 0
+    let active = 0
     for (const state of this.workers) {
       if (!state) {
         continue
       }
+      if (state.retiring) {
+        retiring += 1
+        continue
+      }
+
+      active += 1
       if (state.ready) {
         ready += 1
       }
@@ -871,11 +1167,15 @@ class ThreadWorkerPool {
       }
     }
     return {
-      size: this.size,
+      size: active,
+      desiredSize: this.desiredSize,
+      totalWorkers: this.workers.length,
+      retiring,
       ready,
       busy,
       queued: this.queue.length,
       inFlight: this.inFlight.size,
+      autoScaleIntervalMs: this.autoScaleIntervalMs,
     }
   }
 }
@@ -1162,21 +1462,24 @@ function startServer() {
 
     if (method === 'GET' && pathname === '/health') {
       const mode = threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single')
+      const threadPoolConfigInfo = getThreadPoolConfigInfo()
+      const concurrencyInfo = getCurrentConcurrencyInfo(threadPoolConfigInfo)
       sendJson(res, 200, {
         status: 'ok',
         statusZh: '正常',
         ready: serviceState.ready,
         shuttingDown: serviceState.shuttingDown,
         inFlight,
-        threadPoolSize: THREAD_POOL_SIZE,
-        threadPoolSizeSource: THREAD_POOL_SIZE_SOURCE,
-        recommendedThreadPool: THREAD_POOL_RECOMMENDATION_INFO,
-        maxConcurrency: MAX_CONCURRENCY,
-        maxConcurrencySource: MAX_CONCURRENCY_SOURCE,
-        recommendedConcurrency: RECOMMENDED_CONCURRENCY_INFO,
+        threadPoolSize: threadPoolConfigInfo.threadPoolSize,
+        threadPoolSizeSource: threadPoolConfigInfo.threadPoolSizeSource,
+        recommendedThreadPool: threadPoolConfigInfo.recommendedThreadPool,
+        threadPoolAutoScaleIntervalMs: threadPoolConfigInfo.autoScaleIntervalMs,
+        maxConcurrency: concurrencyInfo.maxConcurrency,
+        maxConcurrencySource: concurrencyInfo.maxConcurrencySource,
+        recommendedConcurrency: concurrencyInfo.recommendedConcurrency,
         mode,
         threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
-        ...buildConcurrencyCompatFields(mode),
+        ...buildConcurrencyCompatFields(mode, threadPoolConfigInfo, concurrencyInfo),
       })
       return
     }
@@ -1197,19 +1500,22 @@ function startServer() {
 
     if (method === 'GET' && pathname === '/metrics') {
       const mode = threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single')
+      const threadPoolConfigInfo = getThreadPoolConfigInfo()
+      const concurrencyInfo = getCurrentConcurrencyInfo(threadPoolConfigInfo)
       sendJson(res, 200, {
         ...serviceState.metrics,
         inFlight,
-        threadPoolSize: THREAD_POOL_SIZE,
-        threadPoolSizeSource: THREAD_POOL_SIZE_SOURCE,
-        recommendedThreadPool: THREAD_POOL_RECOMMENDATION_INFO,
-        maxConcurrency: MAX_CONCURRENCY,
-        maxConcurrencySource: MAX_CONCURRENCY_SOURCE,
-        recommendedConcurrency: RECOMMENDED_CONCURRENCY_INFO,
+        threadPoolSize: threadPoolConfigInfo.threadPoolSize,
+        threadPoolSizeSource: threadPoolConfigInfo.threadPoolSizeSource,
+        recommendedThreadPool: threadPoolConfigInfo.recommendedThreadPool,
+        threadPoolAutoScaleIntervalMs: threadPoolConfigInfo.autoScaleIntervalMs,
+        maxConcurrency: concurrencyInfo.maxConcurrency,
+        maxConcurrencySource: concurrencyInfo.maxConcurrencySource,
+        recommendedConcurrency: concurrencyInfo.recommendedConcurrency,
         mode,
         threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
         uptimeMs: Math.max(0, Date.now() - Date.parse(serviceState.metrics.startedAt)),
-        ...buildConcurrencyCompatFields(mode),
+        ...buildConcurrencyCompatFields(mode, threadPoolConfigInfo, concurrencyInfo),
       })
       return
     }
@@ -1241,7 +1547,8 @@ function startServer() {
       return
     }
 
-    if (inFlight >= MAX_CONCURRENCY) {
+    const runtimeConcurrencyInfo = getCurrentConcurrencyInfo()
+    if (inFlight >= runtimeConcurrencyInfo.maxConcurrency) {
       serviceState.metrics.requestsRejected += 1
       sendJson(res, 429, {error: '服务繁忙，请稍后重试', requestId})
       return
@@ -1369,24 +1676,27 @@ function startServer() {
 
   server.listen(PORT, HOST, () => {
     const mode = threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single')
+    const threadPoolConfigInfo = getThreadPoolConfigInfo()
+    const concurrencyInfo = getCurrentConcurrencyInfo(threadPoolConfigInfo)
     logEvent('info', 'xivanalysis 服务已启动', {
       host: HOST,
       port: PORT,
       mode,
-      threadPoolSize: THREAD_POOL_SIZE,
-      threadPoolSizeSource: THREAD_POOL_SIZE_SOURCE,
-      recommendedThreadPool: THREAD_POOL_RECOMMENDATION_INFO,
+      threadPoolSize: threadPoolConfigInfo.threadPoolSize,
+      threadPoolSizeSource: threadPoolConfigInfo.threadPoolSizeSource,
+      recommendedThreadPool: threadPoolConfigInfo.recommendedThreadPool,
+      threadPoolAutoScaleIntervalMs: threadPoolConfigInfo.autoScaleIntervalMs,
       threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
       maxBodyBytes: MAX_BODY_BYTES,
-      maxConcurrency: MAX_CONCURRENCY,
-      maxConcurrencySource: MAX_CONCURRENCY_SOURCE,
-      recommendedConcurrency: RECOMMENDED_CONCURRENCY_INFO,
+      maxConcurrency: concurrencyInfo.maxConcurrency,
+      maxConcurrencySource: concurrencyInfo.maxConcurrencySource,
+      recommendedConcurrency: concurrencyInfo.recommendedConcurrency,
       analyzeTimeoutMs: ANALYZE_TIMEOUT_MS,
       shutdownTimeoutMs: SHUTDOWN_TIMEOUT_MS,
       apiKeyEnabled: API_KEY !== '',
       metricsPath: '/metrics',
       readyPath: '/ready',
-      ...buildConcurrencyCompatFields(mode),
+      ...buildConcurrencyCompatFields(mode, threadPoolConfigInfo, concurrencyInfo),
     })
   })
 }

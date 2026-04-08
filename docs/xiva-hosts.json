@@ -6,6 +6,13 @@
       "port": 22026,
       "enabled": true,
       "weight": 1
+    },
+      {
+      "name": "nmz",
+      "host": "100.72.166.102",
+      "port": 22026,
+      "enabled": true,
+      "weight": 1
     }
   ]
 }
