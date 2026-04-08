@@ -33,19 +33,17 @@ func NewSyncManager(client *FFLogsClient) *SyncManager {
 }
 
 // StartIncrementalSync 开始增量同步
-func (s *SyncManager) StartIncrementalSync(ctx context.Context, playerID uint, name, server, region string) error {
+func (s *SyncManager) StartIncrementalSync(ctx context.Context, name, server, region string) error {
 	log.Printf("开始同步玩家 [%s-%s] 的数据...", name, server)
 	region = "CN"
 	newlyCreated := false
 
-	if playerID == 0 {
-		resolvedID, created, err := ensurePlayerID(name, server, region)
-		if err != nil {
-			return fmt.Errorf("resolve player failed: %v", err)
-		}
-		playerID = resolvedID
-		newlyCreated = created
+	resolvedID, created, err := ensurePlayerID(name, server, region)
+	if err != nil {
+		return fmt.Errorf("resolve player failed: %v", err)
 	}
+	playerID := resolvedID
+	newlyCreated = created
 
 	allowV2Query, reason, err := shouldRunV2ReportQuery(playerID, newlyCreated)
 	if err != nil {
@@ -348,22 +346,79 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 		return nil
 	}
 
-	workerCount := getScoreConcurrency()
-	log.Printf("[SCORE] pending fights=%d workers=%d", len(maps), workerCount)
-	sem := make(chan struct{}, workerCount)
-	var wg sync.WaitGroup
+	type scoreTask struct {
+		mappingID  uint
+		reportCode string
+		fightID    int
+	}
 
+	tasks := make([]scoreTask, 0, len(maps))
 	for _, mapping := range maps {
 		code, fightID, ok := splitMasterID(mapping.MasterID)
 		if !ok {
+			log.Printf("[SCORE] skip invalid master_id: %s", mapping.MasterID)
 			continue
 		}
+		tasks = append(tasks, scoreTask{mappingID: mapping.ID, reportCode: code, fightID: fightID})
+	}
+	if len(tasks) == 0 {
+		return nil
+	}
 
+	recommendedWorkers := s.scorer.RecommendedWorkerCount()
+	workerCount := getScoreConcurrency(s.scorer)
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	if recommendedWorkers > 0 {
+		if workerCount == recommendedWorkers {
+			log.Printf("[SCORE] 本机推荐解析并发=%d（已采用）", recommendedWorkers)
+		} else {
+			log.Printf("[SCORE] 本机推荐解析并发=%d，当前并发=%d（可用 FFLOGS_SCORE_CONCURRENCY 覆盖）", recommendedWorkers, workerCount)
+		}
+	}
+	totalCount := int64(len(tasks))
+	startedAt := time.Now()
+	var parsedCount int64
+	var activeCount int64
+
+	logProgress := func(reportCode string, fightID int, status string) {
+		parsed := atomic.LoadInt64(&parsedCount)
+		active := atomic.LoadInt64(&activeCount)
+
+		elapsedSec := time.Since(startedAt).Seconds()
+		speed := 0.0
+		if elapsedSec > 0 {
+			speed = float64(parsed) / elapsedSec
+		}
+
+		eta := "--"
+		remaining := totalCount - parsed
+		if remaining <= 0 {
+			eta = "完成"
+		} else if speed > 0 {
+			etaAt := time.Now().Add(time.Duration(float64(remaining)/speed) * time.Second)
+			eta = etaAt.Format("15:04:05")
+		}
+
+		log.Printf("[SCORE] %s-%d %s | 已解析=%d/%d 当前并发=%d/%d 当前速度=%.2f fights/s 预计完成=%s",
+			reportCode, fightID, status, parsed, totalCount, active, int64(workerCount), speed, eta)
+	}
+
+	log.Printf("[SCORE] 解析进度启动 | 已解析=0/%d 当前并发=0/%d 当前速度=0.00 fights/s 预计完成=--", totalCount, workerCount)
+	sem := make(chan struct{}, workerCount)
+	var wg sync.WaitGroup
+
+	for _, task := range tasks {
 		wg.Add(1)
 		go func(mappingID uint, reportCode string, fightID int) {
 			defer wg.Done()
 			sem <- struct{}{}
-			defer func() { <-sem }()
+			atomic.AddInt64(&activeCount, 1)
+			defer func() {
+				atomic.AddInt64(&activeCount, -1)
+				<-sem
+			}()
 
 			scoreCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
@@ -372,12 +427,15 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 				if scoring.IsNoMatchedActorError(err) {
 					if markErr := markFightSkippedNoMatch(mappingID); markErr != nil {
 						log.Printf("[SCORE] fight %s-%d skip-mark failed: %v", reportCode, fightID, markErr)
+						logProgress(reportCode, fightID, "失败(标记跳过)")
 						return
 					}
-					log.Printf("[SCORE] fight %s-%d skipped (player not in actor list)", reportCode, fightID)
+					atomic.AddInt64(&parsedCount, 1)
+					logProgress(reportCode, fightID, "跳过(无匹配角色)")
 					return
 				}
 				log.Printf("[SCORE] fight %s-%d failed: %v", reportCode, fightID, err)
+				logProgress(reportCode, fightID, "失败(评分)")
 				return
 			}
 
@@ -385,17 +443,25 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 				Where("id = ?", mappingID).
 				Update("parsed_done", true).Error; err != nil {
 				log.Printf("[SCORE] mark parsed_done failed (%s-%d): %v", reportCode, fightID, err)
+				logProgress(reportCode, fightID, "失败(更新parsed_done)")
 				return
 			}
-			log.Printf("[SCORE] fight scored %s-%d", reportCode, fightID)
-		}(mapping.ID, code, fightID)
+			atomic.AddInt64(&parsedCount, 1)
+			logProgress(reportCode, fightID, "完成")
+		}(task.mappingID, task.reportCode, task.fightID)
 	}
 
 	wg.Wait()
+	finalParsed := atomic.LoadInt64(&parsedCount)
+	if finalParsed == totalCount {
+		log.Printf("[SCORE] 解析完成 | 已解析=%d/%d", finalParsed, totalCount)
+	} else {
+		log.Printf("[SCORE] 解析结束(部分失败) | 已解析=%d/%d", finalParsed, totalCount)
+	}
 	return nil
 }
 
-func getScoreConcurrency() int {
+func getScoreConcurrency(scorer *scoring.Service) int {
 	const defaultConcurrency = 2
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_SCORE_CONCURRENCY")); raw != "" {
 		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
@@ -443,6 +509,11 @@ func getScoreConcurrency() int {
 
 	if v := parsePositiveInt("XIVA_CALL_CONCURRENCY"); v > 0 {
 		return v
+	}
+	if scorer != nil {
+		if v := scorer.RecommendedWorkerCount(); v > 0 {
+			return v
+		}
 	}
 	return defaultConcurrency
 }

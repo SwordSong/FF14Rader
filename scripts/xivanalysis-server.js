@@ -4,6 +4,7 @@
 
 const http = require('http')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
 const Module = require('module')
 const {fork} = require('child_process')
@@ -12,6 +13,8 @@ const {Worker, isMainThread, parentPort} = require('worker_threads')
 const repoRoot = path.resolve(__dirname, '..')
 const xivaRoot = path.resolve(repoRoot, 'external', 'xivanalysis')
 const xivaSrc = path.resolve(xivaRoot, 'src')
+const DEFAULT_HOSTS_CONFIG_PATH = path.join(repoRoot, 'docs', 'xiva-hosts.json')
+const HOSTS_CONFIG_PATH = resolveHostsConfigPath(process.env.XIVA_HOSTS_CONFIG)
 
 loadEnvFiles([
   path.join(repoRoot, '.env'),
@@ -23,9 +26,7 @@ const HOST = process.env.HOST || '0.0.0.0'
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES || 20 * 1024 * 1024) || 20 * 1024 * 1024
 const EXECUTION_MODE = (process.env.XIVA_EXECUTION_MODE || '').toLowerCase()
 const THREAD_WORKER_MODE = process.env.XIVA_THREAD_WORKER === '1'
-const CALL_CONCURRENCY_PER_WORKER = Number(process.env.XIVA_CALL_CONCURRENCY || 1) || 1
-const THREAD_POOL_SIZE = Number(process.env.XIVA_THREAD_POOL_SIZE || process.env.XIVA_PORT_COUNT || 1) || 1
-const MAX_CONCURRENCY = Number(process.env.MAX_CONCURRENCY || (THREAD_POOL_SIZE * Math.max(1, CALL_CONCURRENCY_PER_WORKER)) || 2) || 2
+const CALL_CONCURRENCY_PER_WORKER = parsePositiveInt(process.env.XIVA_CALL_CONCURRENCY, 1)
 const ANALYZE_TIMEOUT_MS = Number(process.env.ANALYZE_TIMEOUT_MS || 90 * 1000) || 90 * 1000
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS || 30 * 1000) || 30 * 1000
 const API_KEY = process.env.XIVA_API_KEY || process.env.API_KEY || ''
@@ -33,8 +34,33 @@ const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase()
 const OUTPUT_MODE = (process.env.XIVA_OUTPUT_MODE || 'numeric').toLowerCase()
 const OUTPUT_LOCALE = (process.env.XIVA_OUTPUT_LOCALE || process.env.XIVA_LOCALE || 'zh').toLowerCase()
 const WORKER_MODE = process.env.XIVA_WORKER_MODE === '1'
-const PORT_POOL_START = Number(process.env.XIVA_PORT_START || 22000) || 22000
-const PORT_POOL_COUNT = Number(process.env.XIVA_PORT_COUNT || 1) || 1
+const PORT_POOL_START = parsePositiveInt(process.env.XIVA_PORT_START, 22000)
+const PORT_POOL_COUNT = parsePositiveInt(process.env.XIVA_PORT_COUNT, 1)
+const THREAD_POOL_RECOMMENDATION_INFO = computeRecommendedThreadPoolSize()
+const THREAD_POOL_SIZE = THREAD_POOL_RECOMMENDATION_INFO.recommended
+const THREAD_POOL_SIZE_SOURCE = `recommended:${THREAD_POOL_RECOMMENDATION_INFO.reason}`
+const RECOMMENDED_CONCURRENCY_INFO = computeLocalRecommendedConcurrency(THREAD_POOL_SIZE)
+const EXPLICIT_MAX_CONCURRENCY = parsePositiveInt(process.env.MAX_CONCURRENCY, 0)
+const MAX_CONCURRENCY = EXPLICIT_MAX_CONCURRENCY > 0 ? EXPLICIT_MAX_CONCURRENCY : RECOMMENDED_CONCURRENCY_INFO.recommended
+const MAX_CONCURRENCY_SOURCE = EXPLICIT_MAX_CONCURRENCY > 0
+  ? 'env:MAX_CONCURRENCY'
+  : `recommended:${RECOMMENDED_CONCURRENCY_INFO.reason}`
+
+const RECOMMEND_REASON_ZH = {
+  'single-default': '单机默认策略',
+  'thread-pool-default': '线程池默认策略',
+  'cpu-parallelism': 'CPU 并行度',
+  'hosts-config': '解析主机配置',
+  'execution-mode': '执行模式配置',
+  'hosts-config-local': '本地解析主机配置',
+  'port-pool': '端口池配置',
+}
+
+const MODE_ZH = {
+  threads: '线程池模式',
+  'process-worker': '进程工作节点',
+  single: '单进程模式',
+}
 
 function loadEnvFiles(files) {
   for (const filePath of files) {
@@ -70,6 +96,334 @@ function loadEnvFile(filePath) {
     }
 
     process.env[key] = value
+  }
+}
+
+function parsePositiveInt(raw, fallback) {
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback
+  }
+  return Math.floor(parsed)
+}
+
+function clampInt(value, min, max) {
+  if (value < min) {
+    return min
+  }
+  if (value > max) {
+    return max
+  }
+  return value
+}
+
+function resolveHostsConfigPath(rawPath) {
+  const trimmed = typeof rawPath === 'string' ? rawPath.trim() : ''
+  if (trimmed === '') {
+    return DEFAULT_HOSTS_CONFIG_PATH
+  }
+  if (path.isAbsolute(trimmed)) {
+    return trimmed
+  }
+  return path.resolve(repoRoot, trimmed)
+}
+
+function getCpuParallelism() {
+  if (typeof os.availableParallelism === 'function') {
+    return parsePositiveInt(os.availableParallelism(), 1)
+  }
+  const cpus = os.cpus()
+  if (Array.isArray(cpus) && cpus.length > 0) {
+    return cpus.length
+  }
+  return 1
+}
+
+function loadAnalyzeHostEntriesFromConfig(configPath) {
+  if (!configPath || !fs.existsSync(configPath)) {
+    return []
+  }
+
+  try {
+    const raw = fs.readFileSync(configPath, 'utf8')
+    const parsed = JSON.parse(raw)
+
+    if (Array.isArray(parsed)) {
+      return parsed
+    }
+    if (parsed && Array.isArray(parsed.servers)) {
+      return parsed.servers
+    }
+  } catch (_err) {
+    return []
+  }
+
+  return []
+}
+
+function getLocalHostSet() {
+  const set = new Set(['localhost', '127.0.0.1', '::1', '0:0:0:0:0:0:0:1'])
+  const nets = os.networkInterfaces()
+  for (const values of Object.values(nets || {})) {
+    if (!Array.isArray(values)) {
+      continue
+    }
+    for (const info of values) {
+      if (!info || typeof info.address !== 'string' || info.address.trim() === '') {
+        continue
+      }
+      set.add(info.address.trim().toLowerCase())
+    }
+  }
+  return set
+}
+
+function extractHostFromAnalyzeEntry(entry) {
+  if (typeof entry === 'string') {
+    return extractHostFromRawEndpoint(entry)
+  }
+  if (!entry || typeof entry !== 'object') {
+    return ''
+  }
+
+  if (typeof entry.url === 'string' && entry.url.trim() !== '') {
+    return extractHostFromRawEndpoint(entry.url)
+  }
+
+  const host = typeof entry.host === 'string' ? entry.host.trim() : ''
+  if (host === '') {
+    return ''
+  }
+  return host.toLowerCase()
+}
+
+function extractHostFromRawEndpoint(raw) {
+  const trimmed = typeof raw === 'string' ? raw.trim() : ''
+  if (trimmed === '') {
+    return ''
+  }
+
+  let normalized = trimmed
+  if (!normalized.includes('://')) {
+    normalized = `http://${normalized}`
+  }
+
+  try {
+    const u = new URL(normalized)
+    return (u.hostname || '').trim().toLowerCase()
+  } catch (_err) {
+    return ''
+  }
+}
+
+function isLocalHost(host, localHostSet) {
+  const h = typeof host === 'string' ? host.trim().toLowerCase() : ''
+  if (h === '') {
+    return false
+  }
+  if (localHostSet.has(h)) {
+    return true
+  }
+  if (h.startsWith('127.')) {
+    return true
+  }
+  return false
+}
+
+function summarizeHostSlots(hostEntries, localHostSet) {
+  let totalHostSlots = 0
+  let localHostSlots = 0
+
+  for (const entry of hostEntries) {
+    if (entry && typeof entry === 'object' && entry.enabled === false) {
+      continue
+    }
+
+    const host = extractHostFromAnalyzeEntry(entry)
+    if (!host) {
+      continue
+    }
+
+    const weight = entry && typeof entry === 'object'
+      ? parsePositiveInt(entry.weight, 1)
+      : 1
+
+    totalHostSlots += weight
+    if (isLocalHost(host, localHostSet)) {
+      localHostSlots += weight
+    }
+  }
+
+  return {totalHostSlots, localHostSlots}
+}
+
+function computeRecommendedThreadPoolSize() {
+  const localHostSet = getLocalHostSet()
+  const hostEntries = loadAnalyzeHostEntriesFromConfig(HOSTS_CONFIG_PATH)
+  const slots = summarizeHostSlots(hostEntries, localHostSet)
+  const cpuCap = clampInt(getCpuParallelism(), 1, 64)
+
+  let reason = 'thread-pool-default'
+  let rawRecommended = Math.max(1, Math.floor(cpuCap / 2))
+
+  if (PORT_POOL_COUNT > 1) {
+    rawRecommended = PORT_POOL_COUNT
+    reason = 'port-pool'
+  } else if (slots.localHostSlots > 0) {
+    rawRecommended = slots.localHostSlots
+    reason = 'hosts-config-local'
+  } else if (slots.totalHostSlots > 0) {
+    rawRecommended = slots.totalHostSlots
+    reason = 'hosts-config'
+  } else {
+    reason = 'cpu-parallelism'
+  }
+
+  const recommended = clampInt(rawRecommended, 1, cpuCap)
+
+  return {
+    recommended,
+    reason,
+    cpuCap,
+    portPoolCount: PORT_POOL_COUNT,
+    hostsConfigPath: HOSTS_CONFIG_PATH,
+    hostEntries: hostEntries.length,
+    totalHostSlots: slots.totalHostSlots,
+    localHostSlots: slots.localHostSlots,
+  }
+}
+
+function computeLocalRecommendedConcurrency(threadPoolSize) {
+  const perWorker = Math.max(1, CALL_CONCURRENCY_PER_WORKER)
+  const localHostSet = getLocalHostSet()
+  const hostEntries = loadAnalyzeHostEntriesFromConfig(HOSTS_CONFIG_PATH)
+  const slots = summarizeHostSlots(hostEntries, localHostSet)
+
+  let reason = 'single-default'
+  let rawRecommended = 0
+  const mode = EXECUTION_MODE
+  const isThreadLikeMode = mode === 'thread' || mode === 'threads' || mode === 'process' || mode === 'processes' || mode === 'pool'
+
+  if (isThreadLikeMode && threadPoolSize > 0) {
+    rawRecommended = threadPoolSize * perWorker
+    reason = 'execution-mode'
+  } else if (slots.localHostSlots > 0) {
+    rawRecommended = slots.localHostSlots * perWorker
+    reason = 'hosts-config-local'
+  } else if (PORT_POOL_COUNT > 1) {
+    rawRecommended = PORT_POOL_COUNT * perWorker
+    reason = 'port-pool'
+  } else {
+    rawRecommended = Math.max(1, threadPoolSize) * perWorker
+  }
+
+  const cpuCap = clampInt(getCpuParallelism() * 2, 1, 128)
+  const recommended = clampInt(rawRecommended, 1, cpuCap)
+
+  return {
+    recommended,
+    reason,
+    cpuCap,
+    perWorker,
+    threadPoolSize,
+    portPoolCount: PORT_POOL_COUNT,
+    hostsConfigPath: HOSTS_CONFIG_PATH,
+    hostEntries: hostEntries.length,
+    totalHostSlots: slots.totalHostSlots,
+    localHostSlots: slots.localHostSlots,
+  }
+}
+
+function toReasonZh(reason) {
+  return RECOMMEND_REASON_ZH[reason] || reason || '未知来源'
+}
+
+function toModeZh(mode) {
+  return MODE_ZH[mode] || mode || '未知模式'
+}
+
+function formatBytesZh(bytes) {
+  const n = Number(bytes)
+  if (!Number.isFinite(n) || n < 0) {
+    return '未知'
+  }
+  const kb = 1024
+  const mb = kb * 1024
+  if (n >= mb) {
+    return `${(n / mb).toFixed(2)} MB`
+  }
+  if (n >= kb) {
+    return `${(n / kb).toFixed(2)} KB`
+  }
+  return `${Math.floor(n)} B`
+}
+
+function toMaxConcurrencySourceZh(source) {
+  return toConfigSourceZh(source)
+}
+
+function toThreadPoolSourceZh(source) {
+  return toConfigSourceZh(source)
+}
+
+function toConfigSourceZh(source) {
+  const text = typeof source === 'string' ? source : ''
+  if (text.startsWith('env:')) {
+    return `环境变量覆盖（${text.slice(4)}）`
+  }
+  if (text.startsWith('recommended:')) {
+    return `推荐值（${toReasonZh(text.slice('recommended:'.length))}）`
+  }
+  if (text) {
+    return text
+  }
+  return '未知来源'
+}
+
+function buildRecommendedConcurrencyZh(info) {
+  if (!info || typeof info !== 'object') {
+    return undefined
+  }
+  return {
+    推荐并发: info.recommended,
+    推荐原因: toReasonZh(info.reason),
+    CPU上限: info.cpuCap,
+    每工作单元并发: info.perWorker,
+    线程池大小: info.threadPoolSize,
+    端口池数量: info.portPoolCount,
+    主机配置路径: info.hostsConfigPath,
+    配置主机条目数: info.hostEntries,
+    主机总槽位: info.totalHostSlots,
+    本地主机槽位: info.localHostSlots,
+  }
+}
+
+function buildRecommendedThreadPoolZh(info) {
+  if (!info || typeof info !== 'object') {
+    return undefined
+  }
+  return {
+    推荐线程池大小: info.recommended,
+    推荐原因: toReasonZh(info.reason),
+    CPU上限: info.cpuCap,
+    端口池数量: info.portPoolCount,
+    主机配置路径: info.hostsConfigPath,
+    配置主机条目数: info.hostEntries,
+    主机总槽位: info.totalHostSlots,
+    本地主机槽位: info.localHostSlots,
+  }
+}
+
+function buildConcurrencyCompatFields(mode) {
+  return {
+    modeZh: toModeZh(mode),
+    maxBodyBytesZh: formatBytesZh(MAX_BODY_BYTES),
+    threadPoolSizeZh: THREAD_POOL_SIZE,
+    threadPoolSizeSourceZh: toThreadPoolSourceZh(THREAD_POOL_SIZE_SOURCE),
+    recommendedThreadPoolZh: buildRecommendedThreadPoolZh(THREAD_POOL_RECOMMENDATION_INFO),
+    maxConcurrencyZh: MAX_CONCURRENCY,
+    maxConcurrencySourceZh: toMaxConcurrencySourceZh(MAX_CONCURRENCY_SOURCE),
+    recommendedConcurrencyZh: buildRecommendedConcurrencyZh(RECOMMENDED_CONCURRENCY_INFO),
   }
 }
 
@@ -212,7 +566,7 @@ function startEntry() {
     serviceState.ready = true
     startServer()
   } catch (err) {
-    logEvent('error', 'bootstrap failed', formatError(err))
+    logEvent('error', '服务初始化失败', formatError(err))
     process.exit(1)
   }
 }
@@ -234,12 +588,6 @@ function shouldUseThreadPoolMode() {
 function startThreadPoolServer() {
   threadPoolManager = new ThreadWorkerPool(THREAD_POOL_SIZE)
   serviceState.ready = true
-  logEvent('info', 'starting xivanalysis thread pool server', {
-    mode: 'threads',
-    threadPoolSize: THREAD_POOL_SIZE,
-    maxConcurrency: MAX_CONCURRENCY,
-    analyzeTimeoutMs: ANALYZE_TIMEOUT_MS,
-  })
   startServer()
 }
 
@@ -286,7 +634,7 @@ function startThreadWorkerLoop() {
       const results = await withTimeout(
         handleAnalyzeLocal(msg.payload),
         ANALYZE_TIMEOUT_MS,
-        `worker analyze timeout after ${ANALYZE_TIMEOUT_MS}ms`,
+        `工作线程解析超时（${ANALYZE_TIMEOUT_MS}ms）`,
       )
       parentPort.postMessage({
         type: 'result',
@@ -338,7 +686,7 @@ class ThreadWorkerPool {
 
     worker.on('message', msg => this.onWorkerMessage(state, msg))
     worker.on('error', err => {
-      logEvent('error', 'thread worker error', {
+      logEvent('error', '线程工作进程错误', {
         mode: 'threads',
         index,
         error: err && err.message ? err.message : String(err),
@@ -360,7 +708,7 @@ class ThreadWorkerPool {
     }
 
     if (msg.type === 'fatal') {
-      logEvent('error', 'thread worker bootstrap failed', {
+      logEvent('error', '线程工作进程初始化失败', {
         mode: 'threads',
         index: state.index,
         ...msg,
@@ -388,7 +736,7 @@ class ThreadWorkerPool {
     if (msg.ok) {
       slot.resolve(msg.results)
     } else {
-      slot.reject(new Error(msg.error || 'thread analyze failed'))
+      slot.reject(new Error(msg.error || '线程解析失败'))
     }
 
     this.drain()
@@ -408,7 +756,7 @@ class ThreadWorkerPool {
             reject: slot.reject,
           })
         } else {
-          slot.reject(new Error('thread pool shutting down'))
+          slot.reject(new Error('线程池正在关闭'))
         }
       }
     }
@@ -417,7 +765,7 @@ class ThreadWorkerPool {
       return
     }
 
-    logEvent('warn', 'thread worker exited; restarting', {
+    logEvent('warn', '线程工作进程退出，准备重启', {
       mode: 'threads',
       index: state.index,
       code,
@@ -428,7 +776,7 @@ class ThreadWorkerPool {
 
   runTask(payload) {
     if (this.shuttingDown) {
-      return Promise.reject(new Error('thread pool shutting down'))
+      return Promise.reject(new Error('线程池正在关闭'))
     }
 
     return new Promise((resolve, reject) => {
@@ -475,12 +823,12 @@ class ThreadWorkerPool {
 
     while (this.queue.length > 0) {
       const task = this.queue.shift()
-      task.reject(new Error('thread pool shutting down'))
+      task.reject(new Error('线程池正在关闭'))
     }
 
     for (const [taskId, task] of this.inFlight.entries()) {
       this.inFlight.delete(taskId)
-      task.reject(new Error('thread pool shutting down'))
+      task.reject(new Error('线程池正在关闭'))
     }
 
     const terminate = Promise.all(this.workers.map(async state => {
@@ -537,7 +885,7 @@ startEntry()
 function startServerPool(portStart, count) {
   const workers = []
 
-  logEvent('info', 'starting xivanalysis server pool', {
+  logEvent('info', '启动 xivanalysis 多进程服务池', {
     mode: 'pool',
     portStart,
     count,
@@ -558,7 +906,7 @@ function startServerPool(portStart, count) {
     workers.push({worker, port})
 
     worker.on('exit', (code, signal) => {
-      logEvent('warn', 'xivanalysis worker exited', {
+      logEvent('warn', 'xivanalysis 工作进程退出', {
         mode: 'pool',
         port,
         pid: worker.pid,
@@ -569,7 +917,7 @@ function startServerPool(portStart, count) {
   }
 
   const shutdownPool = signal => {
-    logEvent('warn', 'shutting down xivanalysis server pool', {
+    logEvent('warn', '正在关闭 xivanalysis 服务池', {
       mode: 'pool',
       signal,
       count: workers.length,
@@ -711,7 +1059,7 @@ function patchInjection() {
         .filter(([_source, target]) => !nodeSet.has(target))
         .map(([source, target]) => `${source}→${target}`)
 
-      logEvent('warn', 'unregistered modules in dependency graph; pruning edges', {
+      logEvent('warn', '依赖图存在未注册模块，已裁剪相关边', {
         unknownEdges: unknown,
       })
 
@@ -731,7 +1079,7 @@ function patchInjection() {
 
       if (missingDeps.length > 0) {
         failedHandles.add(handle)
-        logEvent('warn', 'skip module due to missing dependencies', {
+        logEvent('warn', '模块缺少依赖，已跳过', {
           module: handle,
           missingDependencies: missingDeps,
         })
@@ -747,12 +1095,12 @@ function patchInjection() {
         if (injectable instanceof Analyser) {
           injectable.initialise()
         } else {
-          throw new Error(`Unhandled injectable type for initialisation: ${handle}`)
+          throw new Error(`未处理的可注入类型，无法初始化：${handle}`)
         }
       } catch (error) {
         failedHandles.add(handle)
         delete this.container[handle]
-        logEvent('warn', 'skip module due to construction failure', {
+        logEvent('warn', '模块构造失败，已跳过', {
           module: handle,
           error: error instanceof Error ? error.message : String(error),
         })
@@ -813,23 +1161,33 @@ function startServer() {
     const method = (req.method || 'GET').toUpperCase()
 
     if (method === 'GET' && pathname === '/health') {
+      const mode = threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single')
       sendJson(res, 200, {
         status: 'ok',
+        statusZh: '正常',
         ready: serviceState.ready,
         shuttingDown: serviceState.shuttingDown,
         inFlight,
-        mode: threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single'),
+        threadPoolSize: THREAD_POOL_SIZE,
+        threadPoolSizeSource: THREAD_POOL_SIZE_SOURCE,
+        recommendedThreadPool: THREAD_POOL_RECOMMENDATION_INFO,
+        maxConcurrency: MAX_CONCURRENCY,
+        maxConcurrencySource: MAX_CONCURRENCY_SOURCE,
+        recommendedConcurrency: RECOMMENDED_CONCURRENCY_INFO,
+        mode,
         threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
+        ...buildConcurrencyCompatFields(mode),
       })
       return
     }
 
     if (method === 'GET' && pathname === '/ready') {
       if (serviceState.ready && !serviceState.shuttingDown) {
-        sendJson(res, 200, {status: 'ready'})
+        sendJson(res, 200, {status: 'ready', statusZh: '就绪'})
       } else {
         sendJson(res, 503, {
           status: 'not_ready',
+          statusZh: '未就绪',
           ready: serviceState.ready,
           shuttingDown: serviceState.shuttingDown,
         })
@@ -838,24 +1196,32 @@ function startServer() {
     }
 
     if (method === 'GET' && pathname === '/metrics') {
+      const mode = threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single')
       sendJson(res, 200, {
         ...serviceState.metrics,
         inFlight,
-        mode: threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single'),
+        threadPoolSize: THREAD_POOL_SIZE,
+        threadPoolSizeSource: THREAD_POOL_SIZE_SOURCE,
+        recommendedThreadPool: THREAD_POOL_RECOMMENDATION_INFO,
+        maxConcurrency: MAX_CONCURRENCY,
+        maxConcurrencySource: MAX_CONCURRENCY_SOURCE,
+        recommendedConcurrency: RECOMMENDED_CONCURRENCY_INFO,
+        mode,
         threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
         uptimeMs: Math.max(0, Date.now() - Date.parse(serviceState.metrics.startedAt)),
+        ...buildConcurrencyCompatFields(mode),
       })
       return
     }
 
     if (method !== 'POST' || pathname !== '/analyze') {
-      sendJson(res, 404, {error: 'not found'})
+      sendJson(res, 404, {error: '未找到接口'})
       return
     }
 
     if (serviceState.shuttingDown || !serviceState.ready) {
       serviceState.metrics.requestsRejected += 1
-      sendJson(res, 503, {error: 'service unavailable', requestId})
+      sendJson(res, 503, {error: '服务暂不可用', requestId})
       return
     }
 
@@ -864,20 +1230,20 @@ function startServer() {
       const suppliedKey = typeof headerApiKey === 'string' ? headerApiKey : ''
       if (suppliedKey !== API_KEY) {
         serviceState.metrics.requestsRejected += 1
-        sendJson(res, 401, {error: 'unauthorized', requestId})
+        sendJson(res, 401, {error: '未授权访问', requestId})
         return
       }
     }
 
     if (!isJsonContentType(req.headers['content-type'])) {
       serviceState.metrics.requestsRejected += 1
-      sendJson(res, 415, {error: 'content-type must be application/json', requestId})
+      sendJson(res, 415, {error: 'content-type 必须为 application/json', requestId})
       return
     }
 
     if (inFlight >= MAX_CONCURRENCY) {
       serviceState.metrics.requestsRejected += 1
-      sendJson(res, 429, {error: 'server busy', requestId})
+      sendJson(res, 429, {error: '服务繁忙，请稍后重试', requestId})
       return
     }
 
@@ -895,7 +1261,7 @@ function startServer() {
       if (receivedBytes > MAX_BODY_BYTES) {
         bodyRejected = true
         serviceState.metrics.requestsRejected += 1
-        sendJson(res, 413, {error: 'payload too large', requestId})
+        sendJson(res, 413, {error: '请求体过大', requestId})
         req.destroy()
         return
       }
@@ -904,16 +1270,16 @@ function startServer() {
     })
 
     req.on('aborted', () => {
-      logEvent('warn', 'request aborted', {requestId})
+      logEvent('warn', '请求已中断', {requestId})
     })
 
     req.on('error', err => {
       serviceState.metrics.requestsFailed += 1
-      logEvent('error', 'request stream error', {
+      logEvent('error', '请求流错误', {
         requestId,
         error: err && err.message ? err.message : String(err),
       })
-      sendJson(res, 500, {error: `request error: ${err.message}`, requestId})
+      sendJson(res, 500, {error: `请求错误：${err.message}`, requestId})
     })
 
     req.on('end', async () => {
@@ -924,7 +1290,7 @@ function startServer() {
       const parsed = parseJSONSafe(Buffer.concat(chunks))
       if (!parsed.ok) {
         serviceState.metrics.requestsRejected += 1
-        sendJson(res, 400, {error: `invalid JSON: ${parsed.error}`, requestId})
+        sendJson(res, 400, {error: `JSON 无效：${parsed.error}`, requestId})
         return
       }
 
@@ -937,7 +1303,7 @@ function startServer() {
         const results = await withTimeout(
           handleAnalyze(payload),
           ANALYZE_TIMEOUT_MS,
-          `analyze timeout after ${ANALYZE_TIMEOUT_MS}ms`,
+          `解析超时（${ANALYZE_TIMEOUT_MS}ms）`,
         )
 
         serviceState.metrics.requestsSucceeded += 1
@@ -947,7 +1313,7 @@ function startServer() {
           results,
         })
 
-        logEvent('info', 'request completed', {
+        logEvent('info', '请求处理完成', {
           requestId,
           status: 200,
           durationMs: Date.now() - startedAt,
@@ -967,7 +1333,7 @@ function startServer() {
         }
         sendJson(res, status, payload)
 
-        logEvent('error', 'request failed', {
+        logEvent('error', '请求处理失败', {
           requestId,
           status,
           durationMs: Date.now() - startedAt,
@@ -994,7 +1360,7 @@ function startServer() {
   })
 
   server.on('error', err => {
-    logEvent('error', 'server error', {
+    logEvent('error', '服务错误', {
       error: err && err.message ? err.message : String(err),
     })
   })
@@ -1002,16 +1368,25 @@ function startServer() {
   registerShutdownHandlers(server)
 
   server.listen(PORT, HOST, () => {
-    logEvent('info', 'xivanalysis server listening', {
+    const mode = threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single')
+    logEvent('info', 'xivanalysis 服务已启动', {
       host: HOST,
       port: PORT,
+      mode,
+      threadPoolSize: THREAD_POOL_SIZE,
+      threadPoolSizeSource: THREAD_POOL_SIZE_SOURCE,
+      recommendedThreadPool: THREAD_POOL_RECOMMENDATION_INFO,
+      threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
       maxBodyBytes: MAX_BODY_BYTES,
       maxConcurrency: MAX_CONCURRENCY,
+      maxConcurrencySource: MAX_CONCURRENCY_SOURCE,
+      recommendedConcurrency: RECOMMENDED_CONCURRENCY_INFO,
       analyzeTimeoutMs: ANALYZE_TIMEOUT_MS,
       shutdownTimeoutMs: SHUTDOWN_TIMEOUT_MS,
       apiKeyEnabled: API_KEY !== '',
       metricsPath: '/metrics',
       readyPath: '/ready',
+      ...buildConcurrencyCompatFields(mode),
     })
   })
 }
@@ -1050,7 +1425,7 @@ function registerShutdownHandlers(server) {
     serviceState.shuttingDown = true
     serviceState.ready = false
 
-    logEvent('warn', 'shutdown initiated', {
+    logEvent('warn', '开始关闭服务', {
       signal,
       inFlight,
       openSockets: serviceState.sockets.size,
@@ -1060,7 +1435,7 @@ function registerShutdownHandlers(server) {
       for (const socket of serviceState.sockets) {
         socket.destroy()
       }
-      logEvent('error', 'shutdown timeout reached; forcing exit', {
+      logEvent('error', '关闭超时，强制退出', {
         signal,
         inFlight,
         openSockets: serviceState.sockets.size,
@@ -1071,7 +1446,7 @@ function registerShutdownHandlers(server) {
     server.close(err => {
       clearTimeout(forceTimer)
       if (err) {
-        logEvent('error', 'server close failed', {
+        logEvent('error', '服务关闭失败', {
           signal,
           error: err && err.message ? err.message : String(err),
         })
@@ -1083,12 +1458,12 @@ function registerShutdownHandlers(server) {
         if (threadPoolManager) {
           await threadPoolManager.shutdown(Math.max(0, SHUTDOWN_TIMEOUT_MS - 500))
         }
-        logEvent('info', 'server shutdown completed', {signal})
+        logEvent('info', '服务已完成关闭', {signal})
         process.exit(0)
       }
 
       finalizeExit().catch(err => {
-        logEvent('error', 'thread pool shutdown failed', {
+        logEvent('error', '线程池关闭失败', {
           signal,
           error: err && err.message ? err.message : String(err),
         })
@@ -1149,7 +1524,7 @@ async function handleAnalyze(payload) {
 async function handleAnalyzeLocal(payload) {
   const requests = Array.isArray(payload.requests) ? payload.requests : [payload]
   if (requests.length === 0) {
-    throw new Error('requests must be a non-empty array')
+    throw new Error('requests 必须是非空数组')
   }
 
   const results = []
@@ -1209,7 +1584,7 @@ async function analyzeRequest(request, index) {
         const err = moduleErrors[key]
         summarizedErrors[key] = err && err.message ? err.message : String(err)
       }
-      logEvent('warn', 'parser module errors detected', {
+      logEvent('warn', '检测到解析模块错误', {
         reportCode: code,
         fightId,
         actorId: actor.id,
@@ -1240,7 +1615,7 @@ async function analyzeRequest(request, index) {
 
 function normalizeRequest(request) {
   if (!request || typeof request !== 'object') {
-    return {error: 'request must be an object'}
+    return {error: 'request 必须是对象'}
   }
   const code = request.code || request.reportCode || request.report_code || 'unknown'
   const report = request.report || request.metadata || request.reportData
@@ -1249,14 +1624,14 @@ function normalizeRequest(request) {
   const fight = request.fight
 
   if (!report || typeof report !== 'object') {
-    return {error: 'missing report metadata'}
+    return {error: '缺少 report 元数据'}
   }
   const normalizedReport = normalizeReport(report, request.actors || request.friendlies || request.masterData)
   if (normalizedReport.error) {
     return {error: normalizedReport.error}
   }
   if (!events || !Array.isArray(events)) {
-    return {error: 'missing events array'}
+    return {error: '缺少 events 数组'}
   }
 
   let selectedFight = fight
@@ -1264,7 +1639,7 @@ function normalizeRequest(request) {
     selectedFight = normalizedReport.fights.find(f => Number(f.id) === fightId)
   }
   if (!selectedFight) {
-    return {error: 'fight not found in report; provide fight or fightId'}
+    return {error: '在 report 中未找到 fight，请提供 fight 或 fightId'}
   }
 
   return {
@@ -1283,14 +1658,14 @@ function normalizeReport(report, actorsFallback) {
   if (!report.title) missing.push('title')
   if (!Array.isArray(report.fights)) missing.push('fights')
   if (missing.length > 0) {
-    return {error: `report missing fields: ${missing.join(', ')}`}
+    return {error: `report 缺少字段：${missing.join(', ')}`}
   }
 
   let masterData = report.masterData
   if (!masterData || !Array.isArray(masterData.actors)) {
     const actors = normalizeActors(actorsFallback || report.actors || report.friendlies)
     if (!actors) {
-      return {error: 'report.masterData.actors missing; supply actors'}
+      return {error: 'report.masterData.actors 缺失，请提供 actors'}
     }
     masterData = {actors}
   }
@@ -1423,7 +1798,7 @@ function collectAdaptedActorIds(events) {
 function buildPlaceholderActor(mods, actorId) {
   return {
     kind: actorId,
-    name: actorId.startsWith('unknown') ? 'Unknown' : `Actor ${actorId}`,
+    name: actorId.startsWith('unknown') ? '未知' : `角色 ${actorId}`,
     team: mods.Team.UNKNOWN != null ? mods.Team.UNKNOWN : mods.Team.FOE,
     playerControlled: false,
     job: 'UNKNOWN',
@@ -1537,9 +1912,9 @@ function serializeResults(results, parser) {
         )
         html = renderToStaticMarkup(wrapped)
       } catch (err) {
-        html = '[render-error]'
+        html = '[渲染错误]'
         if (process.env.DEBUG_RENDER_ERRORS === '1') {
-          logEvent('warn', 'module render failed', {
+          logEvent('warn', '模块渲染失败', {
             module: result.handle,
             error: err && err.message ? err.message : String(err),
           })

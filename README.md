@@ -70,6 +70,11 @@ Node 分析服务可选：
 - `LOG_LEVEL`
 - `XIVA_OUTPUT_MODE`（默认 `numeric`）
 - `XIVA_OUTPUT_LOCALE`（默认 `zh`）
+- `XIVA_HOSTS_CONFIG`（解析服务多主机配置文件，默认 `./docs/xiva-hosts.json`）
+- `XIVA_EXECUTION_MODE`
+- `XIVA_PORT_COUNT`
+- `XIVA_THREAD_POOL_SIZE`
+- `XIVA_CALL_CONCURRENCY`
 
 ## 快速开始
 
@@ -107,6 +112,25 @@ node scripts/xivanalysis-server.js
 ```bash
 curl http://127.0.0.1:22026/health
 ```
+
+### 3.1) 多主机解析配置（配置文档）
+
+评分服务会优先读取 `XIVA_HOSTS_CONFIG` 指定的 JSON 文件（默认 `./docs/xiva-hosts.json`），并按配置中的 `servers` 列表轮询调用解析服务。
+
+示例：
+
+```json
+{
+	"servers": [
+		{"name": "host-a", "host": "10.0.0.11", "port": 22026, "enabled": true, "weight": 2},
+		{"name": "host-b", "host": "10.0.0.12", "port": 22026, "enabled": true, "weight": 1}
+	]
+}
+```
+
+说明：
+- `weight` 可用于加权轮询（值越大，命中概率越高）。
+- 若未配置该文件或文件无效，会回退到原有环境变量方式（`XIVA_ANALYZE_URL` / `XIVA_API_HOST` + 端口范围）。
 
 ### 4) 生成战斗分析文件
 

@@ -1,0 +1,11 @@
+{
+  "servers": [
+    {
+      "name": "local-default",
+      "host": "127.0.0.1",
+      "port": 22026,
+      "enabled": true,
+      "weight": 1
+    }
+  ]
+}

@@ -11,12 +11,13 @@ type Config struct {
 	FFLogsClientSecret string
 	PostgresWriteDSN   string // 写库 (Master)
 	PostgresReadDSN    string // 读库 (Slave)
+	MonitorPort        string // 监控 API 端口
 }
 
 func LoadConfig() *Config {
 	// 尝试从当前目录、父目录或根目录加载 .env
-	_ = godotenv.Load()            // current dir
-	_ = godotenv.Load("../.env")   // parent
+	_ = godotenv.Load()             // current dir
+	_ = godotenv.Load("../.env")    // parent
 	_ = godotenv.Load("../../.env") // root (from cmd/xxx/)
 
 	// if err := godotenv.Load(); err != nil {
@@ -28,5 +29,14 @@ func LoadConfig() *Config {
 		FFLogsClientSecret: os.Getenv("FFLOGS_CLIENT_SECRET"),
 		PostgresWriteDSN:   os.Getenv("POSTGRES_WRITE_DSN"),
 		PostgresReadDSN:    os.Getenv("POSTGRES_READ_DSN"),
+		MonitorPort:        getEnvOrDefault("MONITOR_PORT", "22027"),
 	}
+}
+
+func getEnvOrDefault(key, fallback string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		return fallback
+	}
+	return val
 }

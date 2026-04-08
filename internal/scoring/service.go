@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +27,7 @@ import (
 
 const (
 	defaultAnalyzeURL            = "http://127.0.0.1:22026/analyze"
+	defaultAnalyzeHostsConfig    = "./docs/xiva-hosts.json"
 	defaultReportRoot            = "./downloads/fflogs"
 	defaultWeightMin             = 0.01
 	defaultWeightMax             = 1.0
@@ -98,6 +101,10 @@ func NewServiceFromEnv() *Service {
 }
 
 func resolveAnalyzeURLsFromEnv() []string {
+	if urls := resolveAnalyzeURLsFromConfigDoc(); len(urls) > 0 {
+		return urls
+	}
+
 	if raw := strings.TrimSpace(os.Getenv("XIVA_ANALYZE_URL")); raw != "" {
 		if normalized, err := normalizeAnalyzeURL(raw); err == nil {
 			return []string{normalized}
@@ -143,6 +150,226 @@ func resolveAnalyzeURLsFromEnv() []string {
 	}
 
 	return []string{defaultAnalyzeURL}
+}
+
+type analyzeHostsConfig struct {
+	Servers []analyzeHostEntry `json:"servers"`
+}
+
+type analyzeHostEntry struct {
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	Enabled *bool  `json:"enabled"`
+	Weight  int    `json:"weight"`
+}
+
+func resolveAnalyzeURLsFromConfigDoc() []string {
+	configPath := strings.TrimSpace(os.Getenv("XIVA_HOSTS_CONFIG"))
+	if configPath == "" {
+		configPath = defaultAnalyzeHostsConfig
+	}
+
+	urls, err := loadAnalyzeURLsFromConfigFile(configPath)
+	if err != nil {
+		return nil
+	}
+	return urls
+}
+
+func loadAnalyzeURLsFromConfigFile(configPath string) ([]string, error) {
+	configPath = strings.TrimSpace(configPath)
+	if configPath == "" {
+		return nil, fmt.Errorf("empty config path")
+	}
+
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	content := strings.TrimSpace(string(raw))
+	if content == "" {
+		return nil, fmt.Errorf("empty config file")
+	}
+
+	var root analyzeHostsConfig
+	if err := json.Unmarshal(raw, &root); err == nil && len(root.Servers) > 0 {
+		return buildAnalyzeURLsFromHostEntries(root.Servers), nil
+	}
+
+	var entryList []analyzeHostEntry
+	if err := json.Unmarshal(raw, &entryList); err == nil && len(entryList) > 0 {
+		return buildAnalyzeURLsFromHostEntries(entryList), nil
+	}
+
+	var urlList []string
+	if err := json.Unmarshal(raw, &urlList); err == nil && len(urlList) > 0 {
+		out := make([]string, 0, len(urlList))
+		for _, candidate := range urlList {
+			normalized, err := normalizeAnalyzeURL(strings.TrimSpace(candidate))
+			if err != nil {
+				continue
+			}
+			out = append(out, normalized)
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unsupported config format")
+}
+
+func buildAnalyzeURLsFromHostEntries(entries []analyzeHostEntry) []string {
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Enabled != nil && !*entry.Enabled {
+			continue
+		}
+
+		rawURL := strings.TrimSpace(entry.URL)
+		if rawURL == "" {
+			host := strings.TrimSpace(entry.Host)
+			if host == "" || entry.Port <= 0 {
+				continue
+			}
+			if !strings.Contains(host, "://") {
+				host = "http://" + host
+			}
+			host = strings.TrimRight(host, "/")
+			rawURL = fmt.Sprintf("%s:%d", host, entry.Port)
+		}
+
+		normalized, err := normalizeAnalyzeURL(rawURL)
+		if err != nil {
+			continue
+		}
+
+		weight := entry.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		if weight > 16 {
+			weight = 16
+		}
+		for i := 0; i < weight; i++ {
+			out = append(out, normalized)
+		}
+	}
+	return out
+}
+
+// RecommendedWorkerCount 返回根据当前解析服务配置计算的建议并发。
+func (s *Service) RecommendedWorkerCount() int {
+	unique := uniqueAnalyzeURLs(s.apiURLs)
+	if len(unique) == 0 {
+		return 1
+	}
+
+	perWorker := envInt("XIVA_CALL_CONCURRENCY", 1)
+	if perWorker <= 0 {
+		perWorker = 1
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("XIVA_EXECUTION_MODE")))
+	threadWorkers := envInt("XIVA_THREAD_POOL_SIZE", 0)
+	if threadWorkers == 0 {
+		threadWorkers = envInt("XIVA_PORT_COUNT", 0)
+	}
+	if (mode == "thread" || mode == "threads" || mode == "process" || mode == "processes" || mode == "pool") && threadWorkers > 0 {
+		return clampRecommendedConcurrency(threadWorkers * perWorker)
+	}
+
+	localCount := countLocalAnalyzeURLs(unique)
+	if localCount > 0 {
+		cpuCap := runtime.NumCPU() * 2
+		if cpuCap <= 0 {
+			cpuCap = 1
+		}
+		recommended := localCount * perWorker
+		if recommended > cpuCap {
+			recommended = cpuCap
+		}
+		return clampRecommendedConcurrency(recommended)
+	}
+
+	return clampRecommendedConcurrency(len(unique) * perWorker)
+}
+
+func uniqueAnalyzeURLs(urls []string) []string {
+	if len(urls) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(urls))
+	out := make([]string, 0, len(urls))
+	for _, raw := range urls {
+		u := strings.TrimSpace(raw)
+		if u == "" {
+			continue
+		}
+		if _, exists := seen[u]; exists {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	return out
+}
+
+func countLocalAnalyzeURLs(urls []string) int {
+	if len(urls) == 0 {
+		return 0
+	}
+
+	localIPs := map[string]struct{}{}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet == nil || ipNet.IP == nil {
+				continue
+			}
+			localIPs[ipNet.IP.String()] = struct{}{}
+		}
+	}
+
+	count := 0
+	for _, endpoint := range urls {
+		u, err := url.Parse(endpoint)
+		if err != nil {
+			continue
+		}
+		hostname := strings.ToLower(strings.TrimSpace(u.Hostname()))
+		if hostname == "" {
+			continue
+		}
+		if hostname == "localhost" {
+			count++
+			continue
+		}
+		if ip := net.ParseIP(hostname); ip != nil {
+			if ip.IsLoopback() {
+				count++
+				continue
+			}
+			if _, ok := localIPs[ip.String()]; ok {
+				count++
+				continue
+			}
+		}
+	}
+	return count
+}
+
+func clampRecommendedConcurrency(v int) int {
+	if v <= 0 {
+		return 1
+	}
+	if v > 128 {
+		return 128
+	}
+	return v
 }
 
 func envInt(key string, fallback int) int {

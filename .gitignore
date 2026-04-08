@@ -5,3 +5,6 @@ logs/
 node_modules/
 external/xivanalysis/.git
 downloads/
+pic/
+radar_*.png
+tmp_*.go

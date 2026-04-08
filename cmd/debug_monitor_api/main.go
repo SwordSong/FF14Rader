@@ -11,28 +11,23 @@ import (
 )
 
 func main() {
-	log.Println("正在启动 FF14Rader 服务...")
-
-	// 1. 加载配置
 	cfg := config.LoadConfig()
-
-	// 2. 初始化数据库 (读写分离)
+	if cfg.PostgresWriteDSN == "" || cfg.PostgresReadDSN == "" {
+		log.Fatalf("Postgres DSN missing (POSTGRES_WRITE_DSN/POSTGRES_READ_DSN)")
+	}
 	db.InitDB(cfg.PostgresWriteDSN, cfg.PostgresReadDSN)
 
-	// 3. 初始化同步管理器与渲染器
 	fflogsClient := internalapi.NewFFLogsClient(cfg.FFLogsClientID, cfg.FFLogsClientSecret)
 	syncManager := internalapi.NewSyncManager(fflogsClient)
 	radarRenderer := render.NewRadarChart(800, 800)
-
-	log.Println("FF14Rader 服务正常运行中...")
-	log.Printf("监控 API 已启动: http://0.0.0.0:%s", cfg.MonitorPort)
 
 	service := &appapi.Service{
 		SyncManager:   syncManager,
 		RadarRenderer: radarRenderer,
 	}
-	if err := appapi.RunServer(cfg.MonitorPort, service); err != nil {
-		log.Fatalf("监控 API 启动失败: %v", err)
-	}
 
+	log.Printf("debug monitor api listening on :%s", cfg.MonitorPort)
+	if err := appapi.RunServer(cfg.MonitorPort, service); err != nil {
+		log.Fatalf("debug monitor api failed: %v", err)
+	}
 }

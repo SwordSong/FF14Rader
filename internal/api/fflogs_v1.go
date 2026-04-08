@@ -140,7 +140,7 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 						continue
 					}
 
-					log.Printf("[V1] 开始下载报告 %s 组 (待下载 fights=%d, 并发=%d)", code, len(pendingFights), fightWorkers)
+					log.Printf("[V1] 报告 %s 下载开始 | 已下载=0/%d 当前并发=0/%d 当前速度=0.00 fights/s 预计完成=--", code, len(pendingFights), fightWorkers)
 					start := time.Now()
 					fightCount, reportDone, err := downloadV1Report(ctx, client, baseURL, apiKey, rootDir, playerID, code, pendingFights, fightWorkers, reportTimeout)
 					if err != nil {
@@ -426,6 +426,31 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 
 	var allDone int32 = 1
 	var successCount int64
+	var activeCount int64
+	totalCount := int64(len(pending))
+	startedAt := time.Now()
+
+	logProgress := func(fightID int, status string) {
+		downloaded := atomic.LoadInt64(&successCount)
+		active := atomic.LoadInt64(&activeCount)
+
+		elapsedSec := time.Since(startedAt).Seconds()
+		speed := 0.0
+		if elapsedSec > 0 {
+			speed = float64(downloaded) / elapsedSec
+		}
+
+		remaining := totalCount - downloaded
+		eta := "--"
+		if remaining <= 0 {
+			eta = "完成"
+		} else if speed > 0 {
+			etaAt := time.Now().Add(time.Duration(float64(remaining)/speed) * time.Second)
+			eta = etaAt.Format("15:04:05")
+		}
+
+		log.Printf("[V1] fight %s-%d %s | 已下载=%d/%d 当前并发=%d/%d 当前速度=%.2f fights/s 预计完成=%s", code, fightID, status, downloaded, totalCount, active, int64(fightWorkers), speed, eta)
+	}
 
 	jobs := make(chan pendingFightEntry)
 	var wg sync.WaitGroup
@@ -436,70 +461,80 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 			if ctx.Err() != nil {
 				return
 			}
-			fight, ok := fightByID[entry.FightID]
-			if !ok {
-				log.Printf("[V1] 报告 %s 缺少 fight %d，跳过", code, entry.FightID)
-				atomic.StoreInt32(&allDone, 0)
-				continue
-			}
+			atomic.AddInt64(&activeCount, 1)
+			func(entry pendingFightEntry) {
+				defer atomic.AddInt64(&activeCount, -1)
 
-			eventsPath := filepath.Join(reportDir, fmt.Sprintf("fight_%d_events.json", fight.ID))
-			reuseByMaster := false
-			if downloaded, err := isFightDownloadedByMasterID(entry.MasterID); err != nil {
-				log.Printf("[V1] 检查 master 下载状态失败 %s: %v", entry.MasterID, err)
-			} else {
-				reuseByMaster = downloaded
-			}
+				fight, ok := fightByID[entry.FightID]
+				if !ok {
+					log.Printf("[V1] 报告 %s 缺少 fight %d，跳过", code, entry.FightID)
+					atomic.StoreInt32(&allDone, 0)
+					logProgress(entry.FightID, "失败(报告中不存在该fight)")
+					return
+				}
 
-			if isUsableV1EventsFile(eventsPath) {
+				eventsPath := filepath.Join(reportDir, fmt.Sprintf("fight_%d_events.json", fight.ID))
+				reuseByMaster := false
+				if downloaded, err := isFightDownloadedByMasterID(entry.MasterID); err != nil {
+					log.Printf("[V1] 检查 master 下载状态失败 %s: %v", entry.MasterID, err)
+				} else {
+					reuseByMaster = downloaded
+				}
+
+				if isUsableV1EventsFile(eventsPath) {
+					if err := markFightDownloadedByID(entry.MappingID); err != nil {
+						if firstErr.Load() == nil {
+							firstErr.Store(err)
+						}
+						logProgress(entry.FightID, "失败(标记下载)")
+						return
+					}
+					atomic.AddInt64(&successCount, 1)
+					if reuseByMaster {
+						logProgress(entry.FightID, "复用(master)")
+					} else {
+						logProgress(entry.FightID, "复用本地")
+					}
+					return
+				}
+
+				attempts := 1
+				var events []map[string]interface{}
+				var err error
+				for attempt := 1; attempt <= attempts; attempt++ {
+					fightCtx, cancelFight := context.WithTimeout(ctx, fightTimeout)
+					events, err = fetchV1Events(fightCtx, client, baseURL, apiKey, code, fight)
+					cancelFight()
+					if err == nil {
+						break
+					}
+					log.Printf("[V1] fight %s-%d 下载失败(尝试 %d/%d): %v", code, fight.ID, attempt, attempts, err)
+				}
+				if err != nil {
+					log.Printf("[V1] fight %s-%d 失败，跳过", code, fight.ID)
+					atomic.StoreInt32(&allDone, 0)
+					logProgress(entry.FightID, "失败(下载)")
+					return
+				}
+
+				if err := writeJSON(eventsPath, toV1SavedEventsPayload(events)); err != nil {
+					if firstErr.Load() == nil {
+						firstErr.Store(err)
+					}
+					logProgress(entry.FightID, "失败(写文件)")
+					return
+				}
 				if err := markFightDownloadedByID(entry.MappingID); err != nil {
 					if firstErr.Load() == nil {
 						firstErr.Store(err)
 					}
-					continue
+					logProgress(entry.FightID, "失败(更新数据库)")
+					return
 				}
-				if reuseByMaster {
-					log.Printf("[V1] 复用已下载战斗(master) %s -> %s", entry.MasterID, eventsPath)
-				} else {
-					log.Printf("[V1] 复用本地 events 文件 %s", eventsPath)
-				}
+
 				atomic.AddInt64(&successCount, 1)
-				continue
-			}
-
-			attempts := 1
-			var events []map[string]interface{}
-			var err error
-			for attempt := 1; attempt <= attempts; attempt++ {
-				log.Printf("[V1] 下载 fight %s-%d (%d/%d)", code, fight.ID, attempt, attempts)
-				fightCtx, cancelFight := context.WithTimeout(ctx, fightTimeout)
-				events, err = fetchV1Events(fightCtx, client, baseURL, apiKey, code, fight)
-				cancelFight()
-				if err == nil {
-					break
-				}
-				log.Printf("[V1] 下载失败 fight %s-%d: %v", code, fight.ID, err)
-			}
-			if err != nil {
-				log.Printf("[V1] fight %s-%d 失败，跳过", code, fight.ID)
-				atomic.StoreInt32(&allDone, 0)
-				continue
-			}
-
-			if err := writeJSON(eventsPath, toV1SavedEventsPayload(events)); err != nil {
-				if firstErr.Load() == nil {
-					firstErr.Store(err)
-				}
-				continue
-			}
-			if err := markFightDownloadedByID(entry.MappingID); err != nil {
-				if firstErr.Load() == nil {
-					firstErr.Store(err)
-				}
-				continue
-			}
-			log.Printf("[V1] 完成 fight %s-%d", code, fight.ID)
-			atomic.AddInt64(&successCount, 1)
+				logProgress(entry.FightID, "完成")
+			}(entry)
 		}
 	}
 

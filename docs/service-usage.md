@@ -14,6 +14,7 @@
 可选但常用：
 - FFLOGS_V1_API_KEY
 - FFLOGS_ALL_REPORTS_DIR
+- XIVA_HOSTS_CONFIG（默认 ./docs/xiva-hosts.json）
 
 安装依赖：
 
@@ -24,6 +25,23 @@ go mod download
 cd external/xivanalysis
 pnpm install
 cd ../..
+
+多主机解析配置（JSON 文档）：
+
+默认读取 `docs/xiva-hosts.json`，也可通过 `XIVA_HOSTS_CONFIG` 指向其他路径。
+
+示例：
+
+```json
+{
+  "servers": [
+    {"name": "local", "host": "127.0.0.1", "port": 22026, "enabled": true, "weight": 1},
+    {"name": "remote-a", "host": "10.0.0.11", "port": 22026, "enabled": true, "weight": 2}
+  ]
+}
+```
+
+解析阶段会根据本机可识别的解析地址和本地配置（如 `XIVA_CALL_CONCURRENCY`）给出推荐并发，并在日志中输出。
 
 ## 2. 同步玩家战斗数据
 
@@ -88,3 +106,17 @@ go run ./cmd/draw_player_radar/main.go --name 玩家名 --server 服务器名
 
 3. 潜力值偏低
 - 潜力值含样本收缩；战斗样本不足时会向中性分回归。
+
+## 6. 监控 API（独立端口）
+
+主程序会启动监控接口，端口由 `MONITOR_PORT` 控制（默认 `22027`）。
+
+接口：
+- `GET /healthz`：健康检查。
+- `GET/POST /api/monitor/params`：返回请求携带的 query/form 参数。
+
+示例：
+
+```bash
+curl "http://127.0.0.1:22027/api/monitor/params?name=猫米&server=延夏"
+```
