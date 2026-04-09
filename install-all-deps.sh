@@ -256,6 +256,54 @@ install_node_project() {
   popd >/dev/null
 }
 
+has_babel_class_properties_plugin() {
+  local package_json="$1"
+
+  if [[ ! -f "$package_json" ]]; then
+    return 1
+  fi
+
+  if has_cmd node; then
+    local found
+    found="$(node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); const deps={...(p.dependencies||{}), ...(p.devDependencies||{})}; process.stdout.write(deps['@babel/plugin-transform-class-properties'] ? '1' : '0');" "$package_json" 2>/dev/null || echo 0)"
+    [[ "$found" == "1" ]]
+    return
+  fi
+
+  grep -Eq '"@babel/plugin-transform-class-properties"[[:space:]]*:' "$package_json"
+}
+
+fix_babel_class_properties_plugin() {
+  local project_dir="$1"
+  local project_name="$2"
+  local package_json="$project_dir/package.json"
+
+  if [[ ! -f "$package_json" ]]; then
+    return
+  fi
+
+  local force_fix="${FORCE_PNPM_ADD_BABEL_CLASS_PROPERTIES:-0}"
+  if [[ "$force_fix" != "1" ]] && has_babel_class_properties_plugin "$package_json"; then
+    return
+  fi
+
+  log "apply Babel plugin fix (${project_name}): pnpm add -D @babel/plugin-transform-class-properties"
+  pushd "$project_dir" >/dev/null
+
+  if has_cmd pnpm; then
+    pnpm add -D @babel/plugin-transform-class-properties
+  elif has_cmd corepack; then
+    corepack enable >/dev/null 2>&1 || true
+    corepack pnpm add -D @babel/plugin-transform-class-properties
+  else
+    printf '[deps] %s requires pnpm/corepack for Babel plugin fix\n' "$project_name" >&2
+    popd >/dev/null
+    exit 1
+  fi
+
+  popd >/dev/null
+}
+
 main() {
   cd "$ROOT_DIR"
 
@@ -264,6 +312,7 @@ main() {
 
   install_node_project "$ROOT_DIR" "root"
   install_node_project "$ROOT_DIR/external/xivanalysis" "external/xivanalysis"
+  fix_babel_class_properties_plugin "$ROOT_DIR/external/xivanalysis" "external/xivanalysis"
 
   if [[ "${INSTALL_PLAYWRIGHT_BROWSERS:-0}" == "1" ]]; then
     if [[ -f "$ROOT_DIR/package.json" ]] && has_cmd npx; then
