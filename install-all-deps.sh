@@ -154,34 +154,6 @@ find_go_bin() {
   return 1
 }
 
-download_with_curl_or_wget() {
-  local url="$1"
-  local out="$2"
-  local insecure_tls="${GO_DOWNLOAD_INSECURE:-0}"
-
-  if has_cmd curl; then
-    local curl_args=(--fail --location --silent --show-error --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 --http1.1 "$url" -o "$out")
-    if [[ "$insecure_tls" == "1" ]]; then
-      curl_args=(--insecure "${curl_args[@]}")
-    fi
-    if curl "${curl_args[@]}"; then
-      return 0
-    fi
-  fi
-
-  if has_cmd wget; then
-    local wget_args=(--tries=3 --timeout=30 --output-document="$out" "$url")
-    if [[ "$insecure_tls" == "1" ]]; then
-      wget_args=(--no-check-certificate "${wget_args[@]}")
-    fi
-    if wget "${wget_args[@]}"; then
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
 detect_go_platform() {
   local goos
   local goarch
@@ -244,10 +216,9 @@ resolve_go_version() {
 install_go_from_official_tarball() {
   local go_mod_path="${1:-$ROOT_DIR/go.mod}"
 
-  # Prefer explicit URL env override, otherwise use default mirror URL.
-  local url="${GO_DOWNLOAD_URL:-https://golang.google.cn/dl/go1.26.2.linux-amd64.tar.gz}"
+  local local_tarball="${GO_LOCAL_TARBALL:-$ROOT_DIR/rely/go1.26.2.linux-amd64.tar.gz}"
   local archive
-  archive="$(basename "$url")"
+  archive="$(basename "$local_tarball")"
 
   if ! has_cmd tar; then
     log "warning: tar is required for auto Go install"
@@ -258,21 +229,17 @@ install_go_from_official_tarball() {
     local go_mod_version
     go_mod_version="$(awk '/^go[[:space:]]+[0-9]+\.[0-9]+(\.[0-9]+)?/{print $2; exit}' "$go_mod_path" || true)"
     if [[ -n "$go_mod_version" ]]; then
-      log "go.mod requires Go ${go_mod_version}; downloading from configured URL"
+      log "go.mod requires Go ${go_mod_version}; installing from local tarball"
     fi
   fi
 
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  local archive_path="$tmpdir/$archive"
-
-  log "go not found, trying official tarball install: $archive"
-  if ! download_with_curl_or_wget "$url" "$archive_path"; then
-    rm -rf "$tmpdir"
-    log "warning: failed to download $url"
-    log "hint: set GO_DOWNLOAD_URL to an internal mirror; if your network is trusted and TLS is intercepted, try GO_DOWNLOAD_INSECURE=1"
+  if [[ ! -f "$local_tarball" ]]; then
+    log "warning: local Go tarball not found: $local_tarball"
+    log "hint: put the package at rely/go1.26.2.linux-amd64.tar.gz or set GO_LOCAL_TARBALL"
     return 1
   fi
+
+  log "go not found, using local tarball install: $archive"
 
   local install_base
   if [[ "$(id -u)" -eq 0 ]]; then
@@ -283,12 +250,10 @@ install_go_from_official_tarball() {
 
   mkdir -p "$install_base"
   rm -rf "$install_base/go"
-  if ! tar -C "$install_base" -xzf "$archive_path"; then
-    rm -rf "$tmpdir"
+  if ! tar -C "$install_base" -xzf "$local_tarball"; then
     log "warning: failed to extract Go archive"
     return 1
   fi
-  rm -rf "$tmpdir"
 
   export PATH="$install_base/go/bin:$PATH"
   hash -r 2>/dev/null || true
@@ -313,6 +278,36 @@ install_go_from_official_tarball() {
   return 1
 }
 
+download_go_modules_with_proxy_fallback() {
+  local go_bin="$1"
+  local custom_proxy_list="${GO_MODULE_PROXY_LIST:-}"
+  local -a proxy_candidates=()
+
+  if [[ -n "$custom_proxy_list" ]]; then
+    # Semicolon-separated list so each item can still contain commas, e.g. "https://goproxy.cn,direct;direct".
+    IFS=';' read -r -a proxy_candidates <<<"$custom_proxy_list"
+  else
+    if [[ -n "${GOPROXY:-}" ]]; then
+      proxy_candidates+=("${GOPROXY}")
+    fi
+    proxy_candidates+=("https://proxy.golang.org,direct" "https://goproxy.cn,direct" "https://goproxy.io,direct" "direct")
+  fi
+
+  local proxy
+  for proxy in "${proxy_candidates[@]}"; do
+    [[ -z "$proxy" ]] && continue
+    log "download Go modules (GOPROXY=${proxy})"
+    if GOPROXY="$proxy" "$go_bin" mod download; then
+      if [[ "${GO_PERSIST_GOPROXY:-0}" == "1" ]]; then
+        "$go_bin" env -w GOPROXY="$proxy" >/dev/null 2>&1 || true
+      fi
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 install_go_modules_if_possible() {
   if [[ ! -f "$ROOT_DIR/go.mod" ]]; then
     log "skip Go modules: go.mod not found"
@@ -321,21 +316,21 @@ install_go_modules_if_possible() {
 
   local go_bin
   if go_bin="$(find_go_bin)"; then
-    log "download Go modules"
-    "$go_bin" mod download
-    return
-  fi
-
-  if install_go_from_official_tarball "$ROOT_DIR/go.mod"; then
-    if go_bin="$(find_go_bin)"; then
-      log "download Go modules"
-      "$go_bin" mod download
+    if download_go_modules_with_proxy_fallback "$go_bin"; then
       return
     fi
   fi
 
-  log "warning: go not found, skipped 'go mod download'"
-  log "hint: install Go manually or configure GO_DOWNLOAD_URL to a reachable tarball"
+  if install_go_from_official_tarball "$ROOT_DIR/go.mod"; then
+    if go_bin="$(find_go_bin)"; then
+      if download_go_modules_with_proxy_fallback "$go_bin"; then
+        return
+      fi
+    fi
+  fi
+
+  log "warning: failed to download Go modules"
+  log "hint: check outbound network or set GO_MODULE_PROXY_LIST like 'https://goproxy.cn,direct;direct'"
 }
 
 install_node_project() {
