@@ -157,14 +157,26 @@ find_go_bin() {
 download_with_curl_or_wget() {
   local url="$1"
   local out="$2"
+  local insecure_tls="${GO_DOWNLOAD_INSECURE:-0}"
 
   if has_cmd curl; then
-    curl -fsSL "$url" -o "$out"
-    return $?
+    local curl_args=(--fail --location --silent --show-error --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 600 --http1.1 "$url" -o "$out")
+    if [[ "$insecure_tls" == "1" ]]; then
+      curl_args=(--insecure "${curl_args[@]}")
+    fi
+    if curl "${curl_args[@]}"; then
+      return 0
+    fi
   fi
+
   if has_cmd wget; then
-    wget -qO "$out" "$url"
-    return $?
+    local wget_args=(--tries=3 --timeout=30 --output-document="$out" "$url")
+    if [[ "$insecure_tls" == "1" ]]; then
+      wget_args=(--no-check-certificate "${wget_args[@]}")
+    fi
+    if wget "${wget_args[@]}"; then
+      return 0
+    fi
   fi
 
   return 1
@@ -258,6 +270,7 @@ install_go_from_official_tarball() {
   if ! download_with_curl_or_wget "$url" "$archive_path"; then
     rm -rf "$tmpdir"
     log "warning: failed to download $url"
+    log "hint: set GO_DOWNLOAD_URL to an internal mirror; if your network is trusted and TLS is intercepted, try GO_DOWNLOAD_INSECURE=1"
     return 1
   fi
 
@@ -290,6 +303,7 @@ install_go_from_official_tarball() {
 
   if has_cmd go; then
     log "installed $(go version)"
+    log "hint: if current shell still points to stale /usr/bin/go, run: hash -r"
     if [[ "$(id -u)" -ne 0 ]]; then
       log "hint: add to PATH permanently -> export PATH=\"$install_base/go/bin:\$PATH\""
     fi
