@@ -5,6 +5,7 @@ import (
 
 	appapi "github.com/user/ff14rader/api"
 	internalapi "github.com/user/ff14rader/internal/api"
+	"github.com/user/ff14rader/internal/cluster"
 	"github.com/user/ff14rader/internal/config"
 	"github.com/user/ff14rader/internal/db"
 	"github.com/user/ff14rader/internal/render"
@@ -23,6 +24,16 @@ func main() {
 	fflogsClient := internalapi.NewFFLogsClient(cfg.FFLogsClientID, cfg.FFLogsClientSecret)
 	syncManager := internalapi.NewSyncManager(fflogsClient)
 	radarRenderer := render.NewRadarChart(800, 800)
+	localHost := cluster.LocalHost()
+	scanDir := cluster.ReportsScanDir()
+	seeded, seedErr := cluster.GlobalReportHostRegistry().SeedHostReportsFromDir(localHost, scanDir)
+	if seedErr != nil {
+		log.Printf("[CLUSTER] 本地 reports 扫描失败 host=%s dir=%s err=%v", localHost, scanDir, seedErr)
+	} else {
+		log.Printf("[CLUSTER] 本地 reports 初始化完成 host=%s dir=%s reports=%d", localHost, scanDir, seeded)
+	}
+	cluster.StartRegistryEvictLoop(cluster.GlobalReportHostRegistry())
+	cluster.StartAutoRegisterAndHeartbeat(cluster.GlobalReportHostRegistry())
 
 	log.Println("FF14Rader 服务正常运行中...")
 	log.Printf("监控 API 已启动: http://0.0.0.0:%s", cfg.MonitorPort)

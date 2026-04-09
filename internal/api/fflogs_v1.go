@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/user/ff14rader/internal/cluster"
 	"github.com/user/ff14rader/internal/db"
 	"github.com/user/ff14rader/internal/models"
 )
@@ -79,6 +81,16 @@ type pendingFightEntry struct {
 	FightID    int
 }
 
+type clusterExecuteReportsRequest struct {
+	PlayerID uint     `json:"playerId"`
+	Reports  []string `json:"reports"`
+}
+
+type clusterExecuteReportsResponse struct {
+	Status string `json:"status"`
+	Error  string `json:"error"`
+}
+
 // downloadV1Reports 并行下载多个报告的战斗详情和事件数据，返回成功下载的报告代码列表
 
 // downloadV1Reports 根据 fight_sync_maps 的 MasterID 下载 V1 事件数据
@@ -128,6 +140,31 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 		for code := range grouped {
 			reportCodes = append(reportCodes, code)
 		}
+		sort.Strings(reportCodes)
+
+		candidateHosts := []string{cluster.LocalHost()}
+		if s.scorer != nil {
+			if hosts := s.scorer.CandidateAnalyzeHosts(); len(hosts) > 0 {
+				candidateHosts = hosts
+			}
+		}
+
+		localHost := cluster.LocalHost()
+		reportAssignedHost := make(map[string]string, len(reportCodes))
+		for _, code := range reportCodes {
+			fightCount := len(grouped[code])
+			assigned := cluster.GlobalReportHostRegistry().AssignHostForReport(code, fightCount, candidateHosts)
+			reportAssignedHost[code] = assigned
+			if assigned == "" {
+				log.Printf("[CLUSTER] 报告 %s 未匹配到可用 host，回退本地执行", code)
+				continue
+			}
+			if assigned == localHost {
+				log.Printf("[CLUSTER] 报告 %s 分配到本机 host=%s fights=%d", code, assigned, fightCount)
+			} else {
+				log.Printf("[CLUSTER] 报告 %s 分配到远端 host=%s fights=%d", code, assigned, fightCount)
+			}
+		}
 
 		log.Printf("[INFO] 第 %d 轮待拉取 V1 fights 数量: %d (报告并发=%d, fight并发=%d)", pass, len(allPending), reportWorkers, fightWorkers)
 
@@ -146,6 +183,19 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 					pendingFights := grouped[code]
 					if len(pendingFights) == 0 {
 						continue
+					}
+
+					assignedHost := reportAssignedHost[code]
+					if assignedHost != "" && assignedHost != localHost {
+						dispatchCtx, dispatchCancel := context.WithTimeout(ctx, 15*time.Minute)
+						dispatchErr := s.dispatchReportsToHost(dispatchCtx, assignedHost, playerID, []string{code})
+						dispatchCancel()
+						if dispatchErr == nil {
+							log.Printf("[CLUSTER] 报告 %s 已下发到 host=%s 执行下载+解析", code, assignedHost)
+							results <- code
+							continue
+						}
+						log.Printf("[CLUSTER] 报告 %s 下发失败 host=%s err=%v，回退本地", code, assignedHost, dispatchErr)
 					}
 
 					log.Printf("[V1] 报告 %s 下载开始 | 已下载=0/%d 当前并发=0/%d 当前速度=0.00 fights/s 预计完成=--", code, len(pendingFights), fightWorkers)
@@ -757,6 +807,163 @@ func splitMasterID(masterID string) (string, int, bool) {
 		return "", 0, false
 	}
 	return code, fightID, true
+}
+
+func clusterControlPort() string {
+	if raw := strings.TrimSpace(os.Getenv("CLUSTER_CONTROL_PORT")); raw != "" {
+		return raw
+	}
+	if raw := strings.TrimSpace(os.Getenv("MONITOR_PORT")); raw != "" {
+		return raw
+	}
+	return "22027"
+}
+
+func (s *SyncManager) dispatchReportsToHost(ctx context.Context, host string, playerID uint, reportCodes []string) error {
+	normalizedHost := cluster.NormalizeHost(host)
+	if normalizedHost == "" {
+		return fmt.Errorf("invalid host: %q", host)
+	}
+	if normalizedHost == cluster.LocalHost() {
+		return fmt.Errorf("target host is local host")
+	}
+	if playerID == 0 {
+		return fmt.Errorf("invalid playerID")
+	}
+	if len(reportCodes) == 0 {
+		return nil
+	}
+
+	reqBody := clusterExecuteReportsRequest{
+		PlayerID: playerID,
+		Reports:  reportCodes,
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return err
+	}
+
+	urlText := fmt.Sprintf("http://%s:%s/api/cluster/reports/execute", normalizedHost, clusterControlPort())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlText, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 20 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("dispatch failed status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	if len(raw) == 0 {
+		return nil
+	}
+
+	var payload clusterExecuteReportsResponse
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		if strings.TrimSpace(strings.ToLower(payload.Status)) != "ok" {
+			if strings.TrimSpace(payload.Error) != "" {
+				return fmt.Errorf("%s", payload.Error)
+			}
+			return fmt.Errorf("dispatch returned non-ok status: %s", payload.Status)
+		}
+	}
+
+	return nil
+}
+
+// ExecuteAssignedReports 由集群节点调用，仅处理指定报告集合的下载与解析。
+func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID uint, reportCodes []string) error {
+	if playerID == 0 {
+		return fmt.Errorf("invalid playerID")
+	}
+	if len(reportCodes) == 0 {
+		return nil
+	}
+
+	pending, err := loadPendingFights(playerID)
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+
+	codeSet := make(map[string]struct{}, len(reportCodes))
+	for _, code := range reportCodes {
+		norm := cluster.NormalizeReportCode(code)
+		if norm == "" {
+			continue
+		}
+		codeSet[norm] = struct{}{}
+	}
+	if len(codeSet) == 0 {
+		return nil
+	}
+
+	selected := make([]pendingFightEntry, 0, len(pending))
+	for _, entry := range pending {
+		if _, ok := codeSet[cluster.NormalizeReportCode(entry.ReportCode)]; ok {
+			selected = append(selected, entry)
+		}
+	}
+	if len(selected) == 0 {
+		return nil
+	}
+
+	reportTimeout := getV1ReportTimeout()
+	apiKey, err := getV1ApiKey()
+	if err != nil {
+		return err
+	}
+
+	baseURL := getV1BaseURL()
+	rootDir := getAllReportsDir()
+	client := newV1HTTPClient(reportTimeout)
+	fightWorkers := getV1DownloadConcurrency()
+	if err := os.MkdirAll(rootDir, 0755); err != nil {
+		return fmt.Errorf("create reports dir failed: %v", err)
+	}
+
+	grouped := groupPendingFights(selected)
+	codes := make([]string, 0, len(grouped))
+	for code := range grouped {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+
+	doneReports := make([]string, 0, len(codes))
+	for _, code := range codes {
+		pendingFights := grouped[code]
+		if len(pendingFights) == 0 {
+			continue
+		}
+
+		_, reportDone, err := downloadV1Report(ctx, client, baseURL, apiKey, rootDir, playerID, code, pendingFights, fightWorkers, reportTimeout)
+		if err != nil {
+			return fmt.Errorf("execute assigned report %s failed: %v", code, err)
+		}
+		if reportDone {
+			doneReports = append(doneReports, code)
+		}
+	}
+
+	if len(doneReports) > 0 {
+		if err := s.finalizeAllReportsDownloads(playerID, doneReports); err != nil {
+			return err
+		}
+	}
+	if err := s.scorePendingDownloadedFights(ctx, playerID); err != nil {
+		log.Printf("[SCORE] assigned score pass failed: %v", err)
+	}
+	return markCompletedReportParseLogs(playerID)
 }
 
 // BackfillPlayerOutputPercentiles 兼容旧命名：直接通过 FFLogs 接口刷新指定玩家 output_ability。

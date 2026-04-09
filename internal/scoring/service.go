@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/user/ff14rader/internal/cluster"
 	"github.com/user/ff14rader/internal/db"
 	"github.com/user/ff14rader/internal/models"
 	"gorm.io/datatypes"
@@ -1527,6 +1528,30 @@ func (s *Service) pickAliveAnalyzeURLs() ([]string, error) {
 	return aliveWeighted, nil
 }
 
+// CandidateAnalyzeHosts 返回当前可用的解析主机（仅 host，不含 path）。
+func (s *Service) CandidateAnalyzeHosts() []string {
+	urls := s.apiURLs
+	if alive, err := s.pickAliveAnalyzeURLs(); err == nil && len(alive) > 0 {
+		urls = alive
+	}
+
+	seen := make(map[string]struct{}, len(urls))
+	out := make([]string, 0, len(urls))
+	for _, endpoint := range urls {
+		h := cluster.NormalizeHost(analyzeEndpointHost(endpoint))
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (s *Service) pickAnalyzeURLForPayload(payload analyzeRequest, attempt int) string {
 	return s.pickAnalyzeURLForPayloadFromURLs(payload, attempt, s.apiURLs)
 }
@@ -1537,6 +1562,31 @@ func (s *Service) pickAnalyzeURLForPayloadFromURLs(payload analyzeRequest, attem
 	}
 	if attempt < 1 {
 		attempt = 1
+	}
+
+	if code := strings.TrimSpace(payload.Code); code != "" {
+		if mappedHost, ok := cluster.GlobalReportHostRegistry().ResolveHost(code); ok {
+			preferred := make([]string, 0, len(urls))
+			for _, endpoint := range urls {
+				if hostMatches(analyzeEndpointHost(endpoint), mappedHost) {
+					preferred = append(preferred, endpoint)
+				}
+			}
+			if len(preferred) > 0 {
+				if payload.FightID > 0 {
+					h := fnv.New32a()
+					_, _ = h.Write([]byte(code))
+					_, _ = h.Write([]byte("#"))
+					_, _ = h.Write([]byte(strconv.Itoa(payload.FightID)))
+					base := int(h.Sum32() % uint32(len(preferred)))
+					idx := (base + (attempt - 1)) % len(preferred)
+					return preferred[idx]
+				}
+
+				idx := (attempt - 1) % len(preferred)
+				return preferred[idx]
+			}
+		}
 	}
 
 	if shouldUseRemoteFetchTransport() && strings.TrimSpace(payload.Code) != "" && payload.FightID > 0 {
@@ -1553,6 +1603,12 @@ func (s *Service) pickAnalyzeURLForPayloadFromURLs(payload analyzeRequest, attem
 	base := int((idx - 1) % uint64(len(urls)))
 	final := (base + (attempt - 1)) % len(urls)
 	return urls[final]
+}
+
+func hostMatches(a, b string) bool {
+	ha := cluster.NormalizeHost(a)
+	hb := cluster.NormalizeHost(b)
+	return ha != "" && hb != "" && ha == hb
 }
 
 func analyzeEndpointHost(endpoint string) string {
@@ -2496,7 +2552,16 @@ func updateFightSyncScore(score *fightScoreUpdate) error {
 		return res.Error
 	}
 	if res.RowsAffected == 0 {
-		return fmt.Errorf("fight_sync_maps row not found for score update: player_id=%d master_id=%s", score.PlayerID, score.MasterID)
+		var cnt int64
+		if err := db.DB.Model(&models.FightSyncMap{}).
+			Where("player_id = ? AND master_id = ?", score.PlayerID, score.MasterID).
+			Count(&cnt).Error; err != nil {
+			return err
+		}
+		if cnt == 0 {
+			return fmt.Errorf("fight_sync_maps row not found for score update: player_id=%d master_id=%s", score.PlayerID, score.MasterID)
+		}
+		return nil
 	}
 	return nil
 }

@@ -7,12 +7,14 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/cors"
 	internalapi "github.com/user/ff14rader/internal/api"
+	"github.com/user/ff14rader/internal/cluster"
 	"github.com/user/ff14rader/internal/render"
 )
 
@@ -24,6 +26,169 @@ const requestIDKey ctxKey = "requestID"
 type Service struct {
 	SyncManager   *internalapi.SyncManager
 	RadarRenderer *render.RadarChart
+}
+
+type registerReportsRequest struct {
+	Host    string   `json:"host"`
+	Reports []string `json:"reports"`
+}
+
+type executeReportsRequest struct {
+	PlayerID uint     `json:"playerId"`
+	Reports  []string `json:"reports"`
+}
+
+type heartbeatRequest struct {
+	Host string `json:"host"`
+}
+
+func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req registerReportsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %v", err))
+		return
+	}
+
+	host := cluster.NormalizeHost(req.Host)
+	if host == "" {
+		host = cluster.NormalizeHost(r.RemoteAddr)
+	}
+	if host == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
+		return
+	}
+
+	added, total := cluster.GlobalReportHostRegistry().RegisterHostReports(host, req.Reports)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":       "ok",
+		"host":         host,
+		"received":     len(req.Reports),
+		"addedOrMoved": added,
+		"totalReports": total,
+		"time":         time.Now().Format(time.RFC3339),
+	})
+}
+
+func (s *Service) listReportsHostMapHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":       "ok",
+		"reports":      cluster.GlobalReportHostRegistry().Snapshot(),
+		"hostLoad":     cluster.GlobalReportHostRegistry().SnapshotLoads(),
+		"hostSeenAt":   cluster.GlobalReportHostRegistry().SnapshotSeenAt(),
+		"reportsCount": len(cluster.GlobalReportHostRegistry().Snapshot()),
+		"time":         time.Now().Format(time.RFC3339),
+	})
+}
+
+func (s *Service) heartbeatReportsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req heartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %v", err))
+		return
+	}
+
+	host := cluster.NormalizeHost(req.Host)
+	if host == "" {
+		host = cluster.NormalizeHost(r.RemoteAddr)
+	}
+	if host == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
+		return
+	}
+
+	if ok := cluster.GlobalReportHostRegistry().HeartbeatHost(host); !ok {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid host"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "ok",
+		"host":   host,
+		"time":   time.Now().Format(time.RFC3339),
+	})
+}
+
+func (s *Service) scanLocalReportsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	host := cluster.LocalHost()
+	dir := cluster.ReportsScanDir()
+	if raw := strings.TrimSpace(os.Getenv("REPORTS_SCAN_DIR")); raw != "" {
+		dir = raw
+	}
+
+	added, err := cluster.GlobalReportHostRegistry().SeedHostReportsFromDir(host, dir)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("scan local reports failed: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":       "ok",
+		"host":         host,
+		"scanDir":      dir,
+		"addedOrMoved": added,
+		"totalReports": len(cluster.GlobalReportHostRegistry().Snapshot()),
+		"time":         time.Now().Format(time.RFC3339),
+	})
+}
+
+func (s *Service) executeReportsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.SyncManager == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("sync manager not initialized"))
+		return
+	}
+
+	var req executeReportsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %v", err))
+		return
+	}
+	if req.PlayerID == 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("playerId is required"))
+		return
+	}
+	if len(req.Reports) == 0 {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("reports is required"))
+		return
+	}
+
+	execCtx, cancel := context.WithTimeout(r.Context(), 25*time.Minute)
+	defer cancel()
+
+	if err := s.SyncManager.ExecuteAssignedReports(execCtx, req.PlayerID, req.Reports); err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("execute reports failed: %v", err))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":   "ok",
+		"playerId": req.PlayerID,
+		"reports":  req.Reports,
+		"time":     time.Now().Format(time.RFC3339),
+	})
 }
 
 func TimeTrack(start time.Time, name string) {
@@ -131,6 +296,11 @@ func (s *Service) Handler() http.Handler {
 	// mux.HandleFunc("/api/monitor/params", s.paramsHandler)
 
 	mux.HandleFunc("/api/ff14/rader", s.raderHandler)
+	mux.HandleFunc("/api/cluster/reports/register", s.registerReportsHandler)
+	mux.HandleFunc("/api/cluster/reports/heartbeat", s.heartbeatReportsHandler)
+	mux.HandleFunc("/api/cluster/reports", s.listReportsHostMapHandler)
+	mux.HandleFunc("/api/cluster/reports/scan-local", s.scanLocalReportsHandler)
+	mux.HandleFunc("/api/cluster/reports/execute", s.executeReportsHandler)
 
 	c := cors.New(cors.Options{
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
