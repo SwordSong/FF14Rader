@@ -3,6 +3,7 @@
 // POST /analyze with payload {code, report, fightId, events} or {requests:[...]}
 
 const http = require('http')
+const https = require('https')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
@@ -34,6 +35,19 @@ const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase()
 const OUTPUT_MODE = (process.env.XIVA_OUTPUT_MODE || 'numeric').toLowerCase()
 const OUTPUT_LOCALE = (process.env.XIVA_OUTPUT_LOCALE || process.env.XIVA_LOCALE || 'zh').toLowerCase()
 const WORKER_MODE = process.env.XIVA_WORKER_MODE === '1'
+const REMOTE_FETCH_MODE = (process.env.XIVA_REMOTE_FETCH_MODE || 'off').toLowerCase()
+const REMOTE_FETCH_ENABLED = ['1', 'true', 'on', 'remote', 'remote-fetch', 'self-fetch'].includes(REMOTE_FETCH_MODE)
+const DEFAULT_FFLOGS_V1_BASE_URL = 'https://www.fflogs.com/v1'
+const DEFAULT_FFLOGS_V1_TRANSLATE = parseBoolean(process.env.FFLOGS_V1_TRANSLATE, true)
+const DEFAULT_FFLOGS_V1_API_KEY = typeof process.env.FFLOGS_V1_API_KEY === 'string'
+  ? process.env.FFLOGS_V1_API_KEY.trim()
+  : ''
+const EVENTS_FETCH_TIMEOUT_MS = Math.max(5000, Number(process.env.XIVA_EVENTS_FETCH_TIMEOUT_MS || 45 * 1000) || 45 * 1000)
+const EVENTS_CACHE_DIR = resolveEventsCacheDir(process.env.XIVA_EVENTS_CACHE_DIR)
+const PREFETCH_CONCURRENCY = parsePositiveInt(process.env.XIVA_PREFETCH_CONCURRENCY, 6)
+const PREFETCH_QUEUE_LIMIT = parsePositiveInt(process.env.XIVA_PREFETCH_QUEUE_LIMIT, 4096)
+const PREFETCH_API_MAX_IN_FLIGHT = parsePositiveInt(process.env.XIVA_PREFETCH_API_MAX_IN_FLIGHT, 32)
+const ANALYZE_REQUIRE_CACHE = parseBoolean(process.env.XIVA_ANALYZE_REQUIRE_CACHE, false)
 const PORT_POOL_START = parsePositiveInt(process.env.XIVA_PORT_START, 22000)
 const PORT_POOL_COUNT = parsePositiveInt(process.env.XIVA_PORT_COUNT, 1)
 const THREAD_POOL_AUTOSCALE_INTERVAL_MS = Math.max(
@@ -111,6 +125,42 @@ function parsePositiveInt(raw, fallback) {
     return fallback
   }
   return Math.floor(parsed)
+}
+
+function parseBoolean(raw, fallback) {
+  if (typeof raw === 'boolean') {
+    return raw
+  }
+  if (raw == null) {
+    return fallback
+  }
+  const text = String(raw).trim().toLowerCase()
+  if (text === '') {
+    return fallback
+  }
+  if (['1', 'true', 'yes', 'on'].includes(text)) {
+    return true
+  }
+  if (['0', 'false', 'no', 'off'].includes(text)) {
+    return false
+  }
+  return fallback
+}
+
+function normalizeV1BaseUrl(raw) {
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  if (text === '') {
+    return DEFAULT_FFLOGS_V1_BASE_URL
+  }
+  return text.replace(/\/+$/, '')
+}
+
+function resolveEventsCacheDir(raw) {
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  if (text === '') {
+    return path.resolve(repoRoot, 'downloads', 'fflogs')
+  }
+  return path.isAbsolute(text) ? text : path.resolve(repoRoot, text)
 }
 
 function clampInt(value, min, max) {
@@ -640,10 +690,23 @@ const serviceState = {
     requestsRejected: 0,
     requestsTimedOut: 0,
     bytesInTotal: 0,
+    prefetchRequestsTotal: 0,
+    prefetchAccepted: 0,
+    prefetchDeduplicated: 0,
+    prefetchRejected: 0,
+    prefetchApiRejected: 0,
+    prefetchCompleted: 0,
+    prefetchFailed: 0,
+    prefetchQueueDepthMax: 0,
   },
 }
 
+const remoteEventsInflight = new Map()
+const prefetchQueue = []
+const prefetchQueuedKeys = new Set()
 let inFlight = 0
+let prefetchInFlight = 0
+let prefetchAPIInFlight = 0
 let cachedModules = null
 let cachedI18n = null
 let threadPoolManager = null
@@ -1464,6 +1527,7 @@ function startServer() {
       const mode = threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single')
       const threadPoolConfigInfo = getThreadPoolConfigInfo()
       const concurrencyInfo = getCurrentConcurrencyInfo(threadPoolConfigInfo)
+      const prefetchRuntime = getPrefetchRuntimeStats()
       sendJson(res, 200, {
         status: 'ok',
         statusZh: '正常',
@@ -1479,6 +1543,7 @@ function startServer() {
         recommendedConcurrency: concurrencyInfo.recommendedConcurrency,
         mode,
         threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
+        prefetch: prefetchRuntime,
         ...buildConcurrencyCompatFields(mode, threadPoolConfigInfo, concurrencyInfo),
       })
       return
@@ -1502,6 +1567,7 @@ function startServer() {
       const mode = threadPoolManager ? 'threads' : (WORKER_MODE ? 'process-worker' : 'single')
       const threadPoolConfigInfo = getThreadPoolConfigInfo()
       const concurrencyInfo = getCurrentConcurrencyInfo(threadPoolConfigInfo)
+      const prefetchRuntime = getPrefetchRuntimeStats()
       sendJson(res, 200, {
         ...serviceState.metrics,
         inFlight,
@@ -1514,13 +1580,16 @@ function startServer() {
         recommendedConcurrency: concurrencyInfo.recommendedConcurrency,
         mode,
         threadPool: threadPoolManager ? threadPoolManager.stats() : undefined,
+        prefetch: prefetchRuntime,
         uptimeMs: Math.max(0, Date.now() - Date.parse(serviceState.metrics.startedAt)),
         ...buildConcurrencyCompatFields(mode, threadPoolConfigInfo, concurrencyInfo),
       })
       return
     }
 
-    if (method !== 'POST' || pathname !== '/analyze') {
+    const isAnalyzePath = method === 'POST' && pathname === '/analyze'
+    const isPrefetchPath = method === 'POST' && pathname === '/prefetch'
+    if (!isAnalyzePath && !isPrefetchPath) {
       sendJson(res, 404, {error: '未找到接口'})
       return
     }
@@ -1547,10 +1616,19 @@ function startServer() {
       return
     }
 
-    const runtimeConcurrencyInfo = getCurrentConcurrencyInfo()
-    if (inFlight >= runtimeConcurrencyInfo.maxConcurrency) {
+    if (isAnalyzePath) {
+      const runtimeConcurrencyInfo = getCurrentConcurrencyInfo()
+      if (inFlight >= runtimeConcurrencyInfo.maxConcurrency) {
+        serviceState.metrics.requestsRejected += 1
+        sendJson(res, 429, {error: '服务繁忙，请稍后重试', requestId})
+        return
+      }
+    }
+
+    if (isPrefetchPath && prefetchAPIInFlight >= PREFETCH_API_MAX_IN_FLIGHT) {
       serviceState.metrics.requestsRejected += 1
-      sendJson(res, 429, {error: '服务繁忙，请稍后重试', requestId})
+      serviceState.metrics.prefetchApiRejected += 1
+      sendJson(res, 429, {error: '预拉取请求过多，请稍后重试', requestId})
       return
     }
 
@@ -1601,31 +1679,60 @@ function startServer() {
         return
       }
 
-      inFlight += 1
+      if (isAnalyzePath) {
+        inFlight += 1
+      }
+      if (isPrefetchPath) {
+        prefetchAPIInFlight += 1
+      }
       serviceState.metrics.requestsTotal += 1
       serviceState.metrics.bytesInTotal += receivedBytes
 
       try {
         const payload = parsed.value || {}
-        const results = await withTimeout(
-          handleAnalyze(payload),
-          ANALYZE_TIMEOUT_MS,
-          `解析超时（${ANALYZE_TIMEOUT_MS}ms）`,
-        )
+        if (isPrefetchPath) {
+          serviceState.metrics.prefetchRequestsTotal += 1
+          const prefetchSummary = await withTimeout(
+            handlePrefetch(payload),
+            Math.min(ANALYZE_TIMEOUT_MS, 15 * 1000),
+            '预拉取入队超时',
+          )
 
-        serviceState.metrics.requestsSucceeded += 1
-        sendJson(res, 200, {
-          requestId,
-          durationMs: Date.now() - startedAt,
-          results,
-        })
+          serviceState.metrics.requestsSucceeded += 1
+          sendJson(res, 202, {
+            requestId,
+            durationMs: Date.now() - startedAt,
+            accepted: true,
+            ...prefetchSummary,
+          })
 
-        logEvent('info', '请求处理完成', {
-          requestId,
-          status: 200,
-          durationMs: Date.now() - startedAt,
-          inFlight,
-        })
+          logEvent('info', '预拉取请求已处理', {
+            requestId,
+            status: 202,
+            durationMs: Date.now() - startedAt,
+            ...prefetchSummary.runtime,
+          })
+        } else {
+          const results = await withTimeout(
+            handleAnalyze(payload),
+            ANALYZE_TIMEOUT_MS,
+            `解析超时（${ANALYZE_TIMEOUT_MS}ms）`,
+          )
+
+          serviceState.metrics.requestsSucceeded += 1
+          sendJson(res, 200, {
+            requestId,
+            durationMs: Date.now() - startedAt,
+            results,
+          })
+
+          logEvent('info', '请求处理完成', {
+            requestId,
+            status: 200,
+            durationMs: Date.now() - startedAt,
+            inFlight,
+          })
+        }
       } catch (err) {
         const isTimeout = err instanceof TimeoutError
         if (isTimeout) {
@@ -1647,7 +1754,12 @@ function startServer() {
           ...payload,
         })
       } finally {
-        inFlight -= 1
+        if (isAnalyzePath) {
+          inFlight = Math.max(0, inFlight - 1)
+        }
+        if (isPrefetchPath) {
+          prefetchAPIInFlight = Math.max(0, prefetchAPIInFlight - 1)
+        }
       }
     })
   })
@@ -1696,6 +1808,11 @@ function startServer() {
       apiKeyEnabled: API_KEY !== '',
       metricsPath: '/metrics',
       readyPath: '/ready',
+      prefetchPath: '/prefetch',
+      prefetchConcurrency: PREFETCH_CONCURRENCY,
+      prefetchAPIMaxInFlight: PREFETCH_API_MAX_IN_FLIGHT,
+      prefetchQueueLimit: PREFETCH_QUEUE_LIMIT,
+      analyzeRequireCache: ANALYZE_REQUIRE_CACHE,
       ...buildConcurrencyCompatFields(mode, threadPoolConfigInfo, concurrencyInfo),
     })
   })
@@ -1857,7 +1974,17 @@ async function analyzeRequest(request, index) {
     }
   }
 
-  const {code, report, fight, fightId, events} = normalized
+  const eventsResolution = await resolveRequestEvents(normalized)
+  if (eventsResolution.error) {
+    return {
+      index,
+      status: 'error',
+      error: eventsResolution.error,
+    }
+  }
+
+  const {code, report, fight, fightId} = normalized
+  const events = eventsResolution.events
   const actorIdsInFight = collectActorIds(events)
   const pull = buildPull(mods, report, fight, actorIdsInFight)
   const xvReport = buildReport(mods, code, report, [pull])
@@ -1930,6 +2057,7 @@ function normalizeRequest(request) {
   const code = request.code || request.reportCode || request.report_code || 'unknown'
   const report = request.report || request.metadata || request.reportData
   const events = normalizeEvents(request.events || request.eventData || request.event_data)
+  const fetch = normalizeFetchConfig(request.fetch)
   const fightId = Number(request.fightId || request.fight_id || request.fight || 0)
   const fight = request.fight
 
@@ -1939,9 +2067,6 @@ function normalizeRequest(request) {
   const normalizedReport = normalizeReport(report, request.actors || request.friendlies || request.masterData)
   if (normalizedReport.error) {
     return {error: normalizedReport.error}
-  }
-  if (!events || !Array.isArray(events)) {
-    return {error: '缺少 events 数组'}
   }
 
   let selectedFight = fight
@@ -1958,6 +2083,25 @@ function normalizeRequest(request) {
     fight: selectedFight,
     fightId: Number(selectedFight.id),
     events,
+    fetch,
+  }
+}
+
+function normalizeFetchConfig(input) {
+  if (!input || typeof input !== 'object') {
+    return null
+  }
+
+  const provider = String(input.provider || input.type || input.source || 'fflogs-v1').trim().toLowerCase()
+  const apiKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : ''
+  const baseUrl = normalizeV1BaseUrl(input.baseUrl || input.baseURL)
+  const translate = parseBoolean(input.translate, DEFAULT_FFLOGS_V1_TRANSLATE)
+
+  return {
+    provider,
+    apiKey,
+    baseUrl,
+    translate,
   }
 }
 
@@ -1999,6 +2143,552 @@ function normalizeEvents(raw) {
   if (raw && Array.isArray(raw.events)) return raw.events
   if (raw && raw.events && Array.isArray(raw.events.events)) return raw.events.events
   return null
+}
+
+function numberFromRequestField(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+  if (typeof value === 'string' && value.trim() !== '') {
+    const n = Number(value)
+    if (Number.isFinite(n)) {
+      return n
+    }
+  }
+  return null
+}
+
+function normalizePrefetchRequest(request) {
+  if (!request || typeof request !== 'object') {
+    return {error: 'request 必须是对象'}
+  }
+
+  const code = String(request.code || request.reportCode || request.report_code || '').trim()
+  const fightId = Number(request.fightId || request.fight_id || request.fight || 0)
+  const fetch = normalizeFetchConfig(request.fetch)
+  const startMs = numberFromRequestField(request.startMs ?? request.start_ms)
+  const endMs = numberFromRequestField(request.endMs ?? request.end_ms)
+
+  if (!code) {
+    return {error: '缺少 code'}
+  }
+  if (!Number.isFinite(fightId) || fightId <= 0) {
+    return {error: '缺少有效 fightId'}
+  }
+
+  if (startMs != null && endMs != null) {
+    if (endMs <= startMs) {
+      return {error: 'startMs/endMs 范围无效'}
+    }
+    return {
+      code,
+      fightId: Math.floor(fightId),
+      startMs: Math.floor(startMs),
+      endMs: Math.floor(endMs),
+      fetch,
+    }
+  }
+
+  const report = request.report || request.metadata || request.reportData
+  const fight = request.fight
+  if (!report || typeof report !== 'object') {
+    return {error: '缺少 startMs/endMs 或 report 元数据'}
+  }
+
+  const reportStart = numberFromRequestField(report.startTime)
+  let selectedFight = fight
+  if (!selectedFight && Array.isArray(report.fights)) {
+    selectedFight = report.fights.find(item => Number(item && item.id) === fightId)
+  }
+  if (!selectedFight || typeof selectedFight !== 'object') {
+    return {error: '缺少 startMs/endMs，且 report 中未找到 fight'}
+  }
+
+  const fightStart = numberFromRequestField(selectedFight.startTime)
+  const fightEnd = numberFromRequestField(selectedFight.endTime)
+  if (reportStart == null || fightStart == null || fightEnd == null) {
+    return {error: '缺少有效的 report.startTime/fight.startTime/fight.endTime'}
+  }
+
+  const mergedStart = Math.floor(reportStart + fightStart)
+  const mergedEnd = Math.floor(reportStart + fightEnd)
+  if (mergedEnd <= mergedStart) {
+    return {error: 'report+fight 计算得到的时间范围无效'}
+  }
+
+  return {
+    code,
+    fightId: Math.floor(fightId),
+    startMs: mergedStart,
+    endMs: mergedEnd,
+    fetch,
+  }
+}
+
+function updatePrefetchQueueDepthMetric() {
+  if (prefetchQueue.length > serviceState.metrics.prefetchQueueDepthMax) {
+    serviceState.metrics.prefetchQueueDepthMax = prefetchQueue.length
+  }
+}
+
+function getPrefetchRuntimeStats() {
+  return {
+    enabled: REMOTE_FETCH_ENABLED,
+    requireCache: ANALYZE_REQUIRE_CACHE,
+    concurrency: PREFETCH_CONCURRENCY,
+    queueLimit: PREFETCH_QUEUE_LIMIT,
+    queueDepth: prefetchQueue.length,
+    inFlight: prefetchInFlight,
+    apiInFlight: prefetchAPIInFlight,
+    apiMaxInFlight: PREFETCH_API_MAX_IN_FLIGHT,
+    queuedKeys: prefetchQueuedKeys.size,
+  }
+}
+
+function enqueuePrefetchTask({code, fightId, startMs, endMs, fetchCfg, trigger}) {
+  const cachePath = buildEventsCachePath(code, fightId)
+  const inflightKey = buildRemoteFetchKey(code, fightId, startMs, endMs, fetchCfg)
+
+  if (remoteEventsInflight.has(inflightKey) || prefetchQueuedKeys.has(inflightKey)) {
+    serviceState.metrics.prefetchDeduplicated += 1
+    return {status: 'deduplicated', inflightKey, cachePath}
+  }
+
+  if (prefetchQueue.length >= PREFETCH_QUEUE_LIMIT) {
+    serviceState.metrics.prefetchRejected += 1
+    return {status: 'queue_full', inflightKey, cachePath}
+  }
+
+  prefetchQueuedKeys.add(inflightKey)
+  prefetchQueue.push({
+    inflightKey,
+    code,
+    fightId,
+    startMs,
+    endMs,
+    fetchCfg,
+    cachePath,
+    trigger: trigger || 'api',
+    queuedAt: Date.now(),
+  })
+  serviceState.metrics.prefetchAccepted += 1
+  updatePrefetchQueueDepthMetric()
+  drainPrefetchQueue()
+  return {status: 'queued', inflightKey, cachePath}
+}
+
+function drainPrefetchQueue() {
+  while (prefetchInFlight < PREFETCH_CONCURRENCY && prefetchQueue.length > 0) {
+    const task = prefetchQueue.shift()
+    if (!task) {
+      return
+    }
+    prefetchInFlight += 1
+
+    ;(async () => {
+      const startedAt = Date.now()
+      try {
+        const events = await getOrFetchEventsCached({
+          code: task.code,
+          fightId: task.fightId,
+          startMs: task.startMs,
+          endMs: task.endMs,
+          fetchCfg: task.fetchCfg,
+        })
+
+        serviceState.metrics.prefetchCompleted += 1
+        logEvent('info', '预拉取任务完成', {
+          reportCode: task.code,
+          fightId: task.fightId,
+          events: Array.isArray(events) ? events.length : 0,
+          durationMs: Date.now() - startedAt,
+          waitInQueueMs: Math.max(0, startedAt - task.queuedAt),
+          trigger: task.trigger,
+          cachePath: task.cachePath,
+        })
+      } catch (err) {
+        serviceState.metrics.prefetchFailed += 1
+        logEvent('warn', '预拉取任务失败', {
+          reportCode: task.code,
+          fightId: task.fightId,
+          trigger: task.trigger,
+          durationMs: Date.now() - startedAt,
+          error: err && err.message ? err.message : String(err),
+        })
+      } finally {
+        prefetchInFlight = Math.max(0, prefetchInFlight - 1)
+        prefetchQueuedKeys.delete(task.inflightKey)
+        drainPrefetchQueue()
+      }
+    })().catch(() => {
+      prefetchInFlight = Math.max(0, prefetchInFlight - 1)
+      prefetchQueuedKeys.delete(task.inflightKey)
+      drainPrefetchQueue()
+    })
+  }
+}
+
+async function handlePrefetch(payload) {
+  if (!REMOTE_FETCH_ENABLED) {
+    throw new Error('REMOTE_FETCH_UNAVAILABLE: 未启用远端拉取（XIVA_REMOTE_FETCH_MODE）')
+  }
+
+  const requests = Array.isArray(payload && payload.requests) ? payload.requests : [payload]
+  if (requests.length === 0) {
+    throw new Error('requests 必须是非空数组')
+  }
+
+  const summary = {
+    requested: requests.length,
+    queued: 0,
+    deduplicated: 0,
+    rejected: 0,
+    invalid: 0,
+    items: [],
+  }
+
+  for (const request of requests) {
+    const normalized = normalizePrefetchRequest(request)
+    if (normalized.error) {
+      summary.invalid += 1
+      summary.items.push({status: 'invalid', error: normalized.error})
+      continue
+    }
+
+    const fetchCfg = resolveRuntimeFetchConfig(normalized.fetch)
+    if (fetchCfg.provider !== 'fflogs-v1') {
+      summary.invalid += 1
+      summary.items.push({
+        status: 'invalid',
+        reportCode: normalized.code,
+        fightId: normalized.fightId,
+        error: `不支持的 fetch provider=${fetchCfg.provider}`,
+      })
+      continue
+    }
+    if (!fetchCfg.apiKey) {
+      summary.invalid += 1
+      summary.items.push({
+        status: 'invalid',
+        reportCode: normalized.code,
+        fightId: normalized.fightId,
+        error: '缺少 FFLogs V1 apiKey',
+      })
+      continue
+    }
+
+    const result = enqueuePrefetchTask({
+      code: normalized.code,
+      fightId: normalized.fightId,
+      startMs: normalized.startMs,
+      endMs: normalized.endMs,
+      fetchCfg,
+      trigger: 'prefetch-api',
+    })
+
+    if (result.status === 'queued') {
+      summary.queued += 1
+    } else if (result.status === 'deduplicated') {
+      summary.deduplicated += 1
+    } else {
+      summary.rejected += 1
+    }
+
+    summary.items.push({
+      status: result.status,
+      reportCode: normalized.code,
+      fightId: normalized.fightId,
+      cachePath: result.cachePath,
+    })
+  }
+
+  return {
+    ...summary,
+    runtime: getPrefetchRuntimeStats(),
+  }
+}
+
+async function resolveRequestEvents(normalized) {
+  if (normalized && Array.isArray(normalized.events)) {
+    logEvent('info', 'events 来源: 请求体内联', {
+      reportCode: normalized.code,
+      fightId: normalized.fightId,
+      events: normalized.events.length,
+    })
+    return {events: normalized.events, source: 'payload'}
+  }
+
+  if (!REMOTE_FETCH_ENABLED) {
+    return {error: 'REMOTE_FETCH_UNAVAILABLE: 缺少 events 数组且未启用远端拉取（XIVA_REMOTE_FETCH_MODE）'}
+  }
+  if (!normalized || !normalized.report || !normalized.fight) {
+    return {error: 'REMOTE_FETCH_UNAVAILABLE: 请求缺少 report/fight 元数据，无法远端拉取'}
+  }
+
+  const fetchCfg = resolveRuntimeFetchConfig(normalized.fetch)
+  if (fetchCfg.provider !== 'fflogs-v1') {
+    return {error: `REMOTE_FETCH_UNAVAILABLE: 不支持的 fetch provider=${fetchCfg.provider}`}
+  }
+  if (!fetchCfg.apiKey) {
+    return {error: 'REMOTE_FETCH_UNAVAILABLE: 缺少 FFLogs V1 apiKey'}
+  }
+
+  const reportStart = Number(normalized.report.startTime)
+  const fightStart = Number(normalized.fight.startTime)
+  const fightEnd = Number(normalized.fight.endTime)
+  const startMs = reportStart + fightStart
+  const endMs = reportStart + fightEnd
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return {error: 'REMOTE_FETCH_UNAVAILABLE: 无效的 fight 时间范围，无法远端拉取'}
+  }
+
+  if (ANALYZE_REQUIRE_CACHE) {
+    const cachePath = buildEventsCachePath(normalized.code, normalized.fightId)
+    const cacheHit = await readEventsFromCache(cachePath)
+    if (cacheHit) {
+      logEvent('info', 'events 来源: 本地缓存', {
+        reportCode: normalized.code,
+        fightId: normalized.fightId,
+        events: cacheHit.length,
+        cachePath,
+      })
+      return {events: cacheHit, source: 'cache-only'}
+    }
+
+    const queued = enqueuePrefetchTask({
+      code: normalized.code,
+      fightId: normalized.fightId,
+      startMs,
+      endMs,
+      fetchCfg,
+      trigger: 'analyze-cache-miss',
+    })
+
+    if (queued.status === 'queue_full') {
+      return {error: 'REMOTE_FETCH_PENDING: 缓存未命中且预拉取队列已满，请稍后重试'}
+    }
+
+    return {error: 'REMOTE_FETCH_PENDING: 缓存未命中，已进入异步预拉取队列，请稍后重试'}
+  }
+
+  try {
+    const events = await getOrFetchEventsCached({
+      code: normalized.code,
+      fightId: normalized.fightId,
+      startMs,
+      endMs,
+      fetchCfg,
+    })
+    return {events, source: 'remote-fetch'}
+  } catch (err) {
+    return {error: `REMOTE_FETCH_UNAVAILABLE: ${err && err.message ? err.message : String(err)}`}
+  }
+}
+
+function resolveRuntimeFetchConfig(requestFetch) {
+  const fetchCfg = requestFetch && typeof requestFetch === 'object' ? requestFetch : null
+  const provider = fetchCfg && fetchCfg.provider ? String(fetchCfg.provider).trim().toLowerCase() : 'fflogs-v1'
+  const apiKey = fetchCfg && typeof fetchCfg.apiKey === 'string' && fetchCfg.apiKey.trim() !== ''
+    ? fetchCfg.apiKey.trim()
+    : DEFAULT_FFLOGS_V1_API_KEY
+  const baseUrl = normalizeV1BaseUrl(
+    fetchCfg && fetchCfg.baseUrl
+      ? fetchCfg.baseUrl
+      : process.env.FFLOGS_V1_BASE_URL,
+  )
+  const translate = parseBoolean(
+    fetchCfg && Object.prototype.hasOwnProperty.call(fetchCfg, 'translate') ? fetchCfg.translate : undefined,
+    DEFAULT_FFLOGS_V1_TRANSLATE,
+  )
+
+  return {
+    provider,
+    apiKey,
+    baseUrl,
+    translate,
+  }
+}
+
+function buildEventsCachePath(code, fightId) {
+  return path.join(EVENTS_CACHE_DIR, String(code), `fight_${Number(fightId)}_events.json`)
+}
+
+function buildRemoteFetchKey(code, fightId, startMs, endMs, fetchCfg) {
+  return [
+    String(code),
+    String(fightId),
+    String(startMs),
+    String(endMs),
+    fetchCfg.baseUrl,
+    fetchCfg.translate ? 'translate=1' : 'translate=0',
+  ].join('|')
+}
+
+async function getOrFetchEventsCached({code, fightId, startMs, endMs, fetchCfg}) {
+  const cachePath = buildEventsCachePath(code, fightId)
+  const cacheHit = await readEventsFromCache(cachePath)
+  if (cacheHit) {
+    logEvent('info', 'events 来源: 本地缓存', {
+      reportCode: code,
+      fightId,
+      events: cacheHit.length,
+      cachePath,
+    })
+    return cacheHit
+  }
+
+  const inflightKey = buildRemoteFetchKey(code, fightId, startMs, endMs, fetchCfg)
+  if (remoteEventsInflight.has(inflightKey)) {
+    return remoteEventsInflight.get(inflightKey)
+  }
+
+  const task = (async () => {
+    const startedAt = Date.now()
+    const fetched = await fetchV1EventsRange({
+      code,
+      startMs,
+      endMs,
+      fetchCfg,
+    })
+
+    await writeEventsCache(cachePath, fetched.events, {
+      provider: fetchCfg.provider,
+      pages: fetched.pages,
+      fetchedAt: new Date().toISOString(),
+      fetchDurationMs: Date.now() - startedAt,
+      translate: fetchCfg.translate,
+    })
+
+    logEvent('info', '远端拉取 events 完成', {
+      reportCode: code,
+      fightId,
+      pages: fetched.pages,
+      events: fetched.events.length,
+      durationMs: Date.now() - startedAt,
+      cachePath,
+    })
+
+    return fetched.events
+  })()
+
+  remoteEventsInflight.set(inflightKey, task)
+  try {
+    return await task
+  } finally {
+    remoteEventsInflight.delete(inflightKey)
+  }
+}
+
+async function readEventsFromCache(filePath) {
+  try {
+    const raw = await fs.promises.readFile(filePath, 'utf8')
+    const parsed = JSON.parse(raw)
+    const events = normalizeEvents(parsed)
+    if (!Array.isArray(events)) {
+      return null
+    }
+    return events
+  } catch (_err) {
+    return null
+  }
+}
+
+async function writeEventsCache(filePath, events, meta) {
+  const dir = path.dirname(filePath)
+  await fs.promises.mkdir(dir, {recursive: true})
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}`
+  const payload = JSON.stringify({events, count: events.length, meta})
+  await fs.promises.writeFile(tmpPath, payload)
+  await fs.promises.rename(tmpPath, filePath)
+}
+
+async function fetchV1EventsRange({code, startMs, endMs, fetchCfg}) {
+  let cursor = startMs
+  const all = []
+  let pages = 0
+
+  while (true) {
+    const page = await fetchV1EventsPage({
+      code,
+      startMs: cursor,
+      endMs,
+      fetchCfg,
+    })
+    pages += 1
+
+    const events = normalizeEvents(page)
+    if (!Array.isArray(events)) {
+      throw new Error('FFLogs 返回 events 格式无效')
+    }
+    all.push(...events)
+
+    const next = page.nextPageTimestamp
+    if (next == null || events.length === 0) {
+      break
+    }
+
+    const nextCursor = Number(next)
+    if (!Number.isFinite(nextCursor) || nextCursor <= cursor) {
+      break
+    }
+    cursor = nextCursor
+  }
+
+  return {events: all, pages}
+}
+
+async function fetchV1EventsPage({code, startMs, endMs, fetchCfg}) {
+  const baseURL = new URL(fetchCfg.baseUrl.endsWith('/') ? fetchCfg.baseUrl : `${fetchCfg.baseUrl}/`)
+  baseURL.pathname = `${baseURL.pathname.replace(/\/$/, '')}/report/events/${encodeURIComponent(code)}`
+  baseURL.searchParams.set('api_key', fetchCfg.apiKey)
+  baseURL.searchParams.set('start', String(startMs))
+  baseURL.searchParams.set('end', String(endMs))
+  if (fetchCfg.translate) {
+    baseURL.searchParams.set('translate', 'true')
+  }
+  return httpGetJSON(baseURL.toString(), EVENTS_FETCH_TIMEOUT_MS)
+}
+
+function httpGetJSON(urlText, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const urlObj = new URL(urlText)
+    const mod = urlObj.protocol === 'https:' ? https : http
+    const req = mod.request(urlObj, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+      },
+    }, res => {
+      const chunks = []
+      res.on('data', chunk => {
+        chunks.push(chunk)
+      })
+      res.on('end', () => {
+        const body = Buffer.concat(chunks)
+        const bodyText = body.toString('utf8')
+        if ((res.statusCode || 500) >= 400) {
+          reject(new Error(`FFLogs 请求失败 status=${res.statusCode} body=${bodyText.slice(0, 256)}`))
+          return
+        }
+        const parsed = parseJSONSafe(body)
+        if (!parsed.ok) {
+          reject(new Error(`FFLogs JSON 解析失败: ${parsed.error}`))
+          return
+        }
+        resolve(parsed.value)
+      })
+    })
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`FFLogs 请求超时(${timeoutMs}ms)`))
+    })
+
+    req.on('error', err => {
+      reject(err)
+    })
+
+    req.end()
+  })
 }
 
 function parseJSONSafe(buf) {

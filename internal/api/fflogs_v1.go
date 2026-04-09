@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -56,6 +58,12 @@ type v1SavedEventsPayload struct {
 	Count  int                      `json:"count"`
 }
 
+type v1EventsFetchStats struct {
+	Pages        int
+	Events       int
+	FetchElapsed time.Duration
+}
+
 type allReportsFightEntry struct {
 	SourceID   string
 	AbsStart   int64
@@ -75,7 +83,7 @@ type pendingFightEntry struct {
 
 // downloadV1Reports 根据 fight_sync_maps 的 MasterID 下载 V1 事件数据
 func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]string, error) {
-	reportWorkers := 1
+	reportWorkers := getV1ReportConcurrency()
 	fightWorkers := getV1DownloadConcurrency()
 	reportTimeout := getV1ReportTimeout()
 	apiKey, err := getV1ApiKey()
@@ -85,7 +93,7 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 
 	baseURL := getV1BaseURL()
 	rootDir := getAllReportsDir()
-	client := &http.Client{Timeout: reportTimeout}
+	client := newV1HTTPClient(reportTimeout)
 
 	if err := os.MkdirAll(rootDir, 0755); err != nil {
 		return nil, fmt.Errorf("create reports dir failed: %v", err)
@@ -121,7 +129,7 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 			reportCodes = append(reportCodes, code)
 		}
 
-		log.Printf("[INFO] 第 %d 轮待拉取 V1 fights 数量: %d", pass, len(allPending))
+		log.Printf("[INFO] 第 %d 轮待拉取 V1 fights 数量: %d (报告并发=%d, fight并发=%d)", pass, len(allPending), reportWorkers, fightWorkers)
 
 		jobs := make(chan string)
 		results := make(chan string)
@@ -252,6 +260,16 @@ func getV1DownloadConcurrency() int {
 	return defaultConcurrency
 }
 
+func getV1ReportConcurrency() int {
+	const defaultConcurrency = 2
+	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_REPORT_CONCURRENCY")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			return v
+		}
+	}
+	return defaultConcurrency
+}
+
 func getV1ReportTimeout() time.Duration {
 	const defaultTimeout = 120 * time.Second
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_REPORT_TIMEOUT_SEC")); raw != "" {
@@ -260,6 +278,53 @@ func getV1ReportTimeout() time.Duration {
 		}
 	}
 	return defaultTimeout
+}
+
+func getV1RetryCount() int {
+	const defaultRetry = 1
+	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_RETRY")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			return v
+		}
+	}
+	return defaultRetry
+}
+
+func getV1TranslateEnabled() bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv("FFLOGS_V1_TRANSLATE")))
+	switch raw {
+	case "", "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func newV1HTTPClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   128,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+	}
+
+	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_MAX_CONNS_PER_HOST")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			transport.MaxConnsPerHost = v
+		}
+	}
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
 }
 
 func fetchV1Fights(ctx context.Context, client *http.Client, baseURL, apiKey, code string) (*v1FightsResponse, error) {
@@ -301,21 +366,28 @@ func fetchV1Events(ctx context.Context, client *http.Client, baseURL, apiKey, co
 	if fight.EndTime <= fight.StartTime {
 		return nil, fmt.Errorf("invalid fight time range")
 	}
-	return fetchV1EventsRange(ctx, client, baseURL, apiKey, code, fight.StartTime, fight.EndTime)
+	events, _, err := fetchV1EventsRange(ctx, client, baseURL, apiKey, code, fight.StartTime, fight.EndTime)
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
 }
 
-func fetchV1EventsRange(ctx context.Context, client *http.Client, baseURL, apiKey, code string, start, end int64) ([]map[string]interface{}, error) {
+func fetchV1EventsRange(ctx context.Context, client *http.Client, baseURL, apiKey, code string, start, end int64) ([]map[string]interface{}, v1EventsFetchStats, error) {
 	if end <= start {
-		return nil, fmt.Errorf("invalid time range")
+		return nil, v1EventsFetchStats{}, fmt.Errorf("invalid time range")
 	}
 
+	startedAt := time.Now()
 	all := make([]map[string]interface{}, 0)
+	pages := 0
 
 	for {
 		page, err := fetchV1EventsPage(ctx, client, baseURL, apiKey, code, start, end)
 		if err != nil {
-			return nil, err
+			return nil, v1EventsFetchStats{}, err
 		}
+		pages++
 
 		all = append(all, page.Events...)
 		if page.NextPageTimestamp == nil || len(page.Events) == 0 {
@@ -324,7 +396,12 @@ func fetchV1EventsRange(ctx context.Context, client *http.Client, baseURL, apiKe
 		start = *page.NextPageTimestamp
 	}
 
-	return all, nil
+	stats := v1EventsFetchStats{
+		Pages:        pages,
+		Events:       len(all),
+		FetchElapsed: time.Since(startedAt),
+	}
+	return all, stats, nil
 }
 
 func fetchV1EventsPage(ctx context.Context, client *http.Client, baseURL, apiKey, code string, start, end int64) (*v1EventsResponse, error) {
@@ -338,7 +415,9 @@ func fetchV1EventsPage(ctx context.Context, client *http.Client, baseURL, apiKey
 	q.Set("api_key", apiKey)
 	q.Set("start", fmt.Sprintf("%d", start))
 	q.Set("end", fmt.Sprintf("%d", end))
-	q.Set("translate", "true")
+	if getV1TranslateEnabled() {
+		q.Set("translate", "true")
+	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
@@ -366,7 +445,7 @@ func fetchV1EventsPage(ctx context.Context, client *http.Client, baseURL, apiKey
 }
 
 func writeJSON(path string, payload interface{}) error {
-	data, err := json.MarshalIndent(payload, "", "  ")
+	data, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
@@ -498,17 +577,22 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 					return
 				}
 
-				attempts := 1
+				attempts := getV1RetryCount()
 				var events []map[string]interface{}
+				var fetchStats v1EventsFetchStats
 				var err error
+				fightStartedAt := time.Now()
 				for attempt := 1; attempt <= attempts; attempt++ {
 					fightCtx, cancelFight := context.WithTimeout(ctx, fightTimeout)
-					events, err = fetchV1Events(fightCtx, client, baseURL, apiKey, code, fight)
+					events, fetchStats, err = fetchV1EventsRange(fightCtx, client, baseURL, apiKey, code, fight.StartTime, fight.EndTime)
 					cancelFight()
 					if err == nil {
 						break
 					}
 					log.Printf("[V1] fight %s-%d 下载失败(尝试 %d/%d): %v", code, fight.ID, attempt, attempts, err)
+					if attempt < attempts {
+						time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+					}
 				}
 				if err != nil {
 					log.Printf("[V1] fight %s-%d 失败，跳过", code, fight.ID)
@@ -517,12 +601,19 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 					return
 				}
 
+				writeStartedAt := time.Now()
 				if err := writeJSON(eventsPath, toV1SavedEventsPayload(events)); err != nil {
 					if firstErr.Load() == nil {
 						firstErr.Store(err)
 					}
 					logProgress(entry.FightID, "失败(写文件)")
 					return
+				}
+				writeElapsed := time.Since(writeStartedAt)
+
+				var fileBytes int64
+				if info, statErr := os.Stat(eventsPath); statErr == nil {
+					fileBytes = info.Size()
 				}
 				if err := markFightDownloadedByID(entry.MappingID); err != nil {
 					if firstErr.Load() == nil {
@@ -531,6 +622,8 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 					logProgress(entry.FightID, "失败(更新数据库)")
 					return
 				}
+
+				log.Printf("[V1][PROFILE] fight %s-%d 拉取完成 | pages=%d events=%d fetch耗时=%s 写盘耗时=%s 文件大小=%.2fMB 总耗时=%s", code, fight.ID, fetchStats.Pages, fetchStats.Events, fetchStats.FetchElapsed, writeElapsed, float64(fileBytes)/(1024*1024), time.Since(fightStartedAt))
 
 				atomic.AddInt64(&successCount, 1)
 				logProgress(entry.FightID, "完成")

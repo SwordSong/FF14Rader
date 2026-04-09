@@ -337,7 +337,7 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 	}
 
 	var maps []models.FightSyncMap
-	if err := db.DB.Select("id", "master_id").
+	if err := db.DB.Select("id", "master_id", "timestamp", "start_time", "end_time").
 		Where("player_id = ? AND downloaded = ? AND (parsed_done = ? OR scored_at IS NULL OR scored_at < ?)", playerID, true, false, time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC)).
 		Find(&maps).Error; err != nil {
 		return fmt.Errorf("load pending scoring fights failed: %v", err)
@@ -350,6 +350,9 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 		mappingID  uint
 		reportCode string
 		fightID    int
+		timestamp  int64
+		startTime  int64
+		endTime    int64
 	}
 
 	tasks := make([]scoreTask, 0, len(maps))
@@ -359,7 +362,14 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 			log.Printf("[SCORE] skip invalid master_id: %s", mapping.MasterID)
 			continue
 		}
-		tasks = append(tasks, scoreTask{mappingID: mapping.ID, reportCode: code, fightID: fightID})
+		tasks = append(tasks, scoreTask{
+			mappingID:  mapping.ID,
+			reportCode: code,
+			fightID:    fightID,
+			timestamp:  mapping.Timestamp,
+			startTime:  mapping.StartTime,
+			endTime:    mapping.EndTime,
+		})
 	}
 	if len(tasks) == 0 {
 		return nil
@@ -381,6 +391,64 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 	startedAt := time.Now()
 	var parsedCount int64
 	var activeCount int64
+
+	prefetchAhead := getScorePrefetchAhead()
+	prefetchConcurrency := getScorePrefetchConcurrency(workerCount)
+	prefetchEnabled := prefetchAhead > 0 && isRemoteFetchTransportEnabled()
+
+	var prefetchedCount int64
+	var prefetchFailedCount int64
+	var prefetchCursor int64
+	prefetchSem := make(chan struct{}, prefetchConcurrency)
+
+	queuePrefetch := func(task scoreTask) {
+		if s.scorer == nil {
+			return
+		}
+		startMS, endMS := computePrefetchTimeRange(task.timestamp, task.startTime, task.endTime)
+		if endMS <= startMS {
+			return
+		}
+
+		go func(t scoreTask, startMS, endMS int64) {
+			prefetchSem <- struct{}{}
+			defer func() { <-prefetchSem }()
+
+			prefetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+
+			host, err := s.scorer.PrefetchFightEvents(prefetchCtx, t.reportCode, t.fightID, startMS, endMS)
+			if err != nil {
+				atomic.AddInt64(&prefetchFailedCount, 1)
+				log.Printf("[PREFETCH] %s-%d 失败: %v", t.reportCode, t.fightID, err)
+				return
+			}
+
+			atomic.AddInt64(&prefetchedCount, 1)
+			if strings.TrimSpace(host) != "" {
+				log.Printf("[PREFETCH] %s-%d 已入队 目标主机=%s", t.reportCode, t.fightID, host)
+			}
+		}(task, startMS, endMS)
+	}
+
+	prefetchUpTo := func(target int) {
+		if !prefetchEnabled {
+			return
+		}
+		if target > len(tasks) {
+			target = len(tasks)
+		}
+		for {
+			idx := int(atomic.LoadInt64(&prefetchCursor))
+			if idx >= target || idx >= len(tasks) {
+				return
+			}
+			if !atomic.CompareAndSwapInt64(&prefetchCursor, int64(idx), int64(idx+1)) {
+				continue
+			}
+			queuePrefetch(tasks[idx])
+		}
+	}
 
 	logProgress := func(reportCode string, fightID int, status string, analyzeHost string) {
 		parsed := atomic.LoadInt64(&parsedCount)
@@ -411,6 +479,9 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 	}
 
 	log.Printf("[SCORE] 解析进度启动 | 已解析=0/%d 当前并发=0/%d 当前速度=0.00 fights/s 预计完成=--", totalCount, workerCount)
+	if prefetchEnabled {
+		log.Printf("[PREFETCH] 启用预拉取窗口(按解析进度推进): 解析并发=%d, ahead=%d, 预拉取并发=%d", workerCount, prefetchAhead, prefetchConcurrency)
+	}
 	sem := make(chan struct{}, workerCount)
 	var wg sync.WaitGroup
 
@@ -436,7 +507,10 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 						logProgress(reportCode, fightID, "失败(标记跳过)", analyzeHost)
 						return
 					}
-					atomic.AddInt64(&parsedCount, 1)
+					parsed := atomic.AddInt64(&parsedCount, 1)
+					if prefetchEnabled {
+						prefetchUpTo(int(parsed) + workerCount + prefetchAhead)
+					}
 					logProgress(reportCode, fightID, "跳过(无匹配角色)", analyzeHost)
 					return
 				}
@@ -452,7 +526,10 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 				logProgress(reportCode, fightID, "失败(更新parsed_done)", analyzeHost)
 				return
 			}
-			atomic.AddInt64(&parsedCount, 1)
+			parsed := atomic.AddInt64(&parsedCount, 1)
+			if prefetchEnabled {
+				prefetchUpTo(int(parsed) + workerCount + prefetchAhead)
+			}
 			logProgress(reportCode, fightID, "完成", analyzeHost)
 		}(task.mappingID, task.reportCode, task.fightID)
 	}
@@ -463,6 +540,9 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 		log.Printf("[SCORE] 解析完成 | 已解析=%d/%d", finalParsed, totalCount)
 	} else {
 		log.Printf("[SCORE] 解析结束(部分失败) | 已解析=%d/%d", finalParsed, totalCount)
+	}
+	if prefetchEnabled {
+		log.Printf("[PREFETCH] 入队完成=%d 失败=%d", atomic.LoadInt64(&prefetchedCount), atomic.LoadInt64(&prefetchFailedCount))
 	}
 	return nil
 }
@@ -509,6 +589,74 @@ func getScoreConcurrency(scorer *scoring.Service) int {
 		return v
 	}
 	return defaultConcurrency
+}
+
+func getScorePrefetchAhead() int {
+	const defaultAhead = 10
+	raw := strings.TrimSpace(os.Getenv("FFLOGS_SCORE_PREFETCH_AHEAD"))
+	if raw == "" {
+		return defaultAhead
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultAhead
+	}
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+func getScorePrefetchConcurrency(workerCount int) int {
+	if raw := strings.TrimSpace(os.Getenv("FFLOGS_SCORE_PREFETCH_CONCURRENCY")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			return v
+		}
+	}
+	if workerCount <= 0 {
+		return 2
+	}
+	if workerCount > 8 {
+		return 8
+	}
+	return workerCount
+}
+
+func computePrefetchTimeRange(timestamp, startTime, endTime int64) (int64, int64) {
+	duration := endTime - startTime
+	if duration <= 0 {
+		duration = 12 * 60 * 1000
+	}
+
+	startMS := timestamp
+	if startMS <= 0 {
+		startMS = startTime
+	}
+	endMS := startMS + duration
+	if endMS <= startMS {
+		endMS = startMS + 1000
+	}
+	return startMS, endMS
+}
+
+func isRemoteFetchTransportEnabled() bool {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("XIVA_EVENTS_TRANSPORT_MODE")))
+	switch mode {
+	case "remote", "remote-fetch", "self-fetch", "distributed-fetch":
+		return true
+	case "inline", "legacy", "payload":
+		return false
+	}
+
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("XIVA_REMOTE_FETCH_EVENTS")))
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return false
+	}
 }
 
 func markFightSkippedNoMatch(mappingID uint) error {

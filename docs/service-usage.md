@@ -43,6 +43,26 @@ cd ../..
 
 解析阶段会根据本机可识别的解析地址和本地配置（如 `XIVA_CALL_CONCURRENCY`）给出推荐并发，并在日志中输出。
 
+分布式低带宽场景建议：
+- `XIVA_EVENTS_TRANSPORT_MODE=remote-fetch`（A 主机仅下发任务元数据，不再上传 events 大包）
+- `XIVA_REMOTE_FETCH_MODE=on`（解析节点收到无 events 请求时，自行从 FFLogs 拉取）
+- `XIVA_EVENTS_CACHE_DIR=./downloads/fflogs`（节点本地缓存，重复解析可复用）
+- `XIVA_EVENTS_FETCH_TIMEOUT_MS=45000`（节点拉取超时）
+- `XIVA_PREFETCH_CONCURRENCY=6`（节点后台下载并发，独立于解析线程池）
+- `XIVA_PREFETCH_QUEUE_LIMIT=4096`（节点预拉取排队上限）
+- `XIVA_ANALYZE_REQUIRE_CACHE=true`（启用“下载/解析异步分离”，缓存未命中返回 pending）
+- `FFLOGS_SCORE_PREFETCH_AHEAD=10`（Go 侧预热窗口，常用为“解析并发+10”）
+- `FFLOGS_SCORE_PREFETCH_CONCURRENCY=<与节点数匹配>`（Go 侧预热请求并发）
+
+异步链路说明：
+- Go 侧先调用节点 `/prefetch` 入队下载。
+- 节点后台按 `XIVA_PREFETCH_CONCURRENCY` 拉取并写本地缓存。
+- Go 侧调用 `/analyze` 时，若 `XIVA_ANALYZE_REQUIRE_CACHE=true` 且缓存未命中，会收到 `REMOTE_FETCH_PENDING`，随后自动短重试。
+
+说明：
+- Go 侧会优先读取 `FFLOGS_V1_API_KEY`；若为空，将尝试从数据库表 `fflogskey` 读取 `ver=1` 的 `api_id`。
+- 当解析节点未启用 remote-fetch 时，Go 侧会自动回退为内联 events 上传模式，保证兼容性。
+
 ## 2. 同步玩家战斗数据
 
 按角色名同步（示例）：

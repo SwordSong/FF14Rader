@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"net"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,11 +31,14 @@ const (
 	defaultAnalyzeURL            = "http://127.0.0.1:22026/analyze"
 	defaultAnalyzeHostsConfig    = "./docs/xiva-hosts.json"
 	defaultReportRoot            = "./downloads/fflogs"
+	defaultFFLogsV1BaseURL       = "https://www.fflogs.com/v1"
 	defaultWeightMin             = 0.01
 	defaultWeightMax             = 1.0
 	defaultWeightExp             = 1.0
 	defaultChecklistGCDGateAlpha = 0.15
 	defaultChecklistGCDGateBeta  = 3.0
+	defaultAnalyzeAliveTTL       = 2 * time.Second
+	defaultAnalyzeReadyTimeout   = 800 * time.Millisecond
 )
 
 type Service struct {
@@ -44,6 +49,9 @@ type Service struct {
 	weightMin  float64
 	weightMax  float64
 	weightExpo float64
+	aliveMu    sync.RWMutex
+	aliveURLs  []string
+	aliveAt    time.Time
 }
 
 type NoMatchedActorError struct {
@@ -396,6 +404,39 @@ func analyzeURLToHealthURL(analyzeURL string) (string, error) {
 	return parsed.String(), nil
 }
 
+func analyzeURLToReadyURL(analyzeURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(analyzeURL))
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid analyze url: %s", analyzeURL)
+	}
+	parsed.Path = "/ready"
+	parsed.RawQuery = ""
+	return parsed.String(), nil
+}
+
+func probeAnalyzeEndpointReady(client *http.Client, analyzeURL string) bool {
+	readyURL, err := analyzeURLToReadyURL(analyzeURL)
+	if err != nil {
+		return false
+	}
+
+	req, err := http.NewRequest(http.MethodGet, readyURL, nil)
+	if err != nil {
+		return false
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
 func parsePositiveIntAny(v any) int {
 	switch value := v.(type) {
 	case int:
@@ -527,6 +568,21 @@ func envInt(key string, fallback int) int {
 	return v
 }
 
+func envBool(key string, fallback bool) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
 type fightRow struct {
 	MasterID        string
 	FightID         int
@@ -567,7 +623,23 @@ type analyzeRequest struct {
 	Code    string        `json:"code"`
 	FightID int           `json:"fightId"`
 	Report  reportPayload `json:"report"`
-	Events  any           `json:"events"`
+	Events  any           `json:"events,omitempty"`
+	Fetch   *analyzeFetch `json:"fetch,omitempty"`
+}
+
+type analyzeFetch struct {
+	Provider  string `json:"provider,omitempty"`
+	APIKey    string `json:"apiKey,omitempty"`
+	BaseURL   string `json:"baseUrl,omitempty"`
+	Translate *bool  `json:"translate,omitempty"`
+}
+
+type prefetchRequest struct {
+	Code    string        `json:"code"`
+	FightID int           `json:"fightId"`
+	StartMS int64         `json:"startMs"`
+	EndMS   int64         `json:"endMs"`
+	Fetch   *analyzeFetch `json:"fetch,omitempty"`
 }
 
 type analyzeResponse struct {
@@ -725,10 +797,6 @@ func (s *Service) ScoreFightWithEndpoint(ctx context.Context, playerID uint, rep
 	if err != nil {
 		return "", fmt.Errorf("parse report metadata failed: %v", err)
 	}
-	events, err := readEvents(filepath.Join(s.root, reportCode, fmt.Sprintf("fight_%d_events.json", fightID)))
-	if err != nil {
-		return "", fmt.Errorf("read events failed: %v", err)
-	}
 
 	payload := analyzeRequest{
 		Code:    reportCode,
@@ -740,11 +808,45 @@ func (s *Service) ScoreFightWithEndpoint(ctx context.Context, playerID uint, rep
 			Fights:     []fightJSON{buildFightJSON(fight)},
 			MasterData: masterData,
 		},
-		Events: events,
+	}
+
+	useRemoteFetch := shouldUseRemoteFetchTransport()
+	if useRemoteFetch {
+		if fetchCfg, fetchErr := resolveRemoteFetchConfig(); fetchErr == nil {
+			payload.Fetch = fetchCfg
+		}
+	}
+
+	if payload.Fetch == nil {
+		events, err := readEvents(filepath.Join(s.root, reportCode, fmt.Sprintf("fight_%d_events.json", fightID)))
+		if err != nil {
+			return "", fmt.Errorf("read events failed: %v", err)
+		}
+		payload.Events = events
 	}
 
 	resp, rawBody, endpoint, err := s.postAnalyze(ctx, payload)
+	if err != nil && shouldRetryAnalyzePending(err) {
+		for attempt := 1; attempt <= 4; attempt++ {
+			if waitErr := waitRetry(ctx, attempt); waitErr != nil {
+				break
+			}
+			resp, rawBody, endpoint, err = s.postAnalyze(ctx, payload)
+			if err == nil || !shouldRetryAnalyzePending(err) {
+				break
+			}
+		}
+	}
 	analyzeHost := analyzeEndpointHost(endpoint)
+	if err != nil && payload.Fetch != nil && shouldFallbackAnalyzeInline(err) {
+		events, readErr := readEvents(filepath.Join(s.root, reportCode, fmt.Sprintf("fight_%d_events.json", fightID)))
+		if readErr == nil {
+			payload.Events = events
+			payload.Fetch = nil
+			resp, rawBody, endpoint, err = s.postAnalyze(ctx, payload)
+			analyzeHost = analyzeEndpointHost(endpoint)
+		}
+	}
 	if err != nil {
 		return analyzeHost, err
 	}
@@ -1192,12 +1294,17 @@ func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*ana
 		return nil, nil, "", err
 	}
 
-	const maxAttempts = 3
+	candidates, pickErr := s.pickAliveAnalyzeURLs()
+	if pickErr != nil {
+		return nil, nil, "", pickErr
+	}
+
+	const maxAttempts = 5
 	var lastErr error
 	lastEndpoint := ""
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		endpoint := s.pickAnalyzeURL()
+		endpoint := s.pickAnalyzeURLForPayloadFromURLs(payload, attempt, candidates)
 		lastEndpoint = endpoint
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if reqErr != nil {
@@ -1253,6 +1360,199 @@ func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*ana
 		lastErr = fmt.Errorf("analyze failed after retries")
 	}
 	return nil, nil, lastEndpoint, lastErr
+}
+
+func (s *Service) PrefetchFightEvents(ctx context.Context, reportCode string, fightID int, startMS, endMS int64) (string, error) {
+	if !shouldUseRemoteFetchTransport() {
+		return "", nil
+	}
+	if strings.TrimSpace(reportCode) == "" || fightID <= 0 {
+		return "", fmt.Errorf("prefetch requires valid reportCode and fightID")
+	}
+	if endMS <= startMS {
+		return "", fmt.Errorf("prefetch requires valid start/end range")
+	}
+
+	fetchCfg, err := resolveRemoteFetchConfig()
+	if err != nil {
+		return "", err
+	}
+
+	payload := prefetchRequest{
+		Code:    strings.TrimSpace(reportCode),
+		FightID: fightID,
+		StartMS: startMS,
+		EndMS:   endMS,
+		Fetch:   fetchCfg,
+	}
+
+	endpoint, err := s.postPrefetch(ctx, payload)
+	return analyzeEndpointHost(endpoint), err
+}
+
+func (s *Service) postPrefetch(ctx context.Context, payload prefetchRequest) (string, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+
+	candidates, pickErr := s.pickAliveAnalyzeURLs()
+	if pickErr != nil {
+		return "", pickErr
+	}
+
+	const maxAttempts = 4
+	var lastErr error
+	lastEndpoint := ""
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		endpoint := s.pickAnalyzeURLForPayloadFromURLs(analyzeRequest{Code: payload.Code, FightID: payload.FightID}, attempt, candidates)
+		prefetchURL := analyzeURLToPrefetchURL(endpoint)
+		lastEndpoint = prefetchURL
+
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, prefetchURL, bytes.NewReader(body))
+		if reqErr != nil {
+			return prefetchURL, reqErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, doErr := s.client.Do(req)
+		if doErr != nil {
+			lastErr = doErr
+			if attempt < maxAttempts && isTransientAnalyzeError(doErr) {
+				if err := waitRetry(ctx, attempt); err != nil {
+					return prefetchURL, err
+				}
+				continue
+			}
+			return prefetchURL, doErr
+		}
+
+		respBody, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			if attempt < maxAttempts && isTransientAnalyzeError(readErr) {
+				if err := waitRetry(ctx, attempt); err != nil {
+					return prefetchURL, err
+				}
+				continue
+			}
+			return prefetchURL, readErr
+		}
+
+		if resp.StatusCode >= 400 {
+			err = fmt.Errorf("prefetch failed: status=%d body=%s", resp.StatusCode, string(respBody))
+			lastErr = err
+			if attempt < maxAttempts && (resp.StatusCode == 429 || resp.StatusCode >= 500) {
+				if err := waitRetry(ctx, attempt); err != nil {
+					return prefetchURL, err
+				}
+				continue
+			}
+			return prefetchURL, err
+		}
+
+		return prefetchURL, nil
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("prefetch failed after retries")
+	}
+	return lastEndpoint, lastErr
+}
+
+func analyzeURLToPrefetchURL(endpoint string) string {
+	trimmed := strings.TrimSpace(endpoint)
+	if trimmed == "" {
+		return ""
+	}
+
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		if strings.HasSuffix(trimmed, "/analyze") {
+			return strings.TrimSuffix(trimmed, "/analyze") + "/prefetch"
+		}
+		return strings.TrimRight(trimmed, "/") + "/prefetch"
+	}
+
+	u.Path = "/prefetch"
+	return u.String()
+}
+
+func (s *Service) pickAliveAnalyzeURLs() ([]string, error) {
+	now := time.Now()
+
+	s.aliveMu.RLock()
+	if len(s.aliveURLs) > 0 && now.Sub(s.aliveAt) < defaultAnalyzeAliveTTL {
+		cached := append([]string(nil), s.aliveURLs...)
+		s.aliveMu.RUnlock()
+		return cached, nil
+	}
+	s.aliveMu.RUnlock()
+
+	endpoints := uniqueAnalyzeURLs(s.apiURLs)
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no analyze endpoints configured")
+	}
+
+	probeClient := &http.Client{Timeout: defaultAnalyzeReadyTimeout}
+	aliveSet := make(map[string]struct{}, len(endpoints))
+	for _, endpoint := range endpoints {
+		if probeAnalyzeEndpointReady(probeClient, endpoint) {
+			aliveSet[endpoint] = struct{}{}
+		}
+	}
+
+	aliveWeighted := make([]string, 0, len(s.apiURLs))
+	for _, endpoint := range s.apiURLs {
+		normalized := strings.TrimSpace(endpoint)
+		if normalized == "" {
+			continue
+		}
+		if _, ok := aliveSet[normalized]; ok {
+			aliveWeighted = append(aliveWeighted, normalized)
+		}
+	}
+
+	if len(aliveWeighted) == 0 {
+		return nil, fmt.Errorf("no alive analyze endpoint (all /ready probes failed)")
+	}
+
+	s.aliveMu.Lock()
+	s.aliveURLs = append([]string(nil), aliveWeighted...)
+	s.aliveAt = now
+	s.aliveMu.Unlock()
+
+	return aliveWeighted, nil
+}
+
+func (s *Service) pickAnalyzeURLForPayload(payload analyzeRequest, attempt int) string {
+	return s.pickAnalyzeURLForPayloadFromURLs(payload, attempt, s.apiURLs)
+}
+
+func (s *Service) pickAnalyzeURLForPayloadFromURLs(payload analyzeRequest, attempt int, urls []string) string {
+	if len(urls) == 0 {
+		return defaultAnalyzeURL
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+
+	if shouldUseRemoteFetchTransport() && strings.TrimSpace(payload.Code) != "" && payload.FightID > 0 {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(strings.TrimSpace(payload.Code)))
+		_, _ = h.Write([]byte("#"))
+		_, _ = h.Write([]byte(strconv.Itoa(payload.FightID)))
+		base := int(h.Sum32() % uint32(len(urls)))
+		idx := (base + (attempt - 1)) % len(urls)
+		return urls[idx]
+	}
+
+	idx := atomic.AddUint64(&s.rrCounter, 1)
+	base := int((idx - 1) % uint64(len(urls)))
+	final := (base + (attempt - 1)) % len(urls)
+	return urls[final]
 }
 
 func analyzeEndpointHost(endpoint string) string {
@@ -1878,8 +2178,105 @@ func isTransientAnalyzeError(err error) bool {
 		strings.Contains(msg, "refused")
 }
 
+func shouldFallbackAnalyzeInline(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "remote_fetch_unavailable") {
+		return true
+	}
+	if strings.Contains(msg, "missing events") {
+		return true
+	}
+	if strings.Contains(msg, "缺少 events") {
+		return true
+	}
+	return false
+}
+
+func shouldRetryAnalyzePending(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "remote_fetch_pending")
+}
+
+func shouldUseRemoteFetchTransport() bool {
+	mode := strings.TrimSpace(strings.ToLower(os.Getenv("XIVA_EVENTS_TRANSPORT_MODE")))
+	switch mode {
+	case "remote", "remote-fetch", "self-fetch", "distributed-fetch":
+		return true
+	case "inline", "legacy", "payload":
+		return false
+	}
+	return envBool("XIVA_REMOTE_FETCH_EVENTS", false)
+}
+
+func resolveRemoteFetchConfig() (*analyzeFetch, error) {
+	apiKey := strings.TrimSpace(os.Getenv("FFLOGS_V1_API_KEY"))
+	if apiKey == "" {
+		v, err := loadV1APIKeyFromDB()
+		if err == nil {
+			apiKey = v
+		}
+	}
+	if apiKey == "" {
+		return nil, fmt.Errorf("missing FFLOGS V1 API key for remote fetch")
+	}
+
+	baseURL := strings.TrimSpace(os.Getenv("FFLOGS_V1_BASE_URL"))
+	if baseURL == "" {
+		baseURL = defaultFFLogsV1BaseURL
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+
+	translate := envBool("FFLOGS_V1_TRANSLATE", true)
+
+	return &analyzeFetch{
+		Provider:  "fflogs-v1",
+		APIKey:    apiKey,
+		BaseURL:   baseURL,
+		Translate: &translate,
+	}, nil
+}
+
+func loadV1APIKeyFromDB() (string, error) {
+	var row struct {
+		ID    int    `gorm:"column:id"`
+		APIID string `gorm:"column:api_id"`
+	}
+
+	err := db.DB.Raw(`
+SELECT id, api_id
+FROM fflogskey
+WHERE ver = 1
+  AND COALESCE(api_id, '') <> ''
+ORDER BY COALESCE(used, 0) ASC, id ASC
+LIMIT 1
+`).Scan(&row).Error
+	if err != nil {
+		return "", err
+	}
+
+	apiKey := strings.TrimSpace(row.APIID)
+	if row.ID <= 0 || apiKey == "" {
+		return "", fmt.Errorf("no v1 api key in fflogskey")
+	}
+
+	_ = db.DB.Exec(`UPDATE fflogskey SET used = COALESCE(used, 0) + 1 WHERE id = ?`, row.ID).Error
+	return apiKey, nil
+}
+
 func waitRetry(ctx context.Context, attempt int) error {
-	delay := time.Duration(attempt) * 500 * time.Millisecond
+	if attempt < 1 {
+		attempt = 1
+	}
+	delay := time.Duration(attempt*attempt) * 250 * time.Millisecond
+	if delay > 4*time.Second {
+		delay = 4 * time.Second
+	}
 	t := time.NewTimer(delay)
 	defer t.Stop()
 	select {

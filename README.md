@@ -75,6 +75,17 @@ Node 分析服务可选：
 - `XIVA_PORT_COUNT`
 - `XIVA_THREAD_POOL_SIZE`
 - `XIVA_CALL_CONCURRENCY`
+- `XIVA_EVENTS_TRANSPORT_MODE`（`inline` 或 `remote-fetch`）
+- `XIVA_REMOTE_FETCH_MODE`（`on` 时允许解析节点在请求无 events 时自拉取）
+- `XIVA_EVENTS_CACHE_DIR`（解析节点本地缓存目录）
+- `XIVA_EVENTS_FETCH_TIMEOUT_MS`（解析节点自拉取超时）
+- `XIVA_PREFETCH_CONCURRENCY`（节点后台预拉取并发，默认 `6`）
+- `XIVA_PREFETCH_QUEUE_LIMIT`（节点预拉取队列上限，默认 `4096`）
+- `XIVA_ANALYZE_REQUIRE_CACHE`（`true` 时解析仅使用本地缓存，未命中则返回 pending）
+
+Go 评分调度可选：
+- `FFLOGS_SCORE_PREFETCH_AHEAD`（每个节点预拉取窗口，默认 `10`，即常见“解析并发+10”）
+- `FFLOGS_SCORE_PREFETCH_CONCURRENCY`（Go 下发预拉取请求并发）
 
 ## 快速开始
 

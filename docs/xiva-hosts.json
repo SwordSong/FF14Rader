@@ -13,6 +13,13 @@
       "port": 22026,
       "enabled": true,
       "weight": 1
+    },
+      {
+      "name": "n305",
+      "host": "192.168.20.1",
+      "port": 22026,
+      "enabled": true,
+      "weight": 1
     }
   ]
 }
