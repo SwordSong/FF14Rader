@@ -320,31 +320,8 @@ install_go_modules_if_possible() {
     fi
   fi
 
-  local apt_fallback_mode="${AUTO_INSTALL_SYSTEM_DEPS:-auto}"
-  local allow_apt_fallback=0
-  if [[ "$apt_fallback_mode" == "1" ]]; then
-    allow_apt_fallback=1
-  elif [[ "$apt_fallback_mode" == "auto" && "$(id -u)" -eq 0 ]]; then
-    allow_apt_fallback=1
-  fi
-
-  if [[ "$allow_apt_fallback" -eq 1 ]] && has_cmd apt-get; then
-    if [[ "$(id -u)" -eq 0 ]]; then
-      log "go not found, trying apt-get install golang-go (AUTO_INSTALL_SYSTEM_DEPS=${apt_fallback_mode})"
-      apt-get update
-      apt-get install -y golang-go
-      if go_bin="$(find_go_bin)"; then
-        log "download Go modules"
-        "$go_bin" mod download
-        return
-      fi
-    else
-      log "go not found and not running as root; skip apt fallback (set AUTO_INSTALL_SYSTEM_DEPS=1 to force)"
-    fi
-  fi
-
   log "warning: go not found, skipped 'go mod download'"
-  log "hint: install Go manually, set GO_VERSION, or use AUTO_INSTALL_SYSTEM_DEPS=1"
+  log "hint: install Go manually or configure GO_DOWNLOAD_URL to a reachable tarball"
 }
 
 install_node_project() {
