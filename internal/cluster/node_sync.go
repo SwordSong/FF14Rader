@@ -19,6 +19,7 @@ const (
 	defaultEvictInterval     = 30 * time.Second
 	defaultRegisterTimeout   = 10 * time.Second
 	defaultHeartbeatTimeout  = 5 * time.Second
+	defaultRegisterWait      = 20 * time.Second
 )
 
 type masterRegisterPayload struct {
@@ -100,6 +101,10 @@ func ClusterEvictInterval() time.Duration {
 	return envDurationSeconds("CLUSTER_EVICT_INTERVAL_SEC", defaultEvictInterval)
 }
 
+func ClusterRegisterWait() time.Duration {
+	return envDurationSeconds("CLUSTER_REGISTER_WAIT_SEC", defaultRegisterWait)
+}
+
 func StartRegistryEvictLoop(registry *ReportHostRegistry) {
 	if registry == nil {
 		return
@@ -139,6 +144,7 @@ func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
 	go func() {
 		registerClient := &http.Client{Timeout: defaultRegisterTimeout}
 		heartbeatClient := &http.Client{Timeout: defaultHeartbeatTimeout}
+		registerWait := ClusterRegisterWait()
 
 		registerOnce := func() {
 			reports, err := CollectReportCodesFromDir(scanDir)
@@ -157,6 +163,10 @@ func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
 			return postHeartbeatToMaster(heartbeatClient, master, host)
 		}
 
+		if waitErr := waitMasterReady(registerClient, master, registerWait); waitErr != nil {
+			log.Printf("[CLUSTER] 主节点就绪等待超时 master=%s wait=%s err=%v", master, registerWait, waitErr)
+		}
+
 		registerOnce()
 
 		ticker := time.NewTicker(heartbeatInterval)
@@ -170,6 +180,32 @@ func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
 			registry.HeartbeatHost(host)
 		}
 	}()
+}
+
+func waitMasterReady(client *http.Client, masterEndpoint string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = defaultRegisterWait
+	}
+	deadline := time.Now().Add(timeout)
+	healthURL := strings.TrimRight(masterEndpoint, "/") + "/healthz"
+
+	for {
+		req, err := http.NewRequest(http.MethodGet, healthURL, nil)
+		if err == nil {
+			resp, doErr := client.Do(req)
+			if doErr == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					return nil
+				}
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("master not ready: %s", healthURL)
+		}
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func postRegisterToMaster(client *http.Client, masterEndpoint, host string, reports []string) error {
