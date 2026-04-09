@@ -266,6 +266,15 @@ install_go_from_official_tarball() {
     fi
   fi
 
+  # Some shells cache /usr/bin/go from older package installs.
+  # When running as root, provide /usr/bin links so stale hashes still resolve.
+  if [[ "$install_base" == "/usr/local" && "$(id -u)" -eq 0 && -d "/usr/bin" ]]; then
+    ln -sf /usr/local/go/bin/go /usr/bin/go || true
+    if [[ -x /usr/local/go/bin/gofmt ]]; then
+      ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt || true
+    fi
+  fi
+
   if has_cmd go; then
     log "installed $(go version)"
     log "hint: if current shell still points to stale /usr/bin/go, run: hash -r"
