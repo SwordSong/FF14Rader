@@ -231,29 +231,25 @@ resolve_go_version() {
 
 install_go_from_official_tarball() {
   local go_mod_path="${1:-$ROOT_DIR/go.mod}"
-  local platform
-  local goos
-  local goarch
-  local goversion
 
-  if ! platform="$(detect_go_platform)"; then
-    log "warning: unsupported platform for auto Go install ($(uname -s)/$(uname -m))"
-    return 1
-  fi
-  read -r goos goarch <<<"$platform"
-
-  if ! goversion="$(resolve_go_version "$go_mod_path")"; then
-    log "warning: cannot resolve Go version automatically (set GO_VERSION to override, or ensure go.mod exists)"
-    return 1
-  fi
+  # Prefer explicit URL env override, otherwise use default mirror URL.
+  local url="${GO_DOWNLOAD_URL:-https://golang.google.cn/dl/go1.26.2.linux-amd64.tar.gz}"
+  local archive
+  archive="$(basename "$url")"
 
   if ! has_cmd tar; then
     log "warning: tar is required for auto Go install"
     return 1
   fi
 
-  local archive="${goversion}.${goos}-${goarch}.tar.gz"
-  local url="https://go.dev/dl/${archive}"
+  if [[ -f "$go_mod_path" ]]; then
+    local go_mod_version
+    go_mod_version="$(awk '/^go[[:space:]]+[0-9]+\.[0-9]+(\.[0-9]+)?/{print $2; exit}' "$go_mod_path" || true)"
+    if [[ -n "$go_mod_version" ]]; then
+      log "go.mod requires Go ${go_mod_version}; downloading from configured URL"
+    fi
+  fi
+
   local tmpdir
   tmpdir="$(mktemp -d)"
   local archive_path="$tmpdir/$archive"
