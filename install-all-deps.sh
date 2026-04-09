@@ -191,6 +191,7 @@ detect_go_platform() {
 }
 
 resolve_go_version() {
+  local go_mod_path="${1:-$ROOT_DIR/go.mod}"
   local specified="${GO_VERSION:-}"
   if [[ -n "$specified" ]]; then
     if [[ "$specified" == go* ]]; then
@@ -216,10 +217,20 @@ resolve_go_version() {
     return 0
   fi
 
+  if [[ -f "$go_mod_path" ]]; then
+    local go_mod_version
+    go_mod_version="$(awk '/^go[[:space:]]+[0-9]+\.[0-9]+(\.[0-9]+)?/{print $2; exit}' "$go_mod_path" || true)"
+    if [[ -n "$go_mod_version" ]]; then
+      printf 'go%s\n' "$go_mod_version"
+      return 0
+    fi
+  fi
+
   return 1
 }
 
 install_go_from_official_tarball() {
+  local go_mod_path="${1:-$ROOT_DIR/go.mod}"
   local platform
   local goos
   local goarch
@@ -231,8 +242,8 @@ install_go_from_official_tarball() {
   fi
   read -r goos goarch <<<"$platform"
 
-  if ! goversion="$(resolve_go_version)"; then
-    log "warning: cannot resolve Go version automatically (set GO_VERSION to override)"
+  if ! goversion="$(resolve_go_version "$go_mod_path")"; then
+    log "warning: cannot resolve Go version automatically (set GO_VERSION to override, or ensure go.mod exists)"
     return 1
   fi
 
@@ -273,6 +284,14 @@ install_go_from_official_tarball() {
   export PATH="$install_base/go/bin:$PATH"
   hash -r 2>/dev/null || true
 
+  # Make go available in a common PATH location for future shells when possible.
+  if [[ "$install_base" == "/usr/local" && -d "/usr/local/bin" ]]; then
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go || true
+    if [[ -x /usr/local/go/bin/gofmt ]]; then
+      ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt || true
+    fi
+  fi
+
   if has_cmd go; then
     log "installed $(go version)"
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -297,7 +316,7 @@ install_go_modules_if_possible() {
     return
   fi
 
-  if install_go_from_official_tarball; then
+  if install_go_from_official_tarball "$ROOT_DIR/go.mod"; then
     if go_bin="$(find_go_bin)"; then
       log "download Go modules"
       "$go_bin" mod download
@@ -305,9 +324,17 @@ install_go_modules_if_possible() {
     fi
   fi
 
-  if [[ "${AUTO_INSTALL_SYSTEM_DEPS:-0}" == "1" ]] && has_cmd apt-get; then
+  local apt_fallback_mode="${AUTO_INSTALL_SYSTEM_DEPS:-auto}"
+  local allow_apt_fallback=0
+  if [[ "$apt_fallback_mode" == "1" ]]; then
+    allow_apt_fallback=1
+  elif [[ "$apt_fallback_mode" == "auto" && "$(id -u)" -eq 0 ]]; then
+    allow_apt_fallback=1
+  fi
+
+  if [[ "$allow_apt_fallback" -eq 1 ]] && has_cmd apt-get; then
     if [[ "$(id -u)" -eq 0 ]]; then
-      log "go not found, trying apt-get install golang-go (AUTO_INSTALL_SYSTEM_DEPS=1)"
+      log "go not found, trying apt-get install golang-go (AUTO_INSTALL_SYSTEM_DEPS=${apt_fallback_mode})"
       apt-get update
       apt-get install -y golang-go
       if go_bin="$(find_go_bin)"; then
@@ -316,12 +343,12 @@ install_go_modules_if_possible() {
         return
       fi
     else
-      log "go not found and not running as root; skip auto-install"
+      log "go not found and not running as root; skip apt fallback (set AUTO_INSTALL_SYSTEM_DEPS=1 to force)"
     fi
   fi
 
   log "warning: go not found, skipped 'go mod download'"
-  log "hint: install Go or run with AUTO_INSTALL_SYSTEM_DEPS=1 (apt-get + root)"
+  log "hint: install Go manually, set GO_VERSION, or use AUTO_INSTALL_SYSTEM_DEPS=1"
 }
 
 install_node_project() {
