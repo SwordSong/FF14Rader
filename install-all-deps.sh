@@ -139,6 +139,7 @@ find_go_bin() {
   local candidates=(
     "/usr/local/go/bin/go"
     "/usr/lib/go/bin/go"
+    "$HOME/.local/go/bin/go"
     "$HOME/go/bin/go"
   )
 
@@ -149,6 +150,136 @@ find_go_bin() {
       return 0
     fi
   done
+
+  return 1
+}
+
+download_with_curl_or_wget() {
+  local url="$1"
+  local out="$2"
+
+  if has_cmd curl; then
+    curl -fsSL "$url" -o "$out"
+    return $?
+  fi
+  if has_cmd wget; then
+    wget -qO "$out" "$url"
+    return $?
+  fi
+
+  return 1
+}
+
+detect_go_platform() {
+  local goos
+  local goarch
+
+  case "$(uname -s)" in
+    Linux) goos="linux" ;;
+    Darwin) goos="darwin" ;;
+    *) return 1 ;;
+  esac
+
+  case "$(uname -m)" in
+    x86_64|amd64) goarch="amd64" ;;
+    aarch64|arm64) goarch="arm64" ;;
+    armv7l) goarch="armv6l" ;;
+    *) return 1 ;;
+  esac
+
+  printf '%s %s\n' "$goos" "$goarch"
+}
+
+resolve_go_version() {
+  local specified="${GO_VERSION:-}"
+  if [[ -n "$specified" ]]; then
+    if [[ "$specified" == go* ]]; then
+      printf '%s\n' "$specified"
+    else
+      printf 'go%s\n' "$specified"
+    fi
+    return 0
+  fi
+
+  local raw
+  if has_cmd curl; then
+    raw="$(curl -fsSL https://go.dev/VERSION?m=text 2>/dev/null | head -n1 || true)"
+  elif has_cmd wget; then
+    raw="$(wget -qO- https://go.dev/VERSION?m=text 2>/dev/null | head -n1 || true)"
+  else
+    raw=""
+  fi
+
+  raw="${raw//$'\r'/}"
+  if [[ "$raw" == go* ]]; then
+    printf '%s\n' "$raw"
+    return 0
+  fi
+
+  return 1
+}
+
+install_go_from_official_tarball() {
+  local platform
+  local goos
+  local goarch
+  local goversion
+
+  if ! platform="$(detect_go_platform)"; then
+    log "warning: unsupported platform for auto Go install ($(uname -s)/$(uname -m))"
+    return 1
+  fi
+  read -r goos goarch <<<"$platform"
+
+  if ! goversion="$(resolve_go_version)"; then
+    log "warning: cannot resolve Go version automatically (set GO_VERSION to override)"
+    return 1
+  fi
+
+  if ! has_cmd tar; then
+    log "warning: tar is required for auto Go install"
+    return 1
+  fi
+
+  local archive="${goversion}.${goos}-${goarch}.tar.gz"
+  local url="https://go.dev/dl/${archive}"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local archive_path="$tmpdir/$archive"
+
+  log "go not found, trying official tarball install: $archive"
+  if ! download_with_curl_or_wget "$url" "$archive_path"; then
+    rm -rf "$tmpdir"
+    log "warning: failed to download $url"
+    return 1
+  fi
+
+  local install_base
+  if [[ "$(id -u)" -eq 0 ]]; then
+    install_base="/usr/local"
+  else
+    install_base="$HOME/.local"
+  fi
+
+  mkdir -p "$install_base"
+  rm -rf "$install_base/go"
+  if ! tar -C "$install_base" -xzf "$archive_path"; then
+    rm -rf "$tmpdir"
+    log "warning: failed to extract Go archive"
+    return 1
+  fi
+  rm -rf "$tmpdir"
+
+  export PATH="$install_base/go/bin:$PATH"
+  hash -r 2>/dev/null || true
+
+  if has_cmd go; then
+    log "installed $(go version)"
+    if [[ "$(id -u)" -ne 0 ]]; then
+      log "hint: add to PATH permanently -> export PATH=\"$install_base/go/bin:\$PATH\""
+    fi
+    return 0
+  fi
 
   return 1
 }
@@ -164,6 +295,14 @@ install_go_modules_if_possible() {
     log "download Go modules"
     "$go_bin" mod download
     return
+  fi
+
+  if install_go_from_official_tarball; then
+    if go_bin="$(find_go_bin)"; then
+      log "download Go modules"
+      "$go_bin" mod download
+      return
+    fi
   fi
 
   if [[ "${AUTO_INSTALL_SYSTEM_DEPS:-0}" == "1" ]] && has_cmd apt-get; then
