@@ -150,6 +150,7 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 		}
 
 		localHost := cluster.LocalHost()
+		taskMode := clusterTaskMode()
 		reportAssignedHost := make(map[string]string, len(reportCodes))
 		for _, code := range reportCodes {
 			fightCount := len(grouped[code])
@@ -187,15 +188,26 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 
 					assignedHost := reportAssignedHost[code]
 					if assignedHost != "" && assignedHost != localHost {
-						dispatchCtx, dispatchCancel := context.WithTimeout(ctx, 15*time.Minute)
-						dispatchErr := s.dispatchReportsToHost(dispatchCtx, assignedHost, playerID, []string{code})
-						dispatchCancel()
-						if dispatchErr == nil {
-							log.Printf("[CLUSTER] 报告 %s 已下发到 host=%s 执行下载+解析", code, assignedHost)
-							results <- code
-							continue
+						if taskMode == "pull" {
+							queued, queueErr := cluster.GlobalDispatchTaskQueue().EnqueueReports(playerID, assignedHost, []string{code})
+							if queueErr == nil {
+								if queued > 0 {
+									log.Printf("[CLUSTER] 报告 %s 已入队等待 host=%s 拉取执行", code, assignedHost)
+								}
+								continue
+							}
+							log.Printf("[CLUSTER] 报告 %s 入队失败 host=%s err=%v，回退本地", code, assignedHost, queueErr)
+						} else {
+							dispatchCtx, dispatchCancel := context.WithTimeout(ctx, 15*time.Minute)
+							dispatchErr := s.dispatchReportsToHost(dispatchCtx, assignedHost, playerID, []string{code})
+							dispatchCancel()
+							if dispatchErr == nil {
+								log.Printf("[CLUSTER] 报告 %s 已下发到 host=%s 执行下载+解析", code, assignedHost)
+								results <- code
+								continue
+							}
+							log.Printf("[CLUSTER] 报告 %s 下发失败 host=%s err=%v，回退本地", code, assignedHost, dispatchErr)
 						}
-						log.Printf("[CLUSTER] 报告 %s 下发失败 host=%s err=%v，回退本地", code, assignedHost, dispatchErr)
 					}
 
 					log.Printf("[V1] 报告 %s 下载开始 | 已下载=0/%d 当前并发=0/%d 当前速度=0.00 fights/s 预计完成=--", code, len(pendingFights), fightWorkers)
@@ -258,6 +270,13 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 		}
 		if err := markCompletedReportParseLogs(playerID); err != nil {
 			return downloaded, err
+		}
+		if taskMode == "pull" && len(passDone) == 0 {
+			select {
+			case <-ctx.Done():
+				return downloaded, ctx.Err()
+			case <-time.After(1200 * time.Millisecond):
+			}
 		}
 	}
 }
@@ -960,7 +979,7 @@ func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID uint,
 			return err
 		}
 	}
-	if err := s.scorePendingDownloadedFights(ctx, playerID); err != nil {
+	if err := s.scorePendingDownloadedFightsByReports(ctx, playerID, codes); err != nil {
 		log.Printf("[SCORE] assigned score pass failed: %v", err)
 	}
 	return markCompletedReportParseLogs(playerID)

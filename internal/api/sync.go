@@ -28,6 +28,12 @@ type SyncManager struct {
 	scorer *scoring.Service
 }
 
+type scoreTask struct {
+	mappingID  uint
+	reportCode string
+	fightID    int
+}
+
 func NewSyncManager(client *FFLogsClient) *SyncManager {
 	return &SyncManager{client: client, scorer: scoring.NewServiceFromEnv()}
 }
@@ -332,32 +338,50 @@ func (s *SyncManager) selfHealReportDownloadStatus(playerID uint) error {
 }
 
 func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID uint) error {
+	return s.scorePendingDownloadedFightsByReports(ctx, playerID, nil)
+}
+
+func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context, playerID uint, reportCodes []string) error {
 	if s.scorer == nil {
 		return nil
 	}
 
-	var maps []models.FightSyncMap
+	var allowed map[string]struct{}
+	if len(reportCodes) > 0 {
+		allowed = make(map[string]struct{}, len(reportCodes))
+		for _, code := range reportCodes {
+			normalized := strings.ToUpper(strings.TrimSpace(code))
+			if normalized == "" {
+				continue
+			}
+			allowed[normalized] = struct{}{}
+		}
+		if len(allowed) == 0 {
+			return nil
+		}
+	}
+
+	var mappings []models.FightSyncMap
 	if err := db.DB.Select("id", "master_id").
 		Where("player_id = ? AND downloaded = ? AND (parsed_done = ? OR scored_at IS NULL OR scored_at < ?)", playerID, true, false, time.Date(1970, 1, 2, 0, 0, 0, 0, time.UTC)).
-		Find(&maps).Error; err != nil {
+		Find(&mappings).Error; err != nil {
 		return fmt.Errorf("load pending scoring fights failed: %v", err)
 	}
-	if len(maps) == 0 {
+	if len(mappings) == 0 {
 		return nil
 	}
 
-	type scoreTask struct {
-		mappingID  uint
-		reportCode string
-		fightID    int
-	}
-
-	tasks := make([]scoreTask, 0, len(maps))
-	for _, mapping := range maps {
+	tasks := make([]scoreTask, 0, len(mappings))
+	for _, mapping := range mappings {
 		code, fightID, ok := splitMasterID(mapping.MasterID)
 		if !ok {
 			log.Printf("[SCORE] skip invalid master_id: %s", mapping.MasterID)
 			continue
+		}
+		if len(allowed) > 0 {
+			if _, ok := allowed[strings.ToUpper(strings.TrimSpace(code))]; !ok {
+				continue
+			}
 		}
 		tasks = append(tasks, scoreTask{mappingID: mapping.ID, reportCode: code, fightID: fightID})
 	}

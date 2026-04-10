@@ -42,6 +42,26 @@ type heartbeatRequest struct {
 	Host string `json:"host"`
 }
 
+type claimTasksRequest struct {
+	Host     string `json:"host"`
+	Limit    int    `json:"limit"`
+	LeaseSec int    `json:"leaseSec"`
+}
+
+type ackTaskRequest struct {
+	Host    string `json:"host"`
+	TaskID  string `json:"taskId"`
+	Success bool   `json:"success"`
+	Error   string `json:"error"`
+}
+
+type pullTaskResponseItem struct {
+	TaskID   string   `json:"taskId"`
+	PlayerID uint     `json:"playerId"`
+	Reports  []string `json:"reports"`
+	Host     string   `json:"host"`
+}
+
 func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
@@ -191,6 +211,116 @@ func (s *Service) executeReportsHandler(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+func (s *Service) claimTasksHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req claimTasksRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %v", err))
+		return
+	}
+
+	host := cluster.NormalizeHost(req.Host)
+	if host == "" {
+		host = cluster.NormalizeHost(r.RemoteAddr)
+	}
+	if host == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
+		return
+	}
+
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 1
+	}
+	if limit > 16 {
+		limit = 16
+	}
+
+	leaseSec := req.LeaseSec
+	if leaseSec <= 0 {
+		leaseSec = 900
+	}
+	if leaseSec > 3600 {
+		leaseSec = 3600
+	}
+
+	tasks := cluster.GlobalDispatchTaskQueue().Claim(host, limit, time.Duration(leaseSec)*time.Second)
+	resp := make([]pullTaskResponseItem, 0, len(tasks))
+	for _, task := range tasks {
+		resp = append(resp, pullTaskResponseItem{
+			TaskID:   task.ID,
+			PlayerID: task.PlayerID,
+			Reports:  append([]string(nil), task.Reports...),
+			Host:     task.Host,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "ok",
+		"host":   host,
+		"tasks":  resp,
+		"time":   time.Now().Format(time.RFC3339),
+	})
+}
+
+func (s *Service) ackTaskHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ackTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %v", err))
+		return
+	}
+
+	host := cluster.NormalizeHost(req.Host)
+	if host == "" {
+		host = cluster.NormalizeHost(r.RemoteAddr)
+	}
+	if host == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
+		return
+	}
+	if strings.TrimSpace(req.TaskID) == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("taskId is required"))
+		return
+	}
+
+	updated := cluster.GlobalDispatchTaskQueue().Ack(req.TaskID, host, req.Success, req.Error)
+	if !updated {
+		writeError(w, http.StatusNotFound, fmt.Errorf("task not found or not claimable"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":  "ok",
+		"taskId":  req.TaskID,
+		"success": req.Success,
+		"time":    time.Now().Format(time.RFC3339),
+	})
+}
+
+func (s *Service) listTasksHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	tasks := cluster.GlobalDispatchTaskQueue().Snapshot()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "ok",
+		"tasks":  tasks,
+		"count":  len(tasks),
+		"time":   time.Now().Format(time.RFC3339),
+	})
+}
+
 func TimeTrack(start time.Time, name string) {
 	elapsed := time.Since(start)
 	log.Printf("%s 花费： %s", name, elapsed)
@@ -301,6 +431,9 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/cluster/reports", s.listReportsHostMapHandler)
 	mux.HandleFunc("/api/cluster/reports/scan-local", s.scanLocalReportsHandler)
 	mux.HandleFunc("/api/cluster/reports/execute", s.executeReportsHandler)
+	mux.HandleFunc("/api/cluster/tasks/claim", s.claimTasksHandler)
+	mux.HandleFunc("/api/cluster/tasks/ack", s.ackTaskHandler)
+	mux.HandleFunc("/api/cluster/tasks", s.listTasksHandler)
 
 	c := cors.New(cors.Options{
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
