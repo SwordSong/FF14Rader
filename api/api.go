@@ -564,10 +564,6 @@ func (s *Service) raderHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if s.SyncManager == nil {
-		writeError(w, http.StatusServiceUnavailable, errors.New("sync manager not initialized and no fresh radar cache"))
-		return
-	}
 
 	task, created, err := enqueueRadarSyncTask(username, server, "CN")
 	if err != nil {
@@ -777,6 +773,8 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/cluster/tasks/claim", s.claimTasksHandler)
 	mux.HandleFunc("/api/cluster/tasks/ack", s.ackTaskHandler)
 	mux.HandleFunc("/api/cluster/tasks", s.listTasksHandler)
+	mux.HandleFunc("/api/cluster/unparsed-codes/upsert", s.upsertUnparsedCodesHandler)
+	mux.HandleFunc("/api/cluster/unparsed-codes", s.listUnparsedCodesHandler)
 
 	c := cors.New(cors.Options{
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},

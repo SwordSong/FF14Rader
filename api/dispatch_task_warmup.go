@@ -109,7 +109,7 @@ func prewarmDispatchTaskQueueFromDB() (dispatchWarmupStats, error) {
 	var rows []pendingParsedFightRow
 	err := db.DB.Model(&models.FightSyncMap{}).
 		Select("player_id", "master_id").
-		Where("downloaded = ? AND parsed_done = ?", true, false).
+		Where("parsed_done = ?", false).
 		Find(&rows).Error
 	if err != nil {
 		return stats, err

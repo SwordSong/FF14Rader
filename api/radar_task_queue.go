@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/user/ff14rader/internal/cluster"
 	"github.com/user/ff14rader/internal/db"
 	"github.com/user/ff14rader/internal/models"
 	"gorm.io/gorm"
@@ -221,6 +222,25 @@ func (s *Service) consumeOneRadarSyncTask() {
 
 	execErr := s.SyncManager.StartIncrementalSync(ctx, task.Username, task.Server, task.Region)
 	if execErr == nil {
+		playerID, codeMap, dictErr := collectPlayerUnparsedCodesByNameServer(task.Username, task.Server)
+		if dictErr != nil {
+			log.Printf("[RADAR] collect unparsed codes failed id=%d key=%s err=%v", task.ID, task.TaskKey, dictErr)
+		} else if playerID > 0 {
+			masterEndpoint := strings.TrimSpace(cluster.ClusterMasterEndpoint())
+			if masterEndpoint != "" {
+				if submitErr := submitUnparsedCodesToMaster(playerID, task.Username, task.Server, codeMap); submitErr != nil {
+					log.Printf("[RADAR] submit unparsed codes failed id=%d key=%s player=%d err=%v", task.ID, task.TaskKey, playerID, submitErr)
+					upsertedCodes, queued, alreadyQueued, missingHost := applyUnparsedCodesToServer(playerID, cluster.LocalHost(), codeMap)
+					log.Printf("[RADAR] fallback local unparsed apply id=%d key=%s player=%d upsertedCodes=%d queued=%d alreadyQueued=%d missingHost=%d", task.ID, task.TaskKey, playerID, upsertedCodes, queued, alreadyQueued, missingHost)
+				} else {
+					log.Printf("[RADAR] unparsed codes submitted id=%d key=%s player=%d reports=%d", task.ID, task.TaskKey, playerID, len(codeMap))
+				}
+			} else {
+				upsertedCodes, queued, alreadyQueued, missingHost := applyUnparsedCodesToServer(playerID, cluster.LocalHost(), codeMap)
+				log.Printf("[RADAR] local unparsed apply id=%d key=%s player=%d upsertedCodes=%d queued=%d alreadyQueued=%d missingHost=%d", task.ID, task.TaskKey, playerID, upsertedCodes, queued, alreadyQueued, missingHost)
+			}
+		}
+
 		var row *playerRadarSnapshot
 		row, execErr = loadPlayerRadarSnapshot(task.Username, task.Server)
 		if execErr == nil {

@@ -53,6 +53,13 @@ func main() {
 		} else {
 			log.Printf("[CLUSTER] 已恢复持久化 report->host 映射 count=%d", restoredReports)
 		}
+
+		rebuiltPlayers, rebuiltCodes, rebuildErr := appapi.RebuildUnparsedCodeDictFromDB()
+		if rebuildErr != nil {
+			log.Printf("[UNPARSED] 启动重建用户未解析code字典失败: %v", rebuildErr)
+		} else {
+			log.Printf("[UNPARSED] 启动重建完成 players=%d codes=%d", rebuiltPlayers, rebuiltCodes)
+		}
 		cluster.StartRegistryEvictLoop(cluster.GlobalReportHostRegistry())
 	}
 
@@ -73,20 +80,20 @@ func main() {
 		}
 	}
 
-	if !runServer {
-		log.Println("客户端模式运行中（未启动 HTTP 服务）")
-		select {}
-	}
-
 	service := &appapi.Service{
 		SyncManager:        syncManager,
 		EnableDashboardAPI: false,
 	}
+	if syncManager != nil {
+		service.StartRadarTaskWorker()
+	}
 	if runServer {
 		service.StartDispatchTaskWarmupLoop()
 	}
-	if runServer && syncManager != nil {
-		service.StartRadarTaskWorker()
+
+	if !runServer {
+		log.Println("客户端模式运行中（未启动 HTTP 服务）")
+		select {}
 	}
 
 	log.Println("FF14Rader 服务正常运行中...")
