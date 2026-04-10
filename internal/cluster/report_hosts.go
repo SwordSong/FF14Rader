@@ -28,6 +28,7 @@ type ReportHostRegistry struct {
 
 var globalReportHostRegistry = NewReportHostRegistry()
 
+// NewReportHostRegistry 创建一个新的 ReportHostRegistry 实例。
 func NewReportHostRegistry() *ReportHostRegistry {
 	return &ReportHostRegistry{
 		reportHost: make(map[string]string),
@@ -36,10 +37,12 @@ func NewReportHostRegistry() *ReportHostRegistry {
 	}
 }
 
+// GlobalReportHostRegistry 返回全局单例的 ReportHostRegistry 实例。
 func GlobalReportHostRegistry() *ReportHostRegistry {
 	return globalReportHostRegistry
 }
 
+// LocalHost 尝试从环境变量或系统信息中获取本机可用的 host 标识，优先级：CLUSTER_LOCAL_HOST > NODE_HOST > HOST > os.Hostname() > "127.0.0.1"
 func LocalHost() string {
 	candidates := []string{
 		strings.TrimSpace(os.Getenv("CLUSTER_LOCAL_HOST")),

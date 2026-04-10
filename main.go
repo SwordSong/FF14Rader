@@ -9,22 +9,20 @@ import (
 	"github.com/user/ff14rader/internal/cluster"
 	"github.com/user/ff14rader/internal/config"
 	"github.com/user/ff14rader/internal/db"
-	"github.com/user/ff14rader/internal/render"
 )
 
 func main() {
-	runServerFlag := flag.Bool("server", false, "run server role")
-	runClientFlag := flag.Bool("client", false, "run client(worker) role")
+	runServerFlag := flag.Bool("server", false, "服务器状态运行，包含 HTTP API 和集群管理")
+	runClientFlag := flag.Bool("client", false, "客户端模式运行，仅执行任务拉取、下载与解析")
 	flag.Parse()
 
 	runServer := *runServerFlag
 	runClient := *runClientFlag
 	if !runServer && !runClient {
-		// Backward compatible default: run both roles.
+		// 默认两者都启动
 		runServer = true
 		runClient = true
 	}
-
 	log.Println("正在启动 FF14Rader 服务...")
 	log.Printf("启动角色: server=%t client=%t", runServer, runClient)
 
@@ -34,25 +32,32 @@ func main() {
 	// 2. 初始化数据库 (读写分离)
 	db.InitDB(cfg.PostgresWriteDSN, cfg.PostgresReadDSN)
 
-	// 3. 初始化同步管理器与渲染器
-	fflogsClient := internalapi.NewFFLogsClient(cfg.FFLogsClientID, cfg.FFLogsClientSecret)
-	syncManager := internalapi.NewSyncManager(fflogsClient)
-	radarRenderer := render.NewRadarChart(800, 800)
-	localHost := cluster.LocalHost()
-	scanDir := cluster.ReportsScanDir()
-	seeded, seedErr := cluster.GlobalReportHostRegistry().SeedHostReportsFromDir(localHost, scanDir)
-	if seedErr != nil {
-		log.Printf("[CLUSTER] 本地 reports 扫描失败 host=%s dir=%s err=%v", localHost, scanDir, seedErr)
-	} else {
-		log.Printf("[CLUSTER] 本地 reports 初始化完成 host=%s dir=%s reports=%d", localHost, scanDir, seeded)
+	var syncManager *internalapi.SyncManager
+	if runClient {
+		fflogsClient := internalapi.NewFFLogsClient(cfg.FFLogsClientID, cfg.FFLogsClientSecret)
+		syncManager = internalapi.NewSyncManager(fflogsClient)
 	}
 
+	// server 角色：仅做分发与集群管理。
 	if runServer {
 		cluster.StartRegistryEvictLoop(cluster.GlobalReportHostRegistry())
 	}
+
+	// client 角色：仅做注册、拉取任务、下载与解析。
 	if runClient {
+		localHost := cluster.LocalHost()
+		scanDir := cluster.ReportsScanDir()
+		seeded, seedErr := cluster.GlobalReportHostRegistry().SeedHostReportsFromDir(localHost, scanDir)
+		if seedErr != nil {
+			log.Printf("[CLUSTER] 本地 reports 扫描失败 host=%s dir=%s err=%v", localHost, scanDir, seedErr)
+		} else {
+			log.Printf("[CLUSTER] 本地 reports 初始化完成 host=%s dir=%s reports=%d", localHost, scanDir, seeded)
+		}
+
 		cluster.StartAutoRegisterAndHeartbeat(cluster.GlobalReportHostRegistry())
-		syncManager.StartClusterTaskPullLoop()
+		if syncManager != nil {
+			syncManager.StartClusterTaskPullLoop()
+		}
 	}
 
 	if !runServer {
@@ -60,13 +65,14 @@ func main() {
 		select {}
 	}
 
+	service := &appapi.Service{
+		SyncManager:        syncManager,
+		EnableDashboardAPI: false,
+	}
+
 	log.Println("FF14Rader 服务正常运行中...")
 	log.Printf("监控 API 已启动: http://0.0.0.0:%s", cfg.MonitorPort)
 
-	service := &appapi.Service{
-		SyncManager:   syncManager,
-		RadarRenderer: radarRenderer,
-	}
 	if err := appapi.RunServer(cfg.MonitorPort, service); err != nil {
 		log.Fatalf("监控 API 启动失败: %v", err)
 	}

@@ -15,7 +15,6 @@ import (
 	"github.com/rs/cors"
 	internalapi "github.com/user/ff14rader/internal/api"
 	"github.com/user/ff14rader/internal/cluster"
-	"github.com/user/ff14rader/internal/render"
 )
 
 // context key for request id
@@ -23,9 +22,29 @@ type ctxKey string
 
 const requestIDKey ctxKey = "requestID"
 
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
+}
+
 type Service struct {
-	SyncManager   *internalapi.SyncManager
-	RadarRenderer *render.RadarChart
+	SyncManager        *internalapi.SyncManager
+	EnableDashboardAPI bool
 }
 
 type registerReportsRequest struct {
@@ -333,6 +352,10 @@ func (s *Service) raderHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.SyncManager == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("sync manager not initialized"))
+		return
+	}
 	query := r.URL.Query()
 	params, err := checkParams(query)
 	if err != nil {
@@ -387,6 +410,36 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// accessLogMiddleware 打印 API 请求处理信息（方法、路径、状态码、耗时等）。
+func accessLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started := time.Now()
+		rec := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(rec, r)
+
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+
+		requestID := rec.Header().Get("X-Request-Id")
+		if requestID == "" {
+			requestID = "-"
+		}
+
+		log.Printf("[API] rid=%s method=%s path=%s status=%d bytes=%d cost=%s remote=%s ua=%s",
+			requestID,
+			r.Method,
+			r.URL.RequestURI(),
+			status,
+			rec.bytes,
+			time.Since(started),
+			r.RemoteAddr,
+			r.UserAgent(),
+		)
+	})
+}
+
 // 这里是一个简单的 panic 恢复中间件，确保服务器不会因为单个请求的 panic 而崩溃
 func recoverMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -425,7 +478,9 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.healthHandler)
 	// mux.HandleFunc("/api/monitor/params", s.paramsHandler)
 
-	mux.HandleFunc("/api/ff14/rader", s.raderHandler)
+	if s.EnableDashboardAPI {
+		mux.HandleFunc("/api/ff14/rader", s.raderHandler)
+	}
 	mux.HandleFunc("/api/cluster/reports/register", s.registerReportsHandler)
 	mux.HandleFunc("/api/cluster/reports/heartbeat", s.heartbeatReportsHandler)
 	mux.HandleFunc("/api/cluster/reports", s.listReportsHostMapHandler)
@@ -441,8 +496,9 @@ func (s *Service) Handler() http.Handler {
 		AllowCredentials: true,
 	})
 	h := c.Handler(mux)
-	h = requestIDMiddleware(h)
 	h = recoverMiddleware(h)
+	h = accessLogMiddleware(h)
+	h = requestIDMiddleware(h)
 	return h
 }
 

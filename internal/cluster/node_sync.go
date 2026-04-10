@@ -105,6 +105,7 @@ func ClusterRegisterWait() time.Duration {
 	return envDurationSeconds("CLUSTER_REGISTER_WAIT_SEC", defaultRegisterWait)
 }
 
+// LocalHost 尝试从环境变量或系统信息中获取本机可用的 host 标识，优先级：CLUSTER_LOCAL_HOST > NODE_HOST > HOST > os.Hostname() > "
 func StartRegistryEvictLoop(registry *ReportHostRegistry) {
 	if registry == nil {
 		return

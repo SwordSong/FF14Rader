@@ -7,7 +7,6 @@ import (
 	internalapi "github.com/user/ff14rader/internal/api"
 	"github.com/user/ff14rader/internal/config"
 	"github.com/user/ff14rader/internal/db"
-	"github.com/user/ff14rader/internal/render"
 )
 
 func main() {
@@ -19,11 +18,10 @@ func main() {
 
 	fflogsClient := internalapi.NewFFLogsClient(cfg.FFLogsClientID, cfg.FFLogsClientSecret)
 	syncManager := internalapi.NewSyncManager(fflogsClient)
-	radarRenderer := render.NewRadarChart(800, 800)
 
 	service := &appapi.Service{
-		SyncManager:   syncManager,
-		RadarRenderer: radarRenderer,
+		SyncManager:        syncManager,
+		EnableDashboardAPI: true,
 	}
 
 	log.Printf("debug monitor api listening on :%s", cfg.MonitorPort)
