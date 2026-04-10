@@ -1,0 +1,16 @@
+
+主服务端：
+1.主服务器通过/api/ff14/rader传进来username和server
+2.主服务器检查判断对应用户的更新时间，如果小于24小时就返回players的pichash字段，加上路径，直接返回图片的绝对路径（当前表内没有这个字段添加一下）
+2.如果没有这个用户或者更新时间大于24小时就把这个用户的username和server存在字典里，下发给客户端
+3.客户端获得用户信息后开始执行V2接口查询信息，处理完reportcde和fighsyncmaps后把playerid和reportcde返回给主服务器，主服务有一个字典存这些东西，结构为 {playerid1 :{code1:[1,2,3]},code2:[1,2,3]},playerid2 :{code1:[1,2,3]},code2:[1,2,3]} },后面称为“用户未解析code字典”，（主服务器启动的时候查一遍表把fight_sync_maps没有parseddone的整合成“用户未解析code字典”）
+4.主服务器的“用户未解析code字典”不为空时，根据客户端负载给客户端下发playerid和code
+5.当“用户未解析code字典”中playerid1的集合为0时候执行用户评分
+6.评分完毕后生成图片，使用hash为图片命名，并且存在players表里
+
+客户端：
+V1和V2的key通过fflogskey表获得，之后会使用keypool来换api的key
+1.启动时向主服务器发送注册，表示自己存活
+2.扫描本地已有的reportscode，整理后发送给主服务器（reportcode:host）
+3.客户端获得主服务器下发的username和server开始执行v2查询和fight处理
+4.客户端获得playid和code，进行下载和解析，完成后返回给主服务器

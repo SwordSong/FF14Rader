@@ -13,7 +13,7 @@ import (
 
 var DB *gorm.DB
 
-const currentDBSchemaVersion = "2026-04-07-v10"
+const currentDBSchemaVersion = "2026-04-11-v14"
 
 func InitDB(writeDSN, readDSN string) {
 	var err error
@@ -33,7 +33,7 @@ func InitDB(writeDSN, readDSN string) {
 		Sources:  []gorm.Dialector{postgres.Open(writeDSN)},
 		Replicas: []gorm.Dialector{postgres.Open(readDSN)},
 		Policy:   dbresolver.RandomPolicy{}, // 随机读策略
-	}, &models.Player{}, &models.Report{}, &models.FightSyncMap{}))
+	}, &models.Player{}, &models.Report{}, &models.FightSyncMap{}, &models.RadarSyncTask{}, &models.ClusterHostEndpoint{}, &models.ClusterReportHost{}))
 	if err != nil {
 		log.Fatalf("无法注册读写分离插件 (dbresolver): %v", err)
 	}
@@ -355,7 +355,7 @@ BEGIN
 	END IF;
 END
 $$;`)
-	err = DB.AutoMigrate(&models.Player{}, &models.Report{}, &models.FightSyncMap{})
+	err = DB.AutoMigrate(&models.Player{}, &models.Report{}, &models.FightSyncMap{}, &models.RadarSyncTask{}, &models.ClusterHostEndpoint{}, &models.ClusterReportHost{})
 	if err != nil {
 		log.Fatalf("数据库迁移失败: %v", err)
 	}
@@ -420,7 +420,7 @@ func setSchemaVersion(db *gorm.DB, version string) error {
 }
 
 func schemaLooksCurrent(db *gorm.DB) bool {
-	requiredTables := []string{"players", "reports", "fight_sync_maps"}
+	requiredTables := []string{"players", "reports", "fight_sync_maps", "radar_sync_tasks", "cluster_host_endpoints", "cluster_report_hosts"}
 	for _, table := range requiredTables {
 		if !tableExists(db, table) {
 			return false
@@ -431,7 +431,7 @@ func schemaLooksCurrent(db *gorm.DB) bool {
 		"players": {
 			"id", "name", "server", "region", "race", "gender", "lodestone_id", "common_job", "all_report_codes",
 			"output_ability", "battle_ability", "team_contribution", "progression_speed",
-			"stability_score", "mechanics_score", "potential_score",
+			"stability_score", "mechanics_score", "potential_score", "pichash", "pic_updated_at",
 			"created_at", "updated_at",
 		},
 		"reports": {
@@ -445,6 +445,16 @@ func schemaLooksCurrent(db *gorm.DB) bool {
 			"score_actor_name", "checklist_abs", "checklist_confidence", "checklist_adj", "suggestion_penalty",
 			"utility_score", "survival_penalty", "job_module_score", "battle_score", "fight_weight",
 			"weighted_battle_score", "raw_module_metrics", "scored_at",
+		},
+		"radar_sync_tasks": {
+			"id", "task_key", "username", "server", "region", "status", "last_error", "retry_count",
+			"requested_at", "started_at", "finished_at", "created_at", "updated_at",
+		},
+		"cluster_host_endpoints": {
+			"id", "host", "control_endpoint", "last_seen_at", "created_at", "updated_at",
+		},
+		"cluster_report_hosts": {
+			"id", "report_code", "host", "last_assigned_at", "created_at", "updated_at",
 		},
 	}
 

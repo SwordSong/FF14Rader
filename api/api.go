@@ -2,19 +2,28 @@ package api
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/cors"
 	internalapi "github.com/user/ff14rader/internal/api"
 	"github.com/user/ff14rader/internal/cluster"
+	"github.com/user/ff14rader/internal/db"
+	"github.com/user/ff14rader/internal/models"
+	"github.com/user/ff14rader/internal/render"
+	"gorm.io/gorm"
 )
 
 // context key for request id
@@ -45,11 +54,14 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 type Service struct {
 	SyncManager        *internalapi.SyncManager
 	EnableDashboardAPI bool
+	radarWorkerOnce    sync.Once
+	dispatchWarmupOnce sync.Once
 }
 
 type registerReportsRequest struct {
-	Host    string   `json:"host"`
-	Reports []string `json:"reports"`
+	Host            string   `json:"host"`
+	Reports         []string `json:"reports"`
+	ControlEndpoint string   `json:"controlEndpoint,omitempty"`
 }
 
 type executeReportsRequest struct {
@@ -58,7 +70,8 @@ type executeReportsRequest struct {
 }
 
 type heartbeatRequest struct {
-	Host string `json:"host"`
+	Host            string `json:"host"`
+	ControlEndpoint string `json:"controlEndpoint,omitempty"`
 }
 
 type claimTasksRequest struct {
@@ -79,6 +92,156 @@ type pullTaskResponseItem struct {
 	PlayerID uint     `json:"playerId"`
 	Reports  []string `json:"reports"`
 	Host     string   `json:"host"`
+}
+
+const (
+	radarCacheTTL        = 24 * time.Hour
+	defaultRadarImageDir = "./pic"
+)
+
+type playerRadarSnapshot struct {
+	ID               uint      `gorm:"column:id"`
+	Name             string    `gorm:"column:name"`
+	Server           string    `gorm:"column:server"`
+	OutputAbility    float64   `gorm:"column:output_ability"`
+	BattleAbility    float64   `gorm:"column:battle_ability"`
+	TeamContribution float64   `gorm:"column:team_contribution"`
+	ProgressionSpeed float64   `gorm:"column:progression_speed"`
+	StabilityScore   float64   `gorm:"column:stability_score"`
+	PotentialScore   float64   `gorm:"column:potential_score"`
+	PicHash          string    `gorm:"column:pichash"`
+	PicUpdatedAt     time.Time `gorm:"column:pic_updated_at"`
+	UpdatedAt        time.Time `gorm:"column:updated_at"`
+}
+
+func radarTaskKey(username, server string) string {
+	namePart := strings.ToLower(strings.TrimSpace(username))
+	serverPart := strings.ToLower(strings.TrimSpace(server))
+	return namePart + "@" + serverPart
+}
+
+func radarImageDir() string {
+	if raw := strings.TrimSpace(os.Getenv("RADAR_PIC_DIR")); raw != "" {
+		return raw
+	}
+	return defaultRadarImageDir
+}
+
+func radarImagePathFromHash(picHash string) (string, error) {
+	hash := strings.TrimSpace(picHash)
+	if hash == "" {
+		return "", fmt.Errorf("empty pic hash")
+	}
+	relPath := filepath.Join(radarImageDir(), hash+".png")
+	absPath, err := filepath.Abs(relPath)
+	if err != nil {
+		return "", err
+	}
+	return absPath, nil
+}
+
+func loadPlayerRadarSnapshot(name, server string) (*playerRadarSnapshot, error) {
+	var row playerRadarSnapshot
+	err := db.DB.Model(&models.Player{}).
+		Select("id", "name", "server", "output_ability", "battle_ability", "team_contribution", "progression_speed", "stability_score", "potential_score", "pichash", "pic_updated_at", "updated_at").
+		Where("LOWER(name) = LOWER(?) AND LOWER(server) = LOWER(?)", strings.TrimSpace(name), strings.TrimSpace(server)).
+		Order("updated_at DESC").
+		First(&row).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &row, nil
+}
+
+func cachedRadarImagePath(row *playerRadarSnapshot, now time.Time) (string, bool) {
+	if row == nil {
+		return "", false
+	}
+	if strings.TrimSpace(row.PicHash) == "" || row.PicUpdatedAt.IsZero() {
+		return "", false
+	}
+	if now.Sub(row.PicUpdatedAt) >= radarCacheTTL {
+		return "", false
+	}
+
+	path, err := radarImagePathFromHash(row.PicHash)
+	if err != nil {
+		return "", false
+	}
+	info, statErr := os.Stat(path)
+	if statErr != nil || info.IsDir() {
+		return "", false
+	}
+	return path, true
+}
+
+func buildPlayerRadarHash(row *playerRadarSnapshot) string {
+	seed := fmt.Sprintf("%d|%s|%s|%.4f|%.4f|%.4f|%.4f|%.4f|%.4f|%d",
+		row.ID,
+		row.Name,
+		row.Server,
+		row.OutputAbility,
+		row.BattleAbility,
+		row.TeamContribution,
+		row.ProgressionSpeed,
+		row.StabilityScore,
+		row.PotentialScore,
+		row.UpdatedAt.UTC().UnixNano(),
+	)
+	sum := sha1.Sum([]byte(seed))
+	return hex.EncodeToString(sum[:12])
+}
+
+func generateAndPersistPlayerRadar(row *playerRadarSnapshot) (string, string, error) {
+	if row == nil || row.ID == 0 {
+		return "", "", fmt.Errorf("invalid player")
+	}
+
+	picHash := buildPlayerRadarHash(row)
+	outputPath, err := radarImagePathFromHash(picHash)
+	if err != nil {
+		return "", "", err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
+		return "", "", fmt.Errorf("create radar image dir failed: %v", err)
+	}
+
+	radar := render.NewRadarChart(900, 900)
+	labels := []string{"输出能力", "战斗能力", "团队贡献", "开荒速度", "稳定度", "潜力值"}
+	values := []float64{
+		row.OutputAbility,
+		row.BattleAbility,
+		row.TeamContribution,
+		row.ProgressionSpeed,
+		row.StabilityScore,
+		row.PotentialScore,
+	}
+	title := strings.TrimSpace(row.Name)
+	if title == "" {
+		title = fmt.Sprintf("player-%d", row.ID)
+	}
+
+	if err := radar.DrawMetrics(title, labels, values, outputPath); err != nil {
+		return "", "", fmt.Errorf("draw radar failed: %v", err)
+	}
+
+	now := time.Now()
+	if err := db.DB.Model(&models.Player{}).
+		Where("id = ?", row.ID).
+		Updates(map[string]interface{}{
+			"pichash":        picHash,
+			"pic_updated_at": now,
+		}).Error; err != nil {
+		return "", "", fmt.Errorf("update player pichash failed: %v", err)
+	}
+
+	row.PicHash = picHash
+	row.PicUpdatedAt = now
+	return picHash, outputPath, nil
 }
 
 func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request) {
@@ -102,14 +265,22 @@ func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	added, total := cluster.GlobalReportHostRegistry().RegisterHostReports(host, req.Reports)
+	added, total := cluster.GlobalReportHostRegistry().RegisterHostReportsWithEndpoint(host, req.Reports, req.ControlEndpoint)
+	controlEndpoint, _ := cluster.GlobalReportHostRegistry().ResolveHostControlEndpoint(host)
+	if persistErr := cluster.PersistHostEndpoint(host, controlEndpoint, time.Now()); persistErr != nil {
+		log.Printf("[CLUSTER] 持久化 host endpoint 失败 host=%s endpoint=%s err=%v", host, controlEndpoint, persistErr)
+	}
+	if _, persistMapErr := cluster.PersistReportHostMappings(host, req.Reports, time.Now()); persistMapErr != nil {
+		log.Printf("[CLUSTER] 持久化 report->host 映射失败 host=%s reports=%d err=%v", host, len(req.Reports), persistMapErr)
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":       "ok",
-		"host":         host,
-		"received":     len(req.Reports),
-		"addedOrMoved": added,
-		"totalReports": total,
-		"time":         time.Now().Format(time.RFC3339),
+		"status":          "ok",
+		"host":            host,
+		"received":        len(req.Reports),
+		"addedOrMoved":    added,
+		"totalReports":    total,
+		"controlEndpoint": controlEndpoint,
+		"time":            time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -120,12 +291,14 @@ func (s *Service) listReportsHostMapHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":       "ok",
-		"reports":      cluster.GlobalReportHostRegistry().Snapshot(),
-		"hostLoad":     cluster.GlobalReportHostRegistry().SnapshotLoads(),
-		"hostSeenAt":   cluster.GlobalReportHostRegistry().SnapshotSeenAt(),
-		"reportsCount": len(cluster.GlobalReportHostRegistry().Snapshot()),
-		"time":         time.Now().Format(time.RFC3339),
+		"status":          "ok",
+		"reports":         cluster.GlobalReportHostRegistry().Snapshot(),
+		"hostLoad":        cluster.GlobalReportHostRegistry().SnapshotLoads(),
+		"hostSeenAt":      cluster.GlobalReportHostRegistry().SnapshotSeenAt(),
+		"hostControlApi":  cluster.GlobalReportHostRegistry().SnapshotControlEndpoints(),
+		"reportsCount":    len(cluster.GlobalReportHostRegistry().Snapshot()),
+		"controlApiCount": len(cluster.GlobalReportHostRegistry().SnapshotControlEndpoints()),
+		"time":            time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -150,15 +323,20 @@ func (s *Service) heartbeatReportsHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if ok := cluster.GlobalReportHostRegistry().HeartbeatHost(host); !ok {
+	if ok := cluster.GlobalReportHostRegistry().HeartbeatHostWithEndpoint(host, req.ControlEndpoint); !ok {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid host"))
 		return
 	}
+	controlEndpoint, _ := cluster.GlobalReportHostRegistry().ResolveHostControlEndpoint(host)
+	if persistErr := cluster.PersistHostEndpoint(host, controlEndpoint, time.Now()); persistErr != nil {
+		log.Printf("[CLUSTER] 持久化 host heartbeat 失败 host=%s endpoint=%s err=%v", host, controlEndpoint, persistErr)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status": "ok",
-		"host":   host,
-		"time":   time.Now().Format(time.RFC3339),
+		"status":          "ok",
+		"host":            host,
+		"controlEndpoint": controlEndpoint,
+		"time":            time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -178,6 +356,11 @@ func (s *Service) scanLocalReportsHandler(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("scan local reports failed: %v", err))
 		return
+	}
+	if reports, scanErr := cluster.CollectReportCodesFromDir(dir); scanErr != nil {
+		log.Printf("[CLUSTER] 持久化 scan-local report->host 前读取目录失败 host=%s dir=%s err=%v", host, dir, scanErr)
+	} else if _, persistMapErr := cluster.PersistReportHostMappings(host, reports, time.Now()); persistMapErr != nil {
+		log.Printf("[CLUSTER] 持久化 scan-local report->host 失败 host=%s reports=%d err=%v", host, len(reports), persistMapErr)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -352,28 +535,134 @@ func (s *Service) raderHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.SyncManager == nil {
-		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("sync manager not initialized"))
-		return
-	}
+
 	query := r.URL.Query()
 	params, err := checkParams(query)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	ctx := context.Background()
-	if err := s.SyncManager.StartIncrementalSync(ctx, params[0], params[1], "CN"); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to start incremental sync: %v", err))
+	username := params[0]
+	server := params[1]
+
+	beforeSync, err := loadPlayerRadarSnapshot(username, server)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("load player cache failed: %v", err))
 		return
 	}
-	log.Printf("Dashboard UA:%v Args:%v", r.Header.Get("User-Agent"), params)
+	if imagePath, ok := cachedRadarImagePath(beforeSync, time.Now()); ok {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":       "ok",
+			"cacheHit":     true,
+			"playerId":     beforeSync.ID,
+			"pichash":      beforeSync.PicHash,
+			"imagePath":    imagePath,
+			"path":         r.URL.Path,
+			"query":        query,
+			"picUpdatedAt": beforeSync.PicUpdatedAt.Format(time.RFC3339),
+			"time":         time.Now().Format(time.RFC3339),
+		})
+		return
+	}
+	if s.SyncManager == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("sync manager not initialized and no fresh radar cache"))
+		return
+	}
+
+	task, created, err := enqueueRadarSyncTask(username, server, "CN")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("enqueue radar sync task failed: %v", err))
+		return
+	}
+
+	status := task.Status
+	inProgress := task.Status == radarTaskStatusPending || task.Status == radarTaskStatusRunning
+	log.Printf("Dashboard UA:%v Args:%v cacheHit=%t enqueue=%s created=%t", r.Header.Get("User-Agent"), params, false, task.TaskKey, created)
+
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"status":      status,
+		"cacheHit":    false,
+		"taskId":      task.ID,
+		"taskKey":     task.TaskKey,
+		"inProgress":  inProgress,
+		"created":     created,
+		"requestedAt": task.RequestedAt.Format(time.RFC3339),
+		"lastError":   task.LastError,
+		"retryCount":  task.RetryCount,
+		"path":        r.URL.Path,
+		"query":       query,
+		"time":        time.Now().Format(time.RFC3339),
+	})
+}
+
+func (s *Service) raderTaskStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	params, err := checkParams(r.URL.Query())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	taskKey := radarTaskKey(params[0], params[1])
+	task, err := getRadarSyncTaskByTaskKey(taskKey)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("query radar task failed: %v", err))
+		return
+	}
+	if task == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":     "idle",
+			"taskKey":    taskKey,
+			"inProgress": false,
+			"time":       time.Now().Format(time.RFC3339),
+		})
+		return
+	}
+
+	inProgress := task.Status == radarTaskStatusPending || task.Status == radarTaskStatusRunning
+	status := task.Status
+	if strings.TrimSpace(status) == "" {
+		status = "idle"
+	}
+
+	payload := map[string]interface{}{
+		"status":      status,
+		"taskId":      task.ID,
+		"taskKey":     task.TaskKey,
+		"inProgress":  inProgress,
+		"lastError":   task.LastError,
+		"retryCount":  task.RetryCount,
+		"requestedAt": task.RequestedAt.Format(time.RFC3339),
+		"updatedAt":   task.UpdatedAt.Format(time.RFC3339),
+		"time":        time.Now().Format(time.RFC3339),
+	}
+	if task.StartedAt != nil {
+		payload["startedAt"] = task.StartedAt.Format(time.RFC3339)
+	}
+	if task.FinishedAt != nil {
+		payload["finishedAt"] = task.FinishedAt.Format(time.RFC3339)
+	}
+
+	if status == radarTaskStatusDone {
+		if row, loadErr := loadPlayerRadarSnapshot(params[0], params[1]); loadErr == nil {
+			if imagePath, ok := cachedRadarImagePath(row, time.Now()); ok {
+				payload["cacheHit"] = true
+				payload["playerId"] = row.ID
+				payload["pichash"] = row.PicHash
+				payload["imagePath"] = imagePath
+				payload["picUpdatedAt"] = row.PicUpdatedAt.Format(time.RFC3339)
+			}
+		}
+	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status": "ok",
-		"path":   r.URL.Path,
-		"query":  query,
-		"time":   time.Now().Format(time.RFC3339),
+		"status":     "ok",
+		"taskStatus": payload,
+		"time":       time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -478,9 +767,8 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.healthHandler)
 	// mux.HandleFunc("/api/monitor/params", s.paramsHandler)
 
-	if s.EnableDashboardAPI {
-		mux.HandleFunc("/api/ff14/rader", s.raderHandler)
-	}
+	mux.HandleFunc("/api/ff14/rader", s.raderHandler)
+	mux.HandleFunc("/api/ff14/rader/status", s.raderTaskStatusHandler)
 	mux.HandleFunc("/api/cluster/reports/register", s.registerReportsHandler)
 	mux.HandleFunc("/api/cluster/reports/heartbeat", s.heartbeatReportsHandler)
 	mux.HandleFunc("/api/cluster/reports", s.listReportsHostMapHandler)

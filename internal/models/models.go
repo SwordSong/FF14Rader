@@ -24,6 +24,8 @@ type Player struct {
 	StabilityScore   float64   `gorm:"default:0" json:"stability_score"`
 	MechanicsScore   float64   `gorm:"default:0" json:"mechanics_score"`
 	PotentialScore   float64   `gorm:"default:0" json:"potential_score"`
+	PicHash          string    `gorm:"column:pichash;size:80;index" json:"pichash"`
+	PicUpdatedAt     time.Time `gorm:"column:pic_updated_at;index" json:"pic_updated_at"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 	Reports          []Report  `gorm:"foreignKey:PlayerID" json:"reports"`
@@ -116,4 +118,41 @@ type Performance struct {
 	Progression   float64 `json:"progression"`   // 开荒表现
 	Mechanics     float64 `json:"mechanics"`     // 机制处理
 	Potential     float64 `json:"potential"`     // 潜力值
+}
+
+// RadarSyncTask username+server 的异步同步任务队列（持久化）。
+type RadarSyncTask struct {
+	ID          uint       `gorm:"primaryKey" json:"id"`
+	TaskKey     string     `gorm:"size:180;uniqueIndex" json:"task_key"`
+	Username    string     `gorm:"size:100;index" json:"username"`
+	Server      string     `gorm:"size:50;index" json:"server"`
+	Region      string     `gorm:"size:20;index" json:"region"`
+	Status      string     `gorm:"size:20;index" json:"status"`
+	LastError   string     `gorm:"type:text" json:"last_error"`
+	RetryCount  int        `json:"retry_count"`
+	RequestedAt time.Time  `gorm:"index" json:"requested_at"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	FinishedAt  *time.Time `json:"finished_at,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+}
+
+// ClusterHostEndpoint 集群 host 与 control endpoint 映射（持久化）。
+type ClusterHostEndpoint struct {
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	Host            string    `gorm:"size:255;uniqueIndex" json:"host"`
+	ControlEndpoint string    `gorm:"column:control_endpoint;size:1024" json:"control_endpoint"`
+	LastSeenAt      time.Time `gorm:"column:last_seen_at;index" json:"last_seen_at"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+// ClusterReportHost reportCode 与 host 映射（持久化）。
+type ClusterReportHost struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	ReportCode     string    `gorm:"column:report_code;size:80;uniqueIndex" json:"report_code"`
+	Host           string    `gorm:"size:255;index" json:"host"`
+	LastAssignedAt time.Time `gorm:"column:last_assigned_at;index" json:"last_assigned_at"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }

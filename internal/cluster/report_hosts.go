@@ -13,17 +13,20 @@ import (
 )
 
 const (
-	defaultScanDir = "./downloads/fflogsx"
+	defaultScanDir             = "./downloads/fflogsx"
+	defaultClusterControlPort  = "22027"
+	defaultControlEndpointPath = "/api/cluster/reports/execute"
 )
 
 var reportCodeRegexp = regexp.MustCompile(`^[A-Za-z0-9_-]{4,64}$`)
 
 // ReportHostRegistry 维护 reportCode -> host 的映射，并带有按负载分配能力。
 type ReportHostRegistry struct {
-	mu         sync.RWMutex
-	reportHost map[string]string
-	hostLoad   map[string]int
-	hostSeenAt map[string]time.Time
+	mu                  sync.RWMutex
+	reportHost          map[string]string
+	hostLoad            map[string]int
+	hostSeenAt          map[string]time.Time
+	hostControlEndpoint map[string]string
 }
 
 var globalReportHostRegistry = NewReportHostRegistry()
@@ -31,9 +34,10 @@ var globalReportHostRegistry = NewReportHostRegistry()
 // NewReportHostRegistry 创建一个新的 ReportHostRegistry 实例。
 func NewReportHostRegistry() *ReportHostRegistry {
 	return &ReportHostRegistry{
-		reportHost: make(map[string]string),
-		hostLoad:   make(map[string]int),
-		hostSeenAt: make(map[string]time.Time),
+		reportHost:          make(map[string]string),
+		hostLoad:            make(map[string]int),
+		hostSeenAt:          make(map[string]time.Time),
+		hostControlEndpoint: make(map[string]string),
 	}
 }
 
@@ -68,6 +72,68 @@ func ReportsScanDir() string {
 		return raw
 	}
 	return defaultScanDir
+}
+
+func ClusterControlPort() string {
+	if raw := strings.TrimSpace(os.Getenv("CLUSTER_CONTROL_PORT")); raw != "" {
+		return strings.TrimPrefix(raw, ":")
+	}
+	if raw := strings.TrimSpace(os.Getenv("MONITOR_PORT")); raw != "" {
+		return strings.TrimPrefix(raw, ":")
+	}
+	return defaultClusterControlPort
+}
+
+func NormalizeControlEndpoint(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return ""
+	}
+
+	if !strings.Contains(v, "://") {
+		v = "http://" + v
+	}
+
+	u, err := url.Parse(v)
+	if err != nil {
+		return ""
+	}
+	if strings.TrimSpace(u.Host) == "" {
+		return ""
+	}
+
+	u.Scheme = strings.ToLower(strings.TrimSpace(u.Scheme))
+	if u.Scheme == "" {
+		u.Scheme = "http"
+	}
+	u.Fragment = ""
+	u.RawQuery = ""
+	if strings.TrimSpace(u.Path) == "" || u.Path == "/" {
+		u.Path = defaultControlEndpointPath
+	}
+	if !strings.HasPrefix(u.Path, "/") {
+		u.Path = "/" + u.Path
+	}
+	u.RawPath = ""
+	return strings.TrimSpace(u.String())
+}
+
+func LocalControlEndpoint() string {
+	if endpoint := NormalizeControlEndpoint(os.Getenv("CLUSTER_CONTROL_ENDPOINT")); endpoint != "" {
+		return endpoint
+	}
+
+	host := NormalizeHost(os.Getenv("CLUSTER_CONTROL_HOST"))
+	if host == "" {
+		host = LocalHost()
+	}
+
+	u := url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(host, ClusterControlPort()),
+		Path:   defaultControlEndpointPath,
+	}
+	return u.String()
 }
 
 func NormalizeReportCode(raw string) string {
@@ -180,6 +246,14 @@ func (r *ReportHostRegistry) touchHostLocked(host string, now time.Time) {
 	}
 }
 
+func (r *ReportHostRegistry) setControlEndpointLocked(host, endpoint string) {
+	normalized := NormalizeControlEndpoint(endpoint)
+	if normalized == "" {
+		return
+	}
+	r.hostControlEndpoint[host] = normalized
+}
+
 // SeedHostReportsFromDir 扫描目录下的报告名并注册到 host。
 func (r *ReportHostRegistry) SeedHostReportsFromDir(host, dirPath string) (int, error) {
 	h := NormalizeHost(host)
@@ -197,6 +271,10 @@ func (r *ReportHostRegistry) SeedHostReportsFromDir(host, dirPath string) (int, 
 }
 
 func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) (added int, total int) {
+	return r.RegisterHostReportsWithEndpoint(host, reports, "")
+}
+
+func (r *ReportHostRegistry) RegisterHostReportsWithEndpoint(host string, reports []string, controlEndpoint string) (added int, total int) {
 	h := NormalizeHost(host)
 	if h == "" {
 		return 0, len(r.reportHost)
@@ -204,6 +282,7 @@ func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) 
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.setControlEndpointLocked(h, controlEndpoint)
 	r.touchHostLocked(h, time.Now())
 
 	for _, raw := range reports {
@@ -223,6 +302,11 @@ func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) 
 
 // HeartbeatHost 仅刷新 host 存活时间，不改动 reports 映射。
 func (r *ReportHostRegistry) HeartbeatHost(host string) bool {
+	return r.HeartbeatHostWithEndpoint(host, "")
+}
+
+// HeartbeatHostWithEndpoint 刷新 host 存活时间；如果携带了 endpoint 则一并更新。
+func (r *ReportHostRegistry) HeartbeatHostWithEndpoint(host, controlEndpoint string) bool {
 	h := NormalizeHost(host)
 	if h == "" {
 		return false
@@ -230,8 +314,70 @@ func (r *ReportHostRegistry) HeartbeatHost(host string) bool {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.setControlEndpointLocked(h, controlEndpoint)
 	r.touchHostLocked(h, time.Now())
 	return true
+}
+
+// RestoreHostWithEndpoint 从持久化状态恢复 host 的 seenAt 与 endpoint。
+func (r *ReportHostRegistry) RestoreHostWithEndpoint(host, controlEndpoint string, seenAt time.Time) bool {
+	h := NormalizeHost(host)
+	if h == "" {
+		return false
+	}
+	if seenAt.IsZero() {
+		seenAt = time.Now()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.setControlEndpointLocked(h, controlEndpoint)
+	existingSeen, ok := r.hostSeenAt[h]
+	if !ok || existingSeen.IsZero() || seenAt.After(existingSeen) {
+		r.hostSeenAt[h] = seenAt
+	}
+	if _, ok := r.hostLoad[h]; !ok {
+		r.hostLoad[h] = 0
+	}
+	return true
+}
+
+func (r *ReportHostRegistry) ResolveHostControlEndpoint(host string) (string, bool) {
+	h := NormalizeHost(host)
+	if h == "" {
+		return "", false
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	endpoint, ok := r.hostControlEndpoint[h]
+	if !ok || strings.TrimSpace(endpoint) == "" {
+		return "", false
+	}
+	return endpoint, true
+}
+
+func (r *ReportHostRegistry) ResolveDispatchExecuteURL(host, fallbackPort string) string {
+	h := NormalizeHost(host)
+	if h == "" {
+		return ""
+	}
+
+	if endpoint, ok := r.ResolveHostControlEndpoint(h); ok {
+		return endpoint
+	}
+
+	port := strings.TrimSpace(strings.TrimPrefix(fallbackPort, ":"))
+	if port == "" {
+		port = ClusterControlPort()
+	}
+	u := url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(h, port),
+		Path:   defaultControlEndpointPath,
+	}
+	return u.String()
 }
 
 func (r *ReportHostRegistry) ResolveHost(reportCode string) (string, bool) {
@@ -243,6 +389,26 @@ func (r *ReportHostRegistry) ResolveHost(reportCode string) (string, bool) {
 	defer r.mu.RUnlock()
 	host, ok := r.reportHost[code]
 	return host, ok
+}
+
+// RestoreReportHost 从持久化状态恢复 reportCode -> host 映射。
+func (r *ReportHostRegistry) RestoreReportHost(reportCode, host string) bool {
+	code := NormalizeReportCode(reportCode)
+	h := NormalizeHost(host)
+	if code == "" || h == "" {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.reportHost[code] = h
+	if _, ok := r.hostLoad[h]; !ok {
+		r.hostLoad[h] = 0
+	}
+	if _, ok := r.hostSeenAt[h]; !ok {
+		r.hostSeenAt[h] = time.Now()
+	}
+	return true
 }
 
 // AssignHostForReport 若 report 已有映射优先复用，否则按当前 host 负载最小策略分配。
@@ -313,6 +479,7 @@ func (r *ReportHostRegistry) EvictExpiredHosts(ttl time.Duration) ([]string, int
 	for host := range expiredSet {
 		delete(r.hostSeenAt, host)
 		delete(r.hostLoad, host)
+		delete(r.hostControlEndpoint, host)
 	}
 
 	removedReports := 0
@@ -356,6 +523,19 @@ func (r *ReportHostRegistry) SnapshotSeenAt() map[string]string {
 			continue
 		}
 		out[host] = ts.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
+func (r *ReportHostRegistry) SnapshotControlEndpoints() map[string]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]string, len(r.hostControlEndpoint))
+	for host, endpoint := range r.hostControlEndpoint {
+		if strings.TrimSpace(endpoint) == "" {
+			continue
+		}
+		out[host] = endpoint
 	}
 	return out
 }

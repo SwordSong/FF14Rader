@@ -156,6 +156,11 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 			fightCount := len(grouped[code])
 			assigned := cluster.GlobalReportHostRegistry().AssignHostForReport(code, fightCount, candidateHosts)
 			reportAssignedHost[code] = assigned
+			if assigned != "" {
+				if _, persistMapErr := cluster.PersistReportHostMappings(assigned, []string{code}, time.Now()); persistMapErr != nil {
+					log.Printf("[CLUSTER] 持久化调度映射失败 report=%s host=%s err=%v", code, assigned, persistMapErr)
+				}
+			}
 			if assigned == "" {
 				log.Printf("[CLUSTER] 报告 %s 未匹配到可用 host，回退本地执行", code)
 				continue
@@ -299,10 +304,45 @@ WHERE r.player_id = ?
 
 func getV1ApiKey() (string, error) {
 	key := strings.TrimSpace(os.Getenv("FFLOGS_V1_API_KEY"))
-	if key == "" {
-		return "", fmt.Errorf("missing FFLOGS_V1_API_KEY env")
+	if key != "" {
+		return key, nil
 	}
-	return key, nil
+
+	pooled, err := loadV1APIKeyFromKeyPool()
+	if err == nil && strings.TrimSpace(pooled) != "" {
+		return pooled, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("missing FFLOGS_V1_API_KEY env and keypool lookup failed: %v", err)
+	}
+	return "", fmt.Errorf("missing FFLOGS_V1_API_KEY env and no usable keypool key")
+}
+
+func loadV1APIKeyFromKeyPool() (string, error) {
+	var row struct {
+		ID    int    `gorm:"column:id"`
+		APIID string `gorm:"column:api_id"`
+	}
+
+	err := db.DB.Raw(`
+SELECT id, api_id
+FROM fflogskey
+WHERE ver = 1
+  AND COALESCE(api_id, '') <> ''
+ORDER BY COALESCE(used, 0) ASC, id ASC
+LIMIT 1
+`).Scan(&row).Error
+	if err != nil {
+		return "", err
+	}
+
+	apiKey := strings.TrimSpace(row.APIID)
+	if row.ID <= 0 || apiKey == "" {
+		return "", fmt.Errorf("no usable v1 api key in keypool(fflogskey)")
+	}
+
+	_ = db.DB.Exec(`UPDATE fflogskey SET used = COALESCE(used, 0) + 1 WHERE id = ?`, row.ID).Error
+	return apiKey, nil
 }
 
 func getV1BaseURL() string {
@@ -828,16 +868,6 @@ func splitMasterID(masterID string) (string, int, bool) {
 	return code, fightID, true
 }
 
-func clusterControlPort() string {
-	if raw := strings.TrimSpace(os.Getenv("CLUSTER_CONTROL_PORT")); raw != "" {
-		return raw
-	}
-	if raw := strings.TrimSpace(os.Getenv("MONITOR_PORT")); raw != "" {
-		return raw
-	}
-	return "22027"
-}
-
 func (s *SyncManager) dispatchReportsToHost(ctx context.Context, host string, playerID uint, reportCodes []string) error {
 	normalizedHost := cluster.NormalizeHost(host)
 	if normalizedHost == "" {
@@ -862,7 +892,10 @@ func (s *SyncManager) dispatchReportsToHost(ctx context.Context, host string, pl
 		return err
 	}
 
-	urlText := fmt.Sprintf("http://%s:%s/api/cluster/reports/execute", normalizedHost, clusterControlPort())
+	urlText := cluster.GlobalReportHostRegistry().ResolveDispatchExecuteURL(normalizedHost, cluster.ClusterControlPort())
+	if strings.TrimSpace(urlText) == "" {
+		return fmt.Errorf("resolve dispatch endpoint failed for host=%s", normalizedHost)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlText, bytes.NewReader(body))
 	if err != nil {
 		return err

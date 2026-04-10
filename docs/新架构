@@ -1,0 +1,112 @@
+
+新架构（按当前代码修订）
+
+更新时间：2026-04-11
+
+一、角色与启动（已实现）
+1. 进程支持三种运行方式：
+	- go run main.go --server：仅运行主服务（HTTP API + 集群管理）
+	- go run main.go --client：仅运行客户端（注册心跳 + 拉任务 + 下载解析）
+	- 不带参数：默认 server + client 同时运行
+2. server 主要职责：节点注册管理、任务分发 API、任务状态管理。
+3. client 主要职责：本地 report 扫描上报、向主节点心跳、主动 claim 任务并执行。
+4. 现状注意：若只运行 --server（不带 --client），/api/ff14/rader 在命中 24h 图片缓存时可直接返回；未命中时会返回 sync manager not initialized and no fresh radar cache。
+
+二、主服务端流程（当前实现）
+1. /api/ff14/rader 接收 username + server（GET query）。
+2. rader 入口先检查 players.pichash + players.pic_updated_at：
+	- 若图片存在且 pic_updated_at 未超过 24h，直接返回图片绝对路径（cacheHit=true）。
+3. 若未命中缓存，且 SyncManager 可用，请求会写入持久化任务队列 radar_sync_tasks（按 username+server 去重）。
+4. /api/ff14/rader 在缓存未命中时返回 HTTP 202（pending/running），不再同步阻塞等待。
+5. 后台 worker 轮询消费 radar_sync_tasks：
+	- 执行 StartIncrementalSync。
+	- 同步完成后生成雷达图（hash 文件名）并回写 players.pichash、players.pic_updated_at。
+	- 更新任务状态为 done/failed（含 last_error、retry_count）。
+6. 可通过 /api/ff14/rader/status?username=...&server=... 查询任务状态（idle/pending/running/done/failed）。
+7. 集群调度默认使用 pull 模式：
+	- 主服务对外提供 /api/cluster/tasks/claim、/api/cluster/tasks/ack、/api/cluster/tasks。
+	- 任务在主服务内存队列 DispatchTaskQueue 中维护（状态：pending/claimed/done）。
+8. server 已增加预热循环（默认每 60 秒）：
+	- 从 fight_sync_maps 扫描 downloaded=true 且 parsed_done=false 的记录。
+	- 按 playerID + reportCode 去重后重建 DispatchTaskQueue。
+	- 若 reportCode 缺失 host 映射，会从在线候选节点自动分配（基础补偿）；若无候选节点则继续统计 missingHost。
+9. 节点注册管理：
+	- /api/cluster/reports/register：上报 reportCode 与 host 归属，同时可上报 controlEndpoint。
+	- /api/cluster/reports/heartbeat：维持节点存活，并可刷新 controlEndpoint。
+	- register/heartbeat 会同步写入 cluster_host_endpoints（host、control_endpoint、last_seen_at）。
+	- reportCode -> host 映射会写入 cluster_report_hosts（report_code、host、last_assigned_at）。
+	- server 启动后执行过期节点剔除循环。
+10. 调度策略结论（建议）：
+	- 默认继续使用 pull（客户端主动 claim 任务）。
+	- push（服务器主动调用客户端接口）可作为兜底通道，不作为主链路。
+	- 原因：pull 对 NAT/跨网段更友好，失败重试与负载控制更简单，和当前实现一致。
+
+三、客户端流程（当前实现）
+1. 启动后扫描本地 REPORTS_SCAN_DIR，将 reportCode:host 关系注册到主服务。
+2. 启动自动注册 + 心跳（依赖 CLUSTER_MASTER_ENDPOINT）。
+	- 注册/心跳会携带 controlEndpoint（优先取 CLUSTER_CONTROL_ENDPOINT，默认推导为 http://<host>:<port>/api/cluster/reports/execute）。
+3. 启动 StartClusterTaskPullLoop：
+	- 周期性调用 /api/cluster/tasks/claim 拉取任务。
+	- 对每个任务执行 ExecuteAssignedReports(playerID, reports)。
+	- 完成后调用 /api/cluster/tasks/ack 回执成功/失败。
+4. ExecuteAssignedReports 仅处理本次分配的 reportCodes，并仅对这些报告触发评分，避免跨节点读取不存在文件。
+5. 主服务提供 /api/ff14/rader/status，用于观察 username+server 异步任务状态（idle/pending/running/done/failed）。
+
+三点五、客户端流程补充（已实现第一阶段）
+1. 客户端注册时除 host 外，已支持上报自己的可调用接口地址，例如：
+	- controlEndpoint: http://<client-host>:<port>/api/cluster/reports/execute
+	- 或 callbackBaseURL: http://<client-host>:<port>
+2. 服务器已保存 host -> endpoint 映射，并在 push 下发时优先使用 endpoint（无 endpoint 时回退 host+port 拼接）。
+	- 映射会持久化到 cluster_host_endpoints，并在 server 启动时回填到内存 registry。
+3. reportCode -> host 映射已持久化到 cluster_report_hosts：
+	- 来源包括 register 上报、调度分配、预热补偿自动分配。
+	- server 启动时会在恢复 host->endpoint 后回填 report->host 到内存 registry。
+4. 任务协议当前仍以 playerID + reportCodes 为主；后续可扩展为两类 payload：
+	- username + server + region（用于触发 V2 查询）
+	- playerID + reportCodes（用于下载解析任务）
+5. 主链路仍推荐 pull：上述 endpoint 当前用于 push 兜底和兼容场景。
+
+四、数据与状态（当前实现）
+1. “未完成解析”主要由数据库状态表达：
+	- fight_sync_maps.downloaded
+	- fight_sync_maps.parsed_done
+	- fight_sync_maps.scored_at
+2. players 已新增图片缓存字段：
+	- pichash（雷达图片 hash）
+	- pic_updated_at（图片生成时间）
+3. username+server 异步任务已持久化到 radar_sync_tasks：
+	- 关键字段：task_key、status、requested_at、started_at、finished_at、last_error、retry_count。
+4. 主服务内存任务队列按 playerID + reportCode 维度去重并发放任务。
+5. reports.downloaded 通过与 fight_sync_maps 对齐后回填为 true。
+6. server 通过预热循环从 fight_sync_maps 重建未完成解析任务，缓解重启后内存队列丢失。
+7. host->endpoint 映射已持久化到 cluster_host_endpoints（含 last_seen_at）。
+8. report->host 映射已持久化到 cluster_report_hosts（含 last_assigned_at）。
+
+五、与原草案的差异（当前未实现）
+1. “username/server 用户请求字典”已实现持久化第一版：
+	- 已实现：radar_sync_tasks 持久化队列、异步 worker、状态查询接口。
+	- 当前限制：worker 运行依赖 SyncManager（即当前进程需具备 client 能力）。
+2. “用户未解析 code 字典（player -> code -> fightIDs）”未完整实现为常驻结构：
+	- 现有实现是 DB 状态 + DispatchTaskQueue 的组合。
+	- 已实现：server 预热循环可从 fight_sync_maps 扫描并重建任务队列。
+	- 已实现：host 缺失记录的基础自动补偿（从在线候选节点自动分配）。
+	- 已实现：report->host 映射持久化与启动回填，降低重启冷启动影响。
+	- 仍可优化：补偿策略目前不感知“哪个节点已拥有本地事件文件”，后续可加入文件可达性/命中率权重。
+3. “V1/V2 key 都来自 fflogskey + keypool”未完全实现：
+	- 术语统一：keypool 就是 fflogskey 表（后续文档统一写 keypool(fflogskey)）。
+	- V2：当前使用 FFLOGS_CLIENT_ID/FFLOGS_CLIENT_SECRET（OAuth2）。
+	- V1 下载主链路：优先读取 FFLOGS_V1_API_KEY；为空时回退 keypool(fflogskey ver=1) 并累加 used。
+	- 仍未统一：V2 尚未接入 keypool 轮换。
+4. “注册时上报客户端接口 + 服务器主动下发 username/server 或 playerID+code”部分实现：
+	- 已实现：注册/心跳可携带 controlEndpoint，host->endpoint 映射已建立并持久化到数据库，push 下发优先走 endpoint。
+	- 已实现：server 启动时会回填持久化 host->endpoint 和 report->host 映射到内存 registry。
+	- 未实现：username/server 任务下发协议未接入。
+5. 图片返回方式当前为本机绝对路径：
+	- 适合同机部署调试；跨机器/前端直连场景还需静态文件服务或下载接口。
+
+六、下一步建议（按优先级）
+1. 增强预热补偿策略：引入“节点本地文件可达性/命中率”权重，减少跨节点回退。
+2. 增加 username+server 任务下发协议（push 兜底场景）；默认调度仍走 pull。
+3. 将 keypool(fflogskey) 接入 V2 客户端凭证选择，完成 V1/V2 统一密钥轮换策略。
+4. 增加图片访问层（静态文件服务或图片下载 API），替代纯绝对路径返回。
+说明：持久化映射清理策略暂不实施，当前不做删除。

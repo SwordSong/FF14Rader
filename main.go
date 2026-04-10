@@ -40,6 +40,19 @@ func main() {
 
 	// server 角色：仅做分发与集群管理。
 	if runServer {
+		restoredEndpoints, restoreEndpointsErr := cluster.RestorePersistedHostEndpoints(cluster.GlobalReportHostRegistry())
+		if restoreEndpointsErr != nil {
+			log.Printf("[CLUSTER] 恢复持久化 host->endpoint 映射失败: %v", restoreEndpointsErr)
+		} else {
+			log.Printf("[CLUSTER] 已恢复持久化 host->endpoint 映射 count=%d", restoredEndpoints)
+		}
+
+		restoredReports, restoreReportsErr := cluster.RestorePersistedReportHosts(cluster.GlobalReportHostRegistry())
+		if restoreReportsErr != nil {
+			log.Printf("[CLUSTER] 恢复持久化 report->host 映射失败: %v", restoreReportsErr)
+		} else {
+			log.Printf("[CLUSTER] 已恢复持久化 report->host 映射 count=%d", restoredReports)
+		}
 		cluster.StartRegistryEvictLoop(cluster.GlobalReportHostRegistry())
 	}
 
@@ -68,6 +81,12 @@ func main() {
 	service := &appapi.Service{
 		SyncManager:        syncManager,
 		EnableDashboardAPI: false,
+	}
+	if runServer {
+		service.StartDispatchTaskWarmupLoop()
+	}
+	if runServer && syncManager != nil {
+		service.StartRadarTaskWorker()
 	}
 
 	log.Println("FF14Rader 服务正常运行中...")

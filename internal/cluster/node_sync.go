@@ -23,12 +23,14 @@ const (
 )
 
 type masterRegisterPayload struct {
-	Host    string   `json:"host"`
-	Reports []string `json:"reports"`
+	Host            string   `json:"host"`
+	Reports         []string `json:"reports"`
+	ControlEndpoint string   `json:"controlEndpoint,omitempty"`
 }
 
 type masterHeartbeatPayload struct {
-	Host string `json:"host"`
+	Host            string `json:"host"`
+	ControlEndpoint string `json:"controlEndpoint,omitempty"`
 }
 
 func envDurationSeconds(key string, fallback time.Duration) time.Duration {
@@ -136,6 +138,7 @@ func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
 
 	master := ClusterMasterEndpoint()
 	host := LocalHost()
+	controlEndpoint := LocalControlEndpoint()
 	scanDir := ReportsScanDir()
 	heartbeatInterval := ClusterHeartbeatInterval()
 	if heartbeatInterval < 3*time.Second {
@@ -153,15 +156,15 @@ func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
 				log.Printf("[CLUSTER] 自动注册读取本地 reports 失败 host=%s dir=%s err=%v", host, scanDir, err)
 				return
 			}
-			if err := postRegisterToMaster(registerClient, master, host, reports); err != nil {
+			if err := postRegisterToMaster(registerClient, master, host, reports, controlEndpoint); err != nil {
 				log.Printf("[CLUSTER] 自动注册失败 master=%s host=%s reports=%d err=%v", master, host, len(reports), err)
 				return
 			}
-			log.Printf("[CLUSTER] 自动注册成功 master=%s host=%s reports=%d", master, host, len(reports))
+			log.Printf("[CLUSTER] 自动注册成功 master=%s host=%s reports=%d endpoint=%s", master, host, len(reports), controlEndpoint)
 		}
 
 		heartbeatOnce := func() error {
-			return postHeartbeatToMaster(heartbeatClient, master, host)
+			return postHeartbeatToMaster(heartbeatClient, master, host, controlEndpoint)
 		}
 
 		if waitErr := waitMasterReady(registerClient, master, registerWait); waitErr != nil {
@@ -178,7 +181,7 @@ func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
 				registerOnce()
 				continue
 			}
-			registry.HeartbeatHost(host)
+			registry.HeartbeatHostWithEndpoint(host, controlEndpoint)
 		}
 	}()
 }
@@ -209,10 +212,11 @@ func waitMasterReady(client *http.Client, masterEndpoint string, timeout time.Du
 	}
 }
 
-func postRegisterToMaster(client *http.Client, masterEndpoint, host string, reports []string) error {
+func postRegisterToMaster(client *http.Client, masterEndpoint, host string, reports []string, controlEndpoint string) error {
 	payload := masterRegisterPayload{
-		Host:    host,
-		Reports: reports,
+		Host:            host,
+		Reports:         reports,
+		ControlEndpoint: NormalizeControlEndpoint(controlEndpoint),
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -237,8 +241,8 @@ func postRegisterToMaster(client *http.Client, masterEndpoint, host string, repo
 	return nil
 }
 
-func postHeartbeatToMaster(client *http.Client, masterEndpoint, host string) error {
-	payload := masterHeartbeatPayload{Host: host}
+func postHeartbeatToMaster(client *http.Client, masterEndpoint, host, controlEndpoint string) error {
+	payload := masterHeartbeatPayload{Host: host, ControlEndpoint: NormalizeControlEndpoint(controlEndpoint)}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
