@@ -14,13 +14,14 @@ type Config struct {
 	MonitorPort        string // 监控 API 端口
 }
 
+// LoadConfig 获取配置。
 func LoadConfig() *Config {
 	// 尝试从当前目录、父目录或根目录加载 .env
 	_ = godotenv.Load()             // current dir
 	_ = godotenv.Load("../.env")    // parent
 	_ = godotenv.Load("../../.env") // root (from cmd/xxx/)
 
-	// if err := godotenv.Load(); err != nil {
+	// if 返回if信息。
 	// 	log.Println("No .env file found, reading from environment variables")
 	// }
 
@@ -33,6 +34,7 @@ func LoadConfig() *Config {
 	}
 }
 
+// getEnvOrDefault 获取环境变量或默认值。
 func getEnvOrDefault(key, fallback string) string {
 	val := os.Getenv(key)
 	if val == "" {

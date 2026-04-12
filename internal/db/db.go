@@ -15,6 +15,7 @@ var DB *gorm.DB
 
 const currentDBSchemaVersion = "2026-04-07-v10"
 
+// InitDB 初始化数据库连接、读写分离与表结构迁移。
 func InitDB(writeDSN, readDSN string) {
 	var err error
 
@@ -365,6 +366,7 @@ $$;`)
 	log.Println("数据库表结构迁移成功。")
 }
 
+// shouldSkipMigrations 判断当前数据库是否应跳过迁移。
 func shouldSkipMigrations(db *gorm.DB) (bool, string) {
 	if err := ensureSchemaMetaTable(db); err != nil {
 		log.Printf("[WARN] 初始化 schema_meta 失败，将使用结构探测: %v", err)
@@ -387,6 +389,7 @@ func shouldSkipMigrations(db *gorm.DB) (bool, string) {
 	return false, "需要执行迁移"
 }
 
+// ensureSchemaMetaTable 确保数据库版本元信息表存在。
 func ensureSchemaMetaTable(db *gorm.DB) error {
 	return db.Exec(`CREATE TABLE IF NOT EXISTS schema_meta (
 		meta_key varchar(100) PRIMARY KEY,
@@ -395,6 +398,7 @@ func ensureSchemaMetaTable(db *gorm.DB) error {
 	);`).Error
 }
 
+// getSchemaVersion 读取当前数据库结构版本号。
 func getSchemaVersion(db *gorm.DB) (string, bool, error) {
 	type schemaMetaRow struct {
 		MetaValue string
@@ -410,6 +414,7 @@ func getSchemaVersion(db *gorm.DB) (string, bool, error) {
 	return row.MetaValue, true, nil
 }
 
+// setSchemaVersion 写入当前数据库结构版本号。
 func setSchemaVersion(db *gorm.DB, version string) error {
 	return db.Exec(`
 		INSERT INTO schema_meta (meta_key, meta_value, updated_at)
@@ -419,6 +424,7 @@ func setSchemaVersion(db *gorm.DB, version string) error {
 	`, version).Error
 }
 
+// schemaLooksCurrent 判断数据库结构是否已满足当前版本要求。
 func schemaLooksCurrent(db *gorm.DB) bool {
 	requiredTables := []string{"players", "reports", "fight_sync_maps"}
 	for _, table := range requiredTables {
@@ -459,6 +465,7 @@ func schemaLooksCurrent(db *gorm.DB) bool {
 	return indexExists(db, "reports", "idx_reports_player_source")
 }
 
+// tableExists 判断表是否满足条件。
 func tableExists(db *gorm.DB, tableName string) bool {
 	var exists bool
 	if err := db.Raw(`
@@ -473,6 +480,7 @@ func tableExists(db *gorm.DB, tableName string) bool {
 	return exists
 }
 
+// columnExists 判断列是否满足条件。
 func columnExists(db *gorm.DB, tableName, columnName string) bool {
 	var exists bool
 	if err := db.Raw(`
@@ -487,6 +495,7 @@ func columnExists(db *gorm.DB, tableName, columnName string) bool {
 	return exists
 }
 
+// indexExists 判断索引是否满足条件。
 func indexExists(db *gorm.DB, tableName, indexName string) bool {
 	var exists bool
 	if err := db.Raw(`

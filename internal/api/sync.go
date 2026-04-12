@@ -34,22 +34,17 @@ type scoreTask struct {
 	fightID    int
 }
 
+// NewSyncManager 创建一个新的同步管理器
 func NewSyncManager(client *FFLogsClient) *SyncManager {
 	return &SyncManager{client: client, scorer: scoring.NewServiceFromEnv()}
 }
 
-// StartIncrementalSync 开始增量同步
+// StartIncrementalSync 启动增量同步流程，包含 V2 查询、数据落库、V1 下载和能力刷新。
 func (s *SyncManager) StartIncrementalSync(ctx context.Context, name, server, region string) error {
-	log.Printf("开始同步玩家 [%s-%s] 的数据...", name, server)
-	region = "CN"
-	newlyCreated := false
-
-	resolvedID, created, err := ensurePlayerID(name, server, region)
+	playerID, username, serverName, regionName, newlyCreated, err := s.resolveOrCreateSyncPlayer(name, server, region)
 	if err != nil {
-		return fmt.Errorf("resolve player failed: %v", err)
+		return err
 	}
-	playerID := resolvedID
-	newlyCreated = created
 
 	allowV2Query, reason, err := shouldRunV2ReportQuery(playerID, newlyCreated)
 	if err != nil {
@@ -60,9 +55,37 @@ func (s *SyncManager) StartIncrementalSync(ctx context.Context, name, server, re
 		if _, err := s.downloadV1Reports(ctx, playerID); err != nil {
 			return err
 		}
-		return s.refreshPlayerOutputAbilityFromLogs(ctx, playerID, name, server, region)
+		return s.refreshPlayerOutputAbilityFromLogs(ctx, playerID, username, serverName, regionName)
 	}
 	log.Printf("[INFO] 执行 V2 reports 查询: %s", reason)
+
+	return s.executeV2ReportsQuery(ctx, playerID, username, serverName, regionName)
+}
+
+// resolveOrCreateSyncPlayer 解析玩家信息，若数据库中不存在则创建新玩家记录，并返回玩家 ID 和相关信息。
+func (s *SyncManager) resolveOrCreateSyncPlayer(name, server, region string) (uint, string, string, string, bool, error) {
+	username := strings.TrimSpace(name)
+	serverName := strings.TrimSpace(server)
+	regionName := strings.TrimSpace(region)
+	if regionName == "" {
+		regionName = "CN"
+	}
+	log.Printf("开始同步玩家 [%s-%s] 的数据...", username, serverName)
+
+	playerID, _, newlyCreated, err := EnsurePlayerID(username, serverName, regionName)
+	if err != nil {
+		return 0, "", "", "", false, fmt.Errorf("resolve player failed: %v", err)
+	}
+	if playerID <= 0 {
+		return 0, "", "", "", false, fmt.Errorf("resolve player failed: invalid player id %d", playerID)
+	}
+
+	return uint(playerID), username, serverName, regionName, newlyCreated, nil
+}
+
+// executeV2ReportsQuery 执行 V2 报告分页查询、落库，并触发后续 V1 下载与能力刷新。
+func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, name, server, region string) error {
+	serverSlug := server
 
 	// 确保去重键的唯一索引存在（避免并发创建重复 master 行）
 	// (name, timestamp) 足以区分同一场战斗
@@ -96,7 +119,6 @@ func (s *SyncManager) StartIncrementalSync(ctx context.Context, name, server, re
 	}
 
 	// 2. 构造 GraphQL 查询（分页 recentReports），向前拉取至截止日期（默认近 90 天）
-	serverSlug := server
 	limit := 20
 	cutoff := time.Now().AddDate(0, -3, 0).UnixMilli()
 
@@ -312,6 +334,7 @@ func (s *SyncManager) StartIncrementalSync(ctx context.Context, name, server, re
 	return nil
 }
 
+// selfHealReportDownloadStatus 自检并修复战斗与报告下载状态不一致问题。
 func (s *SyncManager) selfHealReportDownloadStatus(playerID uint) error {
 	var pendingFights int64
 	if err := db.DB.Model(&models.FightSyncMap{}).
@@ -337,10 +360,12 @@ func (s *SyncManager) selfHealReportDownloadStatus(playerID uint) error {
 	return nil
 }
 
+// scorePendingDownloadedFights 对已下载但未完成评分的战斗执行补评分。
 func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID uint) error {
 	return s.scorePendingDownloadedFightsByReports(ctx, playerID, nil)
 }
 
+// scorePendingDownloadedFightsByReports 按可选报告范围筛选并并发执行待评分战斗。
 func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context, playerID uint, reportCodes []string) error {
 	if s.scorer == nil {
 		return nil
@@ -494,6 +519,7 @@ func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context,
 	return nil
 }
 
+// getScoreConcurrency 根据环境变量和评分服务建议值计算评分并发数。
 func getScoreConcurrency(scorer *scoring.Service) int {
 	const defaultConcurrency = 2
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_SCORE_CONCURRENCY")); raw != "" {
@@ -538,6 +564,7 @@ func getScoreConcurrency(scorer *scoring.Service) int {
 	return defaultConcurrency
 }
 
+// markFightParsedDoneIdempotent 幂等地将战斗标记为已解析完成。
 func markFightParsedDoneIdempotent(mappingID uint) (bool, error) {
 	res := db.DB.Model(&models.FightSyncMap{}).
 		Where("id = ? AND parsed_done = ?", mappingID, false).
@@ -548,6 +575,7 @@ func markFightParsedDoneIdempotent(mappingID uint) (bool, error) {
 	return res.RowsAffected > 0, nil
 }
 
+// markFightSkippedNoMatch 将无匹配角色的战斗标记为已处理并写入零分占位结果。
 func markFightSkippedNoMatch(mappingID uint) error {
 	var row models.FightSyncMap
 	if err := db.DB.Select("job").Where("id = ?", mappingID).First(&row).Error; err != nil {
@@ -579,6 +607,7 @@ func markFightSkippedNoMatch(mappingID uint) error {
 		}).Error
 }
 
+// processSyncData 处理同步响应数据并提取报告列表。
 func (s *SyncManager) processSyncData(playerID uint, charName string, data map[string]interface{}) error {
 	reports, _, err := extractReportsFromData(data)
 	if err != nil {
@@ -589,7 +618,7 @@ func (s *SyncManager) processSyncData(playerID uint, charName string, data map[s
 	return s.processSyncReports(playerID, charName, reports)
 }
 
-// processSyncReports 处理报告列表数据，构建战斗映射并存储 fight_sync_maps，同时记录 reports 以便后续解析和 V1 下载
+// processSyncReports 处理报告列表并构建战斗映射写入数据库。
 func (s *SyncManager) processSyncReports(playerID uint, charName string, reports []interface{}) error {
 	if len(reports) == 0 {
 		return nil
@@ -784,13 +813,13 @@ func (s *SyncManager) processSyncReports(playerID uint, charName string, reports
 				}
 
 				// eventsRaw, errEvents := s.fetchFightEvents(reportCode, master.fightID, master.fStart, master.fEnd)
-				// if errEvents != nil {
+				// if 返回if信息。
 				// 	log.Printf("[WARN] 拉取事件失败，略过 events 缓存: %v", errEvents)
 				// }
 
-				// combinedRaw := rawData
-				// if len(eventsRaw) > 0 {
-				// 	combinedRaw = mergeEventPayload(rawData, eventsRaw)
+				// combinedRaw 返回combined原始数据信息。
+				// if 返回if信息。
+				// 	combinedRaw 返回combined原始数据信息。
 				// }
 
 				// s.saveFightCache(master.reportFightID, master.fightTimestamp, int(master.fEnd-master.fStart), deaths, vulns, avoidable, percentile, combinedRaw)
@@ -848,7 +877,7 @@ func (s *SyncManager) writeReports(playerID uint, masters []*masterFight, report
 			set = make(map[string]struct{})
 			entries[masterCode] = set
 		}
-		// Ensure a canonical self-row exists for each master report.
+		// Ensure 返回ensure信息。
 		set[masterCode] = struct{}{}
 		for _, sourceID := range master.sourceIDs {
 			sourceCode, ok := splitReportCode(sourceID)
@@ -862,7 +891,7 @@ func (s *SyncManager) writeReports(playerID uint, masters []*masterFight, report
 		return nil
 	}
 
-	// now := time.Now()
+	// now 返回now信息。
 	for masterCode, sources := range entries {
 		for sourceCode := range sources {
 			logEntry := models.Report{
@@ -906,6 +935,7 @@ type reportSummary struct {
 	EndTime   int64
 }
 
+// buildReportSummary 从单份报告数据提取标题与起止时间摘要。
 func buildReportSummary(reportMap map[string]interface{}) (reportSummary, bool) {
 	code, ok := reportMap["code"].(string)
 	if !ok || code == "" {
@@ -942,6 +972,7 @@ func buildReportSummary(reportMap map[string]interface{}) (reportSummary, bool) 
 	return reportSummary{Title: title, StartTime: int64(start), EndTime: end}, true
 }
 
+// buildReportMetadata 构建并序列化需要持久化的报告元数据。
 func buildReportMetadata(reportMap map[string]interface{}) (datatypes.JSON, error) {
 	meta := map[string]interface{}{}
 	if masterData, ok := reportMap["masterData"]; ok {
@@ -955,6 +986,7 @@ func buildReportMetadata(reportMap map[string]interface{}) (datatypes.JSON, erro
 	return datatypes.JSON(data), nil
 }
 
+// getEncounterIDFilter 解析遭遇战 ID 过滤配置。
 func getEncounterIDFilter() (map[int]struct{}, bool) {
 	raw := strings.TrimSpace(os.Getenv("FFLOGS_ENCOUNTER_ID"))
 	if raw == "" {
@@ -989,7 +1021,7 @@ func getEncounterIDFilter() (map[int]struct{}, bool) {
 	return ids, true
 }
 
-// extractReportsFromData 从 GraphQL 响应数据中提取报告列表和总页数
+// extractReportsFromData 从响应数据中提取有效报告列表与分页信息。
 func extractReportsFromData(data map[string]interface{}) ([]interface{}, int, error) {
 	charData, ok := data["characterData"].(map[string]interface{})
 	if !ok || charData["character"] == nil {
@@ -1088,6 +1120,7 @@ func getOldestReportTimeFromReports(reports []interface{}) (oldestMs int64, coun
 	return oldestMs, count
 }
 
+// getPageConcurrency 读取分页拉取并发配置，缺省返回默认值。
 func getPageConcurrency() int {
 	const defaultConcurrency = 5
 	if raw := os.Getenv("FFLOGS_SYNC_PAGE_CONCURRENCY"); raw != "" {
@@ -1098,7 +1131,7 @@ func getPageConcurrency() int {
 	return defaultConcurrency
 }
 
-// syncAllReportsMetadata 同步所有报告元数据并写入 reports/fight_sync_maps。
+// syncAllReportsMetadata 返回同步全量报告列表元数据。
 func (s *SyncManager) syncAllReportsMetadata(playerID uint, name string, reports []interface{}) error {
 	if len(reports) == 0 {
 		return nil
@@ -1108,18 +1141,18 @@ func (s *SyncManager) syncAllReportsMetadata(playerID uint, name string, reports
 		return err
 	}
 
-	// if err := os.MkdirAll(getAllReportsDir(), 0755); err != nil {
-	// 	return "", nil, fmt.Errorf("create allreports dir failed: %v", err)
+	// if 返回if信息。
+	// 	return 返回return信息。
 	// }
-	// writePath := filepath.Join(getAllReportsDir(), "reports_snapshot.json")
-	// if err := writeJSON(writePath, reports); err != nil {
-	// 	return "", nil, fmt.Errorf("write reports snapshot failed: %v", err)
+	// writePath 返回writepath信息。
+	// if 返回if信息。
+	// 	return 返回return信息。
 	// }
 
 	return nil
 }
 
-// finalizeAllReportsDownloads 将已完成下载的报告标记到 reports，并更新玩家 all_report_codes。
+// finalizeAllReportsDownloads 收尾更新已下载报告状态与玩家报告集合。
 func (s *SyncManager) finalizeAllReportsDownloads(playerID uint, downloaded []string) error {
 	if len(downloaded) == 0 {
 		return nil
@@ -1147,6 +1180,7 @@ func (s *SyncManager) finalizeAllReportsDownloads(playerID uint, downloaded []st
 	return nil
 }
 
+// mergeStringSets 合并两个字符串集合并去重。
 func mergeStringSets(base []string, add []string) []string {
 	set := make(map[string]struct{}, len(base)+len(add))
 	for _, v := range base {
@@ -1162,6 +1196,7 @@ func mergeStringSets(base []string, add []string) []string {
 	return merged
 }
 
+// splitReportCode 拆分报告代码。
 func splitReportCode(sourceID string) (string, bool) {
 	idx := strings.LastIndex(sourceID, "-")
 	if idx <= 0 {
@@ -1170,6 +1205,7 @@ func splitReportCode(sourceID string) (string, bool) {
 	return sourceID[:idx], true
 }
 
+// batchUpsertFightSyncMaps 批量写入或更新战斗映射并合并关键字段。
 func (s *SyncManager) batchUpsertFightSyncMaps(maps []models.FightSyncMap) error {
 	if len(maps) == 0 {
 		return nil
@@ -1227,6 +1263,7 @@ func (s *SyncManager) isActorInFight(fight map[string]interface{}, actorID int) 
 	return false
 }
 
+// resolveActorNameMap 构建角色 ID 到名称的映射。
 func resolveActorNameMap(reportMap map[string]interface{}) map[int]string {
 	out := make(map[int]string)
 	md, ok := reportMap["masterData"].(map[string]interface{})
@@ -1263,6 +1300,7 @@ func resolveActorNameMap(reportMap map[string]interface{}) map[int]string {
 	return out
 }
 
+// resolveFriendlyPlayerNames 解析并过滤友方玩家名称列表。
 func resolveFriendlyPlayerNames(fight map[string]interface{}, actorNameByID map[int]string) []string {
 	ids := parseFriendlyPlayerIDs(fight["friendlyPlayers"])
 	if len(ids) == 0 {
@@ -1285,16 +1323,19 @@ func resolveFriendlyPlayerNames(fight map[string]interface{}, actorNameByID map[
 	return out
 }
 
+// shouldExcludeFriendlyPlayerName 判断名称是否应从友方玩家名单中过滤。
 func shouldExcludeFriendlyPlayerName(name string) bool {
 	n := strings.ToLower(strings.TrimSpace(name))
 	return n == "multiple players" || n == "limit break" || n == "limitbreak"
 }
 
+// isFriendPlayersUsable 判断友方玩家名单是否满足开荒速度计算条件。
 func isFriendPlayersUsable(names []string) bool {
 	// 8人本要求完整队伍名单（含自己）才用于开荒速度计算。
 	return len(names) == 8
 }
 
+// parseFriendlyPlayerIDs 解析并去重友方玩家 ID 列表。
 func parseFriendlyPlayerIDs(v interface{}) []int {
 	friends, ok := v.([]interface{})
 	if !ok || len(friends) == 0 {
@@ -1316,6 +1357,7 @@ func parseFriendlyPlayerIDs(v interface{}) []int {
 	return out
 }
 
+// parseFriendlyPlayerID 解析单个友方玩家项为玩家 ID。
 func parseFriendlyPlayerID(v interface{}) (int, bool) {
 	switch val := v.(type) {
 	case float64:
@@ -1335,7 +1377,8 @@ func parseFriendlyPlayerID(v interface{}) (int, bool) {
 	}
 }
 
-// containsString checks if a slice contains a string; avoids repeated linear scans inline.
+// containsString 判断字符串是否满足条件。
+// containsString 检查字符串切片是否包含目标值。
 func containsString(arr []string, target string) bool {
 	for _, v := range arr {
 		if v == target {
@@ -1375,6 +1418,7 @@ type masterFight struct {
 	sourceIDs        []string
 }
 
+// resolveActorInfo 从报告数据中解析玩家职业与角色 ID。
 func (s *SyncManager) resolveActorInfo(reportMap map[string]interface{}, charName string) (string, int) {
 	var playerJob string
 	var actorID int
@@ -1395,6 +1439,7 @@ func (s *SyncManager) resolveActorInfo(reportMap map[string]interface{}, charNam
 	return playerJob, actorID
 }
 
+// mapFloor 将战斗名称映射为楼层标识并判断是否为目标战斗。
 func mapFloor(rawName string) (string, bool) {
 	bossMapping := map[string]string{
 		"Vamp Fatale":         "M9S",
@@ -1408,6 +1453,7 @@ func mapFloor(rawName string) (string, bool) {
 	return mappedName, isTarget
 }
 
+// buildMasterFights 构建主节点战斗列表。
 func buildMasterFights(reports []*reportInfo) []*masterFight {
 	masters := make([]*masterFight, 0)
 	for _, r := range reports {
@@ -1436,6 +1482,7 @@ func buildMasterFights(reports []*reportInfo) []*masterFight {
 	return masters
 }
 
+// groupMastersByReport 按报告编号对主战斗集合分组。
 func groupMastersByReport(masters []*masterFight) map[string][]*masterFight {
 	grouped := make(map[string][]*masterFight)
 	for _, master := range masters {
@@ -1444,6 +1491,7 @@ func groupMastersByReport(masters []*masterFight) map[string][]*masterFight {
 	return grouped
 }
 
+// findMatchingMaster 在现有主战斗集合中查找可合并战斗。
 func findMatchingMaster(masters []*masterFight, fight fightInfo) int {
 	for idx, master := range masters {
 		if master.floor != fight.floor {
@@ -1457,13 +1505,7 @@ func findMatchingMaster(masters []*masterFight, fight fightInfo) int {
 	return -1
 }
 
-func absInt(v int) int {
-	if v < 0 {
-		return -v
-	}
-	return v
-}
-
+// absInt64 返回 64 位整数的绝对值。
 func absInt64(v int64) int64 {
 	if v < 0 {
 		return -v
@@ -1471,132 +1513,12 @@ func absInt64(v int64) int64 {
 	return v
 }
 
-func mergeSourceIDs(raw []string, add []string) ([]string, bool) {
-	ids := append([]string{}, raw...)
-	changed := false
-	for _, id := range add {
-		if !containsString(ids, id) {
-			ids = append(ids, id)
-			changed = true
-		}
-	}
-	if !changed {
-		return raw, false
-	}
-	return ids, true
-}
-
-func mergeEventPayload(rawData []byte, eventsRaw []byte) []byte {
-	combinedRaw := rawData
-	var base map[string]interface{}
-	if err := json.Unmarshal(rawData, &base); err != nil || base == nil {
-		base = make(map[string]interface{})
-	}
-
-	var ev map[string]interface{}
-	if err := json.Unmarshal(eventsRaw, &ev); err == nil {
-		if evEvents, ok := ev["events"]; ok {
-			base["events"] = evEvents
-		}
-		if _, ok := base["start"]; !ok {
-			if evStart, ok := ev["start"]; ok {
-				base["start"] = evStart
-			}
-		}
-		if _, ok := base["end"]; !ok {
-			if evEnd, ok := ev["end"]; ok {
-				base["end"] = evEnd
-			}
-		}
-		if meta, ok := base["meta"].(map[string]interface{}); ok {
-			if evStart, ok := ev["start"]; ok && meta["start"] == nil {
-				meta["start"] = evStart
-			}
-			if evEnd, ok := ev["end"]; ok && meta["end"] == nil {
-				meta["end"] = evEnd
-			}
-		}
-	}
-
-	if merged, err := json.Marshal(base); err == nil {
-		combinedRaw = merged
-	}
-
-	return combinedRaw
-}
-
-func (s *SyncManager) saveFightCache(id string, timestamp int64, durationMs int, deaths, vulns, avoidable int, percentile float64, payload []byte) {
-	var cache models.FightCache
-	if db.DB.Where("id = ?", id).First(&cache).Error == nil {
-		cache.Deaths = deaths
-		cache.VulnStacks = vulns
-		cache.AvoidableDamage = avoidable
-		cache.Percentile = percentile
-		cache.Data = payload
-		cache.Timestamp = timestamp
-		cache.Duration = durationMs
-		_ = db.DB.Save(&cache)
-		return
-	}
-
-	_ = db.DB.Create(&models.FightCache{
-		ID:              id,
-		Duration:        durationMs,
-		Deaths:          deaths,
-		VulnStacks:      vulns,
-		AvoidableDamage: avoidable,
-		Percentile:      percentile,
-		Timestamp:       timestamp,
-		Data:            payload,
-	})
-}
-
-func (s *SyncManager) upsertFightSyncMap(newMap models.FightSyncMap) {
-	var existing models.FightSyncMap
-	errSearch := db.DB.Clauses(dbresolver.Write).Where(
-		"name = ? AND ABS(timestamp - ?) <= 5",
-		newMap.Name,
-		newMap.Timestamp,
-	).First(&existing).Error
-
-	if errSearch == nil {
-		merged, changed := mergeSourceIDs(existing.SourceIDs, newMap.SourceIDs)
-		if changed {
-			if errUpdate := db.DB.Model(&existing).Update("source_ids", merged).Error; errUpdate != nil {
-				log.Printf("[ERROR] 更新映射表失败: %v", errUpdate)
-			}
-		}
-		return
-	}
-
-	if errCreate := db.DB.Table("fight_sync_maps").Create(&newMap).Error; errCreate != nil {
-		if strings.Contains(errCreate.Error(), "duplicate key") {
-			if errRetry := db.DB.Clauses(dbresolver.Write).Where(
-				"name = ? AND ABS(timestamp - ?) <= 5",
-				newMap.Name,
-				newMap.Timestamp,
-			).First(&existing).Error; errRetry == nil {
-				merged, changed := mergeSourceIDs(existing.SourceIDs, newMap.SourceIDs)
-				if changed {
-					if errUpdate := db.DB.Model(&existing).Update("source_ids", merged).Error; errUpdate != nil {
-						log.Printf("[ERROR] 并发合并 source_ids 失败: %v", errUpdate)
-					}
-				}
-			} else {
-				log.Printf("[ERROR] 并发创建映射记录失败: %v", errCreate)
-			}
-		} else {
-			log.Printf("[SYNC] 已创建新战斗映射: %s (Name: %s, Time: %d)", newMap.MasterID, newMap.Name, newMap.Timestamp)
-		}
-	}
-}
-
-// ensurePlayerID 确保玩家记录存在，返回玩家 ID；如果不存在则创建新记录
-func ensurePlayerID(name, server, region string) (uint, bool, error) {
+// EnsurePlayerID 确保玩家记录存在，返回玩家 ID；如果不存在则创建新记录
+func EnsurePlayerID(name, server, region string) (int, string, bool, error) {
 	var player models.Player
-	err := db.DB.Clauses(dbresolver.Write).Where("name = ? AND server = ? AND region = ?", name, server, region).First(&player).Error
+	err := db.DB.Clauses(dbresolver.Write).Select("id", "pichash").Where("name = ? AND server = ? AND region = ?", name, server, region).First(&player).Error
 	if err == nil {
-		return player.ID, false, nil
+		return player.ID, player.PicHash, false, nil
 	}
 
 	newPlayer := models.Player{
@@ -1605,12 +1527,13 @@ func ensurePlayerID(name, server, region string) (uint, bool, error) {
 		Region: region,
 	}
 	if errCreate := db.DB.Clauses(dbresolver.Write).Create(&newPlayer).Error; errCreate != nil {
-		return 0, false, errCreate
+		return 0, "", false, errCreate
 	}
 
-	return newPlayer.ID, true, nil
+	return newPlayer.ID, player.PicHash, true, nil
 }
 
+// shouldRunV2ReportQuery 根据玩家状态和更新时间判断是否执行 V2 报告查询。
 func shouldRunV2ReportQuery(playerID uint, newlyCreated bool) (bool, string, error) {
 	if playerID == 0 {
 		return true, "player_id=0 fallback", nil
@@ -1642,6 +1565,7 @@ func shouldRunV2ReportQuery(playerID uint, newlyCreated bool) (bool, string, err
 	return false, fmt.Sprintf("updated_at 距今 %.1fh，未超过24小时", age.Hours()), nil
 }
 
+// touchPlayerV2ReportCheckedAt 更新玩家 V2 查询检查时间。
 func touchPlayerV2ReportCheckedAt(playerID uint) error {
 	if playerID == 0 {
 		return nil
@@ -1651,6 +1575,7 @@ func touchPlayerV2ReportCheckedAt(playerID uint) error {
 		UpdateColumn("updated_at", time.Now()).Error
 }
 
+// refreshPlayerOutputAbilityFromLogs 拉取并更新玩家输出能力评分。
 func (s *SyncManager) refreshPlayerOutputAbilityFromLogs(ctx context.Context, playerID uint, name, server, region string) error {
 	name = strings.TrimSpace(name)
 	server = strings.TrimSpace(server)
@@ -1669,6 +1594,7 @@ func (s *SyncManager) refreshPlayerOutputAbilityFromLogs(ctx context.Context, pl
 		UpdateColumn("output_ability", ability).Error
 }
 
+// fetchCharacterOutputAbility 查询并提取角色输出能力评分。
 func (s *SyncManager) fetchCharacterOutputAbility(ctx context.Context, name, server, region string) (float64, error) {
 	query := `
 	query ($name: String, $server: String, $region: String) {
@@ -1712,6 +1638,7 @@ func (s *SyncManager) fetchCharacterOutputAbility(ctx context.Context, name, ser
 	return clampPercent(ability), nil
 }
 
+// extractOutputAbilityFromZoneRankings 从分区排行结构中提取输出能力值。
 func extractOutputAbilityFromZoneRankings(raw interface{}) (float64, bool) {
 	switch v := raw.(type) {
 	case string:
@@ -1746,6 +1673,7 @@ func extractOutputAbilityFromZoneRankings(raw interface{}) (float64, bool) {
 	return 0, false
 }
 
+// extractPercentileFromRankingEntries 从排名条目集合计算平均百分位。
 func extractPercentileFromRankingEntries(entries []interface{}) (float64, bool) {
 	if len(entries) == 0 {
 		return 0, false
@@ -1770,6 +1698,7 @@ func extractPercentileFromRankingEntries(entries []interface{}) (float64, bool) 
 	return sum / count, true
 }
 
+// clampPercent 将百分值限制在 0-100 并保留两位小数。
 func clampPercent(v float64) float64 {
 	if v < 0 {
 		v = 0
@@ -1780,6 +1709,7 @@ func clampPercent(v float64) float64 {
 	return math.Round(v*100) / 100
 }
 
+// parseRankingEntryFloat 按候选键从排名条目中解析浮点值。
 func parseRankingEntryFloat(entry map[string]interface{}, keys ...string) (float64, bool) {
 	for _, key := range keys {
 		value, ok := entry[key]
@@ -1803,399 +1733,4 @@ func parseRankingEntryFloat(entry map[string]interface{}, keys ...string) (float
 		}
 	}
 	return 0, false
-}
-
-func (s *SyncManager) fetchFullReportTableData(reportCode string) (map[string]interface{}, error) {
-	// 1. 首先获取报告中所有的战斗记录 ID，用于构造批量查询
-	queryFights := `
-	query ($code: String) {
-		reportData {
-			report(code: $code) {
-				fights {
-					id
-				}
-			}
-		}
-	}`
-
-	fData, err := s.client.ExecuteQuery(context.Background(), queryFights, map[string]interface{}{"code": reportCode})
-	if err != nil {
-		return nil, err
-	}
-
-	reportData, _ := fData["reportData"].(map[string]interface{})
-	report, ok := reportData["report"].(map[string]interface{})
-	if !ok || report == nil {
-		return nil, fmt.Errorf("report not found")
-	}
-
-	var fightIDs []int
-	if fs, ok := report["fights"].([]interface{}); ok {
-		for _, f := range fs {
-			fight := f.(map[string]interface{})
-			fightIDs = append(fightIDs, int(fight["id"].(float64)))
-		}
-	}
-
-	if len(fightIDs) == 0 {
-		return nil, fmt.Errorf("no fights in report")
-	}
-
-	// 2. 使用显式的 fightIDs 数组进行批量拉取详情 (规避 startTime/endTime 报错)
-	// 注意：Rankings 可能在批量查询中报错，先移除它以确保稳定同步
-	queryTables := `
-	query ($code: String, $fids: [Int]) {
-		rateLimitData {
-			limitPerHour
-			pointsSpentThisHour
-			pointsResetIn
-		}
-		reportData {
-			report(code: $code) {
-				deaths: table(dataType: Deaths, fightIDs: $fids)
-				debuffs: table(dataType: Debuffs, fightIDs: $fids)
-				buffs: table(dataType: Buffs, fightIDs: $fids)
-				casts: table(dataType: Casts, fightIDs: $fids)
-				damageDone: table(dataType: DamageDone, fightIDs: $fids)
-				healing: table(dataType: Healing, fightIDs: $fids)
-				damageTaken: table(dataType: DamageTaken, fightIDs: $fids)
-				avoidable: table(dataType: DamageTaken, fightIDs: $fids, filterExpression: "ability.damageIsAvoidable = true")
-			}
-		}
-	}`
-
-	variables := map[string]interface{}{
-		"code": reportCode,
-		"fids": fightIDs,
-	}
-
-	data, err := s.client.ExecuteQuery(context.Background(), queryTables, variables)
-	if err != nil {
-		return nil, err
-	}
-
-	resReportData, _ := data["reportData"].(map[string]interface{})
-	return resReportData["report"].(map[string]interface{}), nil
-}
-
-// fetchFightEvents 拉取指定战斗的事件流（分页拉取完整事件，输出 xivanalysis 友好结构）
-func (s *SyncManager) fetchFightEvents(reportCode string, fightID int, startMs int64, endMs int64) ([]byte, error) {
-	const limit = 5000
-
-	query := `
-	query ($code: String, $start: Float, $end: Float, $fids: [Int], $limit: Int) {
-		reportData {
-			report(code: $code) {
-				events(startTime: $start, endTime: $end, fightIDs: $fids, limit: $limit) {
-					data
-					nextPageTimestamp
-				}
-			}
-		}
-	}
-	`
-
-	startCursor := startMs
-	allEvents := make([]interface{}, 0)
-
-	for {
-		vars := map[string]interface{}{
-			"code":  reportCode,
-			"start": startCursor,
-			"end":   endMs,
-			"fids":  []int{fightID},
-			"limit": limit,
-		}
-
-		data, err := s.client.ExecuteQuery(context.Background(), query, vars)
-		if err != nil {
-			return nil, err
-		}
-
-		reportData, ok := data["reportData"].(map[string]interface{})
-		if !ok {
-			return nil, fmt.Errorf("reportData missing in events response")
-		}
-		report, ok := reportData["report"].(map[string]interface{})
-		if !ok || report == nil {
-			return nil, fmt.Errorf("report missing in events response")
-		}
-
-		eventsBlock, ok := report["events"].(map[string]interface{})
-		if !ok || eventsBlock == nil {
-			return nil, fmt.Errorf("events block missing")
-		}
-
-		rows, _ := eventsBlock["data"].([]interface{})
-		if len(rows) == 0 {
-			break
-		}
-		allEvents = append(allEvents, rows...)
-
-		nextTs, hasNext := eventsBlock["nextPageTimestamp"].(float64)
-		if !hasNext {
-			break
-		}
-		nextStart := int64(nextTs)
-		if nextStart <= startCursor || nextStart >= endMs {
-			break
-		}
-		startCursor = nextStart
-	}
-
-	if len(allEvents) == 0 {
-		return nil, nil
-	}
-
-	return json.Marshal(map[string]interface{}{
-		"fight_id": fightID,
-		"start":    startMs,
-		"end":      endMs,
-		"events":   allEvents,
-	})
-}
-
-// extractFightDataFromReportV2 提取更完整的表数据并附带时间戳元信息
-func (s *SyncManager) extractFightDataFromReportV2(reportData map[string]interface{}, fightID int, actorID int, startMs int64, endMs int64) (deaths, vulns, avoidable int, percentile float64, rawData []byte) {
-	fightSpecificData := make(map[string]interface{})
-	tables := make(map[string]interface{})
-	// 顶层也放入基本元信息，方便下游直接读取
-	fightSpecificData["fight_id"] = fightID
-	fightSpecificData["start"] = startMs
-	fightSpecificData["end"] = endMs
-	fightSpecificData["meta"] = map[string]interface{}{
-		"fight_id": fightID,
-		"start":    startMs,
-		"end":      endMs,
-	}
-
-	filterEntries := func(entries []interface{}) []interface{} {
-		var out []interface{}
-		for _, e := range entries {
-			entry, ok := e.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if fid, ok := entry["fight"].(float64); ok && int(fid) == fightID {
-				out = append(out, entry)
-			}
-		}
-		return out
-	}
-
-	// 1. 死亡
-	if dt, ok := reportData["deaths"].(map[string]interface{}); ok {
-		if dData, ok := dt["data"].(map[string]interface{}); ok {
-			if entries, ok := dData["entries"].([]interface{}); ok {
-				fightDeaths := filterEntries(entries)
-				for _, e := range fightDeaths {
-					entry := e.(map[string]interface{})
-					if idVal, ok := entry["id"].(float64); ok && int(idVal) == actorID {
-						deaths++
-					}
-				}
-				tables["deaths"] = fightDeaths
-			}
-		}
-	}
-
-	// 2. 易伤
-	if vts, ok := reportData["debuffs"].(map[string]interface{}); ok {
-		if vData, ok := vts["data"].(map[string]interface{}); ok {
-			if entries, ok := vData["entries"].([]interface{}); ok {
-				fightVulns := filterEntries(entries)
-				for _, e := range fightVulns {
-					entry := e.(map[string]interface{})
-					if idVal, ok := entry["id"].(float64); ok && int(idVal) == actorID {
-						if count, ok := entry["count"].(float64); ok {
-							vulns += int(count)
-						}
-					}
-				}
-				tables["debuffs"] = fightVulns
-			}
-		}
-	}
-
-	// 3. Buffs
-	if bt, ok := reportData["buffs"].(map[string]interface{}); ok {
-		if bData, ok := bt["data"].(map[string]interface{}); ok {
-			if entries, ok := bData["entries"].([]interface{}); ok {
-				tables["buffs"] = filterEntries(entries)
-			}
-		}
-	}
-
-	// 4. Casts
-	if ct, ok := reportData["casts"].(map[string]interface{}); ok {
-		if cData, ok := ct["data"].(map[string]interface{}); ok {
-			if entries, ok := cData["entries"].([]interface{}); ok {
-				tables["casts"] = filterEntries(entries)
-			}
-		}
-	}
-
-	// 5. DamageDone
-	if dt, ok := reportData["damageDone"].(map[string]interface{}); ok {
-		if dData, ok := dt["data"].(map[string]interface{}); ok {
-			if entries, ok := dData["entries"].([]interface{}); ok {
-				tables["damageDone"] = filterEntries(entries)
-			}
-		}
-	}
-
-	// 6. Healing
-	if ht, ok := reportData["healing"].(map[string]interface{}); ok {
-		if hData, ok := ht["data"].(map[string]interface{}); ok {
-			if entries, ok := hData["entries"].([]interface{}); ok {
-				tables["healing"] = filterEntries(entries)
-			}
-		}
-	}
-
-	// 7. DamageTaken
-	if dt, ok := reportData["damageTaken"].(map[string]interface{}); ok {
-		if dData, ok := dt["data"].(map[string]interface{}); ok {
-			if entries, ok := dData["entries"].([]interface{}); ok {
-				tables["damageTaken"] = filterEntries(entries)
-			}
-		}
-	}
-
-	// 8. 可规避伤害 (avoidable)
-	if at, ok := reportData["avoidable"].(map[string]interface{}); ok {
-		if aData, ok := at["data"].(map[string]interface{}); ok {
-			if entries, ok := aData["entries"].([]interface{}); ok {
-				fightAvoidable := filterEntries(entries)
-				for _, e := range fightAvoidable {
-					entry := e.(map[string]interface{})
-					if idVal, ok := entry["id"].(float64); ok && int(idVal) == actorID {
-						if count, ok := entry["count"].(float64); ok {
-							avoidable += int(count)
-						}
-					}
-				}
-				tables["avoidable"] = fightAvoidable
-			}
-		}
-	}
-
-	// 9. 百分位 (percentile)
-	if rt, ok := reportData["rankings"].(map[string]interface{}); ok {
-		if rData, ok := rt["data"].(map[string]interface{}); ok {
-			if entries, ok := rData["entries"].([]interface{}); ok {
-				for _, e := range entries {
-					entry := e.(map[string]interface{})
-					if fid, ok := entry["fight"].(float64); ok && int(fid) == fightID {
-						if int(entry["id"].(float64)) == actorID {
-							if pVal, ok := entry["percentile"].(float64); ok {
-								percentile = pVal
-								tables["percentile"] = pVal
-								break
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	fightSpecificData["tables"] = tables
-	rawData, _ = json.Marshal(fightSpecificData)
-	return deaths, vulns, avoidable, percentile, rawData
-}
-
-// extractFightDataFromReport 为旧版，保留兼容但已不再使用
-func (s *SyncManager) extractFightDataFromReport(reportData map[string]interface{}, fightID int, actorID int) (deaths, vulns, avoidable int, percentile float64, rawData []byte) {
-	fightSpecificData := make(map[string]interface{})
-
-	// 1. 提取死亡 (deaths)
-	if dt, ok := reportData["deaths"].(map[string]interface{}); ok {
-		if dData, ok := dt["data"].(map[string]interface{}); ok {
-			if entries, ok := dData["entries"].([]interface{}); ok {
-				var fightDeaths []interface{}
-				for _, e := range entries {
-					entry := e.(map[string]interface{})
-					if fid, ok := entry["fight"].(float64); ok && int(fid) == fightID {
-						fightDeaths = append(fightDeaths, entry)
-						if int(entry["id"].(float64)) == actorID {
-							deaths++
-						}
-					}
-				}
-				fightSpecificData["deaths"] = fightDeaths
-			}
-		}
-	}
-
-	// 2. 提取易伤 (debuffs)
-	if vts, ok := reportData["debuffs"].(map[string]interface{}); ok {
-		if vData, ok := vts["data"].(map[string]interface{}); ok {
-			if entries, ok := vData["entries"].([]interface{}); ok {
-				var fightVulns []interface{}
-				for _, e := range entries {
-					entry := e.(map[string]interface{})
-					if fid, ok := entry["fight"].(float64); ok && int(fid) == fightID {
-						fightVulns = append(fightVulns, entry)
-						if int(entry["id"].(float64)) == actorID {
-							if count, ok := entry["count"].(float64); ok {
-								vulns += int(count)
-							}
-						}
-					}
-				}
-				fightSpecificData["debuffs"] = fightVulns
-			}
-		}
-	}
-
-	// 3. 提取可规避伤害 (avoidable)
-	if at, ok := reportData["avoidable"].(map[string]interface{}); ok {
-		if aData, ok := at["data"].(map[string]interface{}); ok {
-			if entries, ok := aData["entries"].([]interface{}); ok {
-				var fightAvoidable []interface{}
-				for _, e := range entries {
-					entry := e.(map[string]interface{})
-					if fid, ok := entry["fight"].(float64); ok && int(fid) == fightID {
-						fightAvoidable = append(fightAvoidable, entry)
-						if int(entry["id"].(float64)) == actorID {
-							if count, ok := entry["count"].(float64); ok {
-								avoidable += int(count)
-							}
-						}
-					}
-				}
-				fightSpecificData["avoidable"] = fightAvoidable
-			}
-		}
-	}
-
-	// 4. 提取百分位 (percentile)
-	if rt, ok := reportData["rankings"].(map[string]interface{}); ok {
-		if rData, ok := rt["data"].(map[string]interface{}); ok {
-			if entries, ok := rData["entries"].([]interface{}); ok {
-				for _, e := range entries {
-					entry := e.(map[string]interface{})
-					if fid, ok := entry["fight"].(float64); ok && int(fid) == fightID {
-						if int(entry["id"].(float64)) == actorID {
-							if pVal, ok := entry["percentile"].(float64); ok {
-								percentile = pVal
-								fightSpecificData["percentile"] = pVal
-								break
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-	rawData, _ = json.Marshal(fightSpecificData)
-	return deaths, vulns, avoidable, percentile, rawData
-}
-
-// 废弃旧的单战斗拉取函数
-func (s *SyncManager) fetchFightTableData(reportCode string, fightID int, actorID int) (deaths, vulns, avoidable int, rawData []byte, err error) {
-	// ... (代码已重构为批量模式)
-	return 0, 0, 0, nil, nil
 }

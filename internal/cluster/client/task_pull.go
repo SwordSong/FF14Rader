@@ -1,4 +1,4 @@
-package api
+package client
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/user/ff14rader/internal/cluster"
+	cluster "github.com/user/ff14rader/internal/cluster"
 )
 
 const (
@@ -22,6 +22,10 @@ const (
 	defaultPullLease       = 20 * time.Minute
 	defaultPullExecTimeout = 25 * time.Minute
 )
+
+type assignedReportsExecutor interface {
+	ExecuteAssignedReports(ctx context.Context, playerID uint, reports []string) error
+}
 
 type pullTaskClaimRequest struct {
 	Host     string `json:"host"`
@@ -106,7 +110,7 @@ func clusterPullExecTimeout() time.Duration {
 	return time.Duration(envIntWithDefault("CLUSTER_PULL_EXEC_TIMEOUT_SEC", int(defaultPullExecTimeout.Seconds()))) * time.Second
 }
 
-func (s *SyncManager) claimTasksFromMaster(client *http.Client, master, host string, limit int, lease time.Duration) ([]pullTaskItem, error) {
+func claimTasksFromMaster(client *http.Client, master, host string, limit int, lease time.Duration) ([]pullTaskItem, error) {
 	payload := pullTaskClaimRequest{Host: host, Limit: limit, LeaseSec: int(lease.Seconds())}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -145,7 +149,7 @@ func (s *SyncManager) claimTasksFromMaster(client *http.Client, master, host str
 	return parsed.Tasks, nil
 }
 
-func (s *SyncManager) ackTaskToMaster(client *http.Client, master, host, taskID string, success bool, errText string) {
+func ackTaskToMaster(client *http.Client, master, host, taskID string, success bool, errText string) {
 	payload := pullTaskAckRequest{Host: host, TaskID: taskID, Success: success, Error: strings.TrimSpace(errText)}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -173,13 +177,13 @@ func (s *SyncManager) ackTaskToMaster(client *http.Client, master, host, taskID 
 	}
 }
 
-// StartClusterTaskPullLoop 启动工作节点主动拉取任务循环（pull 模式）。
-func (s *SyncManager) StartClusterTaskPullLoop() {
-	if s == nil || !clusterPullEnabled() || clusterTaskMode() != "pull" {
+// StartClusterTaskPullLoop 启动客户端后台任务拉取循环并执行分配任务。
+func StartClusterTaskPullLoop(executor assignedReportsExecutor) {
+	if executor == nil || !clusterPullEnabled() || clusterTaskMode() != "pull" {
 		return
 	}
 
-	master := cluster.ClusterMasterEndpoint()
+	master := ClusterMasterEndpoint()
 	if master == "" {
 		return
 	}
@@ -198,7 +202,7 @@ func (s *SyncManager) StartClusterTaskPullLoop() {
 		ackClient := &http.Client{Timeout: 10 * time.Second}
 
 		runOnce := func() {
-			tasks, err := s.claimTasksFromMaster(claimClient, master, host, batch, lease)
+			tasks, err := claimTasksFromMaster(claimClient, master, host, batch, lease)
 			if err != nil {
 				log.Printf("[CLUSTER] 拉取任务失败 master=%s host=%s err=%v", master, host, err)
 				return
@@ -209,22 +213,22 @@ func (s *SyncManager) StartClusterTaskPullLoop() {
 
 			for _, task := range tasks {
 				if task.PlayerID == 0 || len(task.Reports) == 0 || strings.TrimSpace(task.TaskID) == "" {
-					s.ackTaskToMaster(ackClient, master, host, task.TaskID, false, "invalid task payload")
+					ackTaskToMaster(ackClient, master, host, task.TaskID, false, "invalid task payload")
 					continue
 				}
 
 				log.Printf("[CLUSTER] 拉取任务成功 host=%s task=%s player=%d reports=%v", host, task.TaskID, task.PlayerID, task.Reports)
 				execCtx, cancel := context.WithTimeout(context.Background(), execTimeout)
-				err = s.ExecuteAssignedReports(execCtx, task.PlayerID, task.Reports)
+				err = executor.ExecuteAssignedReports(execCtx, task.PlayerID, task.Reports)
 				cancel()
 
 				if err != nil {
 					log.Printf("[CLUSTER] 任务执行失败 host=%s task=%s err=%v", host, task.TaskID, err)
-					s.ackTaskToMaster(ackClient, master, host, task.TaskID, false, err.Error())
+					ackTaskToMaster(ackClient, master, host, task.TaskID, false, err.Error())
 					continue
 				}
 				log.Printf("[CLUSTER] 任务执行完成 host=%s task=%s", host, task.TaskID)
-				s.ackTaskToMaster(ackClient, master, host, task.TaskID, true, "")
+				ackTaskToMaster(ackClient, master, host, task.TaskID, true, "")
 			}
 		}
 

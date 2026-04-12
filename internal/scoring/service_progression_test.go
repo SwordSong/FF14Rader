@@ -7,6 +7,7 @@ import (
 	"github.com/user/ff14rader/internal/models"
 )
 
+// TestPartySignature_NormalizesAndSorts 返回测试队伍签名规范化并排序。
 func TestPartySignature_NormalizesAndSorts(t *testing.T) {
 	sig := partySignature([]string{"  Alice", "bob", "alice", "BOB  ", ""})
 	if sig != "alice|alice|bob|bob" {
@@ -14,6 +15,7 @@ func TestPartySignature_NormalizesAndSorts(t *testing.T) {
 	}
 }
 
+// TestComputeEncounterProgressionScore_FirstPullKill 验证首次拉取即击杀时的进度评分计算。
 func TestComputeEncounterProgressionScore_FirstPullKill(t *testing.T) {
 	score, weight := computeEncounterProgressionScore([]models.FightSyncMap{
 		{
@@ -33,6 +35,7 @@ func TestComputeEncounterProgressionScore_FirstPullKill(t *testing.T) {
 	}
 }
 
+// TestComputeEncounterProgressionScore_TeamChangeCompensates 验证队伍变化补偿对进度评分的影响。
 func TestComputeEncounterProgressionScore_TeamChangeCompensates(t *testing.T) {
 	sameTeam := []models.FightSyncMap{
 		{ID: 1, Timestamp: 1, FightPercentage: 80, FriendPlayers: []string{"a", "b", "c", "d", "e", "f", "g", "h"}},
@@ -58,6 +61,7 @@ func TestComputeEncounterProgressionScore_TeamChangeCompensates(t *testing.T) {
 	}
 }
 
+// TestComputeEncounterProgressionScore_NoKillHasLowerWeight 验证未击杀记录的权重更低。
 func TestComputeEncounterProgressionScore_NoKillHasLowerWeight(t *testing.T) {
 	score, weight := computeEncounterProgressionScore([]models.FightSyncMap{
 		{ID: 1, Timestamp: 1, FightPercentage: 95, FriendPlayers: []string{"a", "b", "c", "d", "e", "f", "g", "h"}},

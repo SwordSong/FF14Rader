@@ -1,119 +1,49 @@
-package cluster
+package server
 
 import (
-	"net"
-	"net/url"
-	"os"
-	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	cluster "github.com/user/ff14rader/internal/cluster"
 )
 
-const (
-	defaultScanDir = "./downloads/fflogsx"
-)
-
-var reportCodeRegexp = regexp.MustCompile(`^[A-Za-z0-9_-]{4,64}$`)
-
-// ReportHostRegistry 维护 reportCode -> host 的映射，并带有按负载分配能力。
+// ReportHostRegistry 维护 reportCode 到 host 的映射及主机负载信息。
 type ReportHostRegistry struct {
 	mu         sync.RWMutex
+	user       map[int]UserInfo
 	reportHost map[string]string
 	hostLoad   map[string]int
 	hostSeenAt map[string]time.Time
 }
 
+// UserInfo 保存玩家与服务器信息。
+type UserInfo struct {
+	User   string
+	Server string
+}
+
 var globalReportHostRegistry = NewReportHostRegistry()
 
+// NewReportHostRegistry 创建报告主机注册表。
 func NewReportHostRegistry() *ReportHostRegistry {
 	return &ReportHostRegistry{
+		user:       make(map[int]UserInfo),
 		reportHost: make(map[string]string),
 		hostLoad:   make(map[string]int),
 		hostSeenAt: make(map[string]time.Time),
 	}
 }
 
+// GlobalReportHostRegistry 返回全局报告主机注册表实例。
 func GlobalReportHostRegistry() *ReportHostRegistry {
 	return globalReportHostRegistry
 }
 
-func LocalHost() string {
-	candidates := []string{
-		strings.TrimSpace(os.Getenv("CLUSTER_LOCAL_HOST")),
-		strings.TrimSpace(os.Getenv("NODE_HOST")),
-		strings.TrimSpace(os.Getenv("HOST")),
-	}
-	for _, c := range candidates {
-		if n := NormalizeHost(c); n != "" {
-			return n
-		}
-	}
-
-	if host, err := os.Hostname(); err == nil {
-		if n := NormalizeHost(host); n != "" {
-			return n
-		}
-	}
-	return "127.0.0.1"
-}
-
-func ReportsScanDir() string {
-	if raw := strings.TrimSpace(os.Getenv("REPORTS_SCAN_DIR")); raw != "" {
-		return raw
-	}
-	return defaultScanDir
-}
-
-func NormalizeReportCode(raw string) string {
-	code := strings.ToUpper(strings.TrimSpace(raw))
-	if code == "" {
-		return ""
-	}
-	if !reportCodeRegexp.MatchString(code) {
-		return ""
-	}
-	return code
-}
-
-func NormalizeHost(raw string) string {
-	v := strings.TrimSpace(raw)
-	if v == "" {
-		return ""
-	}
-
-	if strings.Contains(v, "://") {
-		u, err := url.Parse(v)
-		if err == nil {
-			h := strings.TrimSpace(u.Hostname())
-			if h != "" {
-				return strings.ToLower(h)
-			}
-		}
-	}
-
-	if strings.Contains(v, "/") {
-		parts := strings.SplitN(v, "/", 2)
-		v = parts[0]
-	}
-
-	if host, _, err := net.SplitHostPort(v); err == nil {
-		v = host
-	} else if strings.Count(v, ":") == 1 {
-		parts := strings.SplitN(v, ":", 2)
-		if parts[0] != "" {
-			v = parts[0]
-		}
-	}
-
-	return strings.ToLower(strings.Trim(strings.TrimSpace(v), "[]"))
-}
-
 func containsHost(hosts []string, host string) bool {
 	for _, h := range hosts {
-		if NormalizeHost(h) == host {
+		if cluster.NormalizeHost(h) == host {
 			return true
 		}
 	}
@@ -124,7 +54,7 @@ func dedupeHosts(hosts []string) []string {
 	seen := map[string]struct{}{}
 	out := make([]string, 0, len(hosts))
 	for _, h := range hosts {
-		n := NormalizeHost(h)
+		n := cluster.NormalizeHost(h)
 		if n == "" {
 			continue
 		}
@@ -137,39 +67,6 @@ func dedupeHosts(hosts []string) []string {
 	return out
 }
 
-// CollectReportCodesFromDir 扫描目录，提取可用 reportCode 列表（去重、排序）。
-func CollectReportCodesFromDir(dirPath string) ([]string, error) {
-	entries, err := os.ReadDir(dirPath)
-	if err != nil {
-		return nil, err
-	}
-
-	set := make(map[string]struct{}, len(entries))
-	for _, entry := range entries {
-		name := strings.TrimSpace(entry.Name())
-		if name == "" {
-			continue
-		}
-		if entry.IsDir() {
-			if code := NormalizeReportCode(name); code != "" {
-				set[code] = struct{}{}
-			}
-			continue
-		}
-		base := strings.TrimSuffix(name, filepath.Ext(name))
-		if code := NormalizeReportCode(base); code != "" {
-			set[code] = struct{}{}
-		}
-	}
-
-	out := make([]string, 0, len(set))
-	for code := range set {
-		out = append(out, code)
-	}
-	sort.Strings(out)
-	return out, nil
-}
-
 func (r *ReportHostRegistry) touchHostLocked(host string, now time.Time) {
 	r.hostSeenAt[host] = now
 	if _, ok := r.hostLoad[host]; !ok {
@@ -177,14 +74,14 @@ func (r *ReportHostRegistry) touchHostLocked(host string, now time.Time) {
 	}
 }
 
-// SeedHostReportsFromDir 扫描目录下的报告名并注册到 host。
+// SeedHostReportsFromDir 扫描目录并将报告映射注册到指定主机。
 func (r *ReportHostRegistry) SeedHostReportsFromDir(host, dirPath string) (int, error) {
-	h := NormalizeHost(host)
+	h := cluster.NormalizeHost(host)
 	if h == "" {
-		h = LocalHost()
+		h = cluster.LocalHost()
 	}
 
-	reports, err := CollectReportCodesFromDir(dirPath)
+	reports, err := cluster.CollectReportCodesFromDir(dirPath)
 	if err != nil {
 		return 0, err
 	}
@@ -193,8 +90,9 @@ func (r *ReportHostRegistry) SeedHostReportsFromDir(host, dirPath string) (int, 
 	return added, nil
 }
 
+// RegisterHostReports 注册主机与报告映射。
 func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) (added int, total int) {
-	h := NormalizeHost(host)
+	h := cluster.NormalizeHost(host)
 	if h == "" {
 		return 0, len(r.reportHost)
 	}
@@ -204,7 +102,7 @@ func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) 
 	r.touchHostLocked(h, time.Now())
 
 	for _, raw := range reports {
-		code := NormalizeReportCode(raw)
+		code := cluster.NormalizeReportCode(raw)
 		if code == "" {
 			continue
 		}
@@ -218,9 +116,58 @@ func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) 
 	return added, len(r.reportHost)
 }
 
-// HeartbeatHost 仅刷新 host 存活时间，不改动 reports 映射。
+// RegisterUserServer 注册玩家与服务器映射。
+func (r *ReportHostRegistry) RegisterUserServer(playID int, user, server string) bool {
+	user = strings.TrimSpace(user)
+	server = strings.TrimSpace(server)
+	if user == "" || server == "" {
+		return false
+	}
+	r.mu.Lock()
+	r.user[playID] = UserInfo{User: user, Server: server}
+	r.mu.Unlock()
+	return true
+}
+
+// SnapshotUsers 返回玩家与服务器映射快照。
+func (r *ReportHostRegistry) SnapshotUsers() map[int]UserInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[int]UserInfo, len(r.user))
+	for k, v := range r.user {
+		out[k] = v
+	}
+	return out
+}
+
+// ClaimUser 领取一个玩家映射并立即删除，避免多客户端重复处理同一条记录。
+func (r *ReportHostRegistry) ClaimUser(host string) (int, UserInfo, bool) {
+	if cluster.NormalizeHost(host) == "" {
+		return 0, UserInfo{}, false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.user) == 0 {
+		return 0, UserInfo{}, false
+	}
+
+	ids := make([]int, 0, len(r.user))
+	for playerID := range r.user {
+		ids = append(ids, playerID)
+	}
+	sort.Ints(ids)
+
+	playerID := ids[0]
+	info := r.user[playerID]
+	delete(r.user, playerID)
+	return playerID, info, true
+}
+
+// HeartbeatHost 更新主机心跳时间。
 func (r *ReportHostRegistry) HeartbeatHost(host string) bool {
-	h := NormalizeHost(host)
+	h := cluster.NormalizeHost(host)
 	if h == "" {
 		return false
 	}
@@ -231,8 +178,9 @@ func (r *ReportHostRegistry) HeartbeatHost(host string) bool {
 	return true
 }
 
+// ResolveHost 解析报告对应主机。
 func (r *ReportHostRegistry) ResolveHost(reportCode string) (string, bool) {
-	code := NormalizeReportCode(reportCode)
+	code := cluster.NormalizeReportCode(reportCode)
 	if code == "" {
 		return "", false
 	}
@@ -242,9 +190,9 @@ func (r *ReportHostRegistry) ResolveHost(reportCode string) (string, bool) {
 	return host, ok
 }
 
-// AssignHostForReport 若 report 已有映射优先复用，否则按当前 host 负载最小策略分配。
+// AssignHostForReport 为报告分配主机并更新负载统计。
 func (r *ReportHostRegistry) AssignHostForReport(reportCode string, fightCount int, candidateHosts []string) string {
-	code := NormalizeReportCode(reportCode)
+	code := cluster.NormalizeReportCode(reportCode)
 	if code == "" {
 		return ""
 	}
@@ -284,7 +232,7 @@ func (r *ReportHostRegistry) AssignHostForReport(reportCode string, fightCount i
 	return chosen
 }
 
-// EvictExpiredHosts 剔除超时未心跳的 host，并删除其 reportCode 映射。
+// EvictExpiredHosts 清理超时主机并返回被剔除主机列表。
 func (r *ReportHostRegistry) EvictExpiredHosts(ttl time.Duration) ([]string, int) {
 	if ttl <= 0 {
 		return nil, 0
@@ -324,6 +272,7 @@ func (r *ReportHostRegistry) EvictExpiredHosts(ttl time.Duration) ([]string, int
 	return expiredHosts, removedReports
 }
 
+// Snapshot 返回报告到主机映射快照。
 func (r *ReportHostRegistry) Snapshot() map[string]string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -334,6 +283,7 @@ func (r *ReportHostRegistry) Snapshot() map[string]string {
 	return out
 }
 
+// SnapshotLoads 返回主机负载快照。
 func (r *ReportHostRegistry) SnapshotLoads() map[string]int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -344,6 +294,7 @@ func (r *ReportHostRegistry) SnapshotLoads() map[string]int {
 	return out
 }
 
+// SnapshotSeenAt 返回主机最近心跳时间快照。
 func (r *ReportHostRegistry) SnapshotSeenAt() map[string]string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

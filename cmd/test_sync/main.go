@@ -31,10 +31,6 @@ func main() {
 	}
 
 	cfg := config.LoadConfig()
-	log.Printf("[DEBUG] FFLOGS_CLIENT_ID loaded=%t, FFLOGS_CLIENT_SECRET loaded=%t", cfg.FFLogsClientID != "", cfg.FFLogsClientSecret != "")
-	if cfg.FFLogsClientID == "" || cfg.FFLogsClientSecret == "" {
-		log.Fatalf("FFLogs credentials missing (FFLOGS_CLIENT_ID/FFLOGS_CLIENT_SECRET)")
-	}
 	if cfg.PostgresWriteDSN == "" || cfg.PostgresReadDSN == "" {
 		log.Fatalf("Postgres DSN missing (POSTGRES_WRITE_DSN/POSTGRES_READ_DSN)")
 	}
@@ -53,11 +49,15 @@ func main() {
 
 	db.InitDB(cfg.PostgresWriteDSN, cfg.PostgresReadDSN)
 
-	client := api.NewFFLogsClient(cfg.FFLogsClientID, cfg.FFLogsClientSecret)
+	client := api.NewFFLogsClient()
 	syncManager := api.NewSyncManager(client)
 
+	if *playerID > 0 {
+		log.Printf("[INFO] 当前增量同步按角色维度执行，--player-id=%d 仅用于兼容旧脚本，不再参与调用参数", *playerID)
+	}
+
 	ctx := context.Background()
-	if err := syncManager.StartIncrementalSync(ctx, uint(*playerID), strings.TrimSpace(*name), strings.TrimSpace(*server), region); err != nil {
+	if err := syncManager.StartIncrementalSync(ctx, strings.TrimSpace(*name), strings.TrimSpace(*server), region); err != nil {
 		log.Fatalf("sync failed: %v", err)
 	}
 

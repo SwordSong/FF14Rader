@@ -8,7 +8,7 @@ import (
 
 // Player 玩家基础信息
 type Player struct {
-	ID               uint      `gorm:"primaryKey" json:"id"`
+	ID               int       `gorm:"primaryKey" json:"id"`
 	Name             string    `gorm:"size:100;not null" json:"name"`
 	Server           string    `gorm:"size:50;not null" json:"server"`
 	Region           string    `gorm:"size:20;not null" json:"region"`
@@ -27,9 +27,11 @@ type Player struct {
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 	Reports          []Report  `gorm:"foreignKey:PlayerID" json:"reports"`
+	PicHash          string    `gorm:"size:50" json:"pichash"`
+	PicUpdatedAt     time.Time `json:"pic_updated_at"`
 }
 
-// Report 报告解析记录（替代 report_parse_logs，表名: reports）
+// Report 返回报告信息。
 type Report struct {
 	ID             uint           `gorm:"primaryKey"`
 	PlayerID       uint           `gorm:"not null;index" json:"player_id"`

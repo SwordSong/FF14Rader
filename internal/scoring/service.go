@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/user/ff14rader/internal/cluster"
+	clusterserver "github.com/user/ff14rader/internal/cluster/server"
 	"github.com/user/ff14rader/internal/db"
 	"github.com/user/ff14rader/internal/models"
 	"gorm.io/datatypes"
@@ -63,6 +64,7 @@ type NoMatchedActorError struct {
 	Candidates  []string
 }
 
+// Error 返回错误字符串。
 func (e *NoMatchedActorError) Error() string {
 	if e == nil {
 		return "no matched actor"
@@ -70,6 +72,7 @@ func (e *NoMatchedActorError) Error() string {
 	return fmt.Sprintf("no matched actor for report=%s fight=%d player=%s expected_job=%s candidates=%v", e.ReportCode, e.FightID, strings.TrimSpace(e.PlayerName), strings.TrimSpace(e.ExpectedJob), e.Candidates)
 }
 
+// IsNoMatchedActorError 判断错误是否为无匹配角色错误。
 func IsNoMatchedActorError(err error) bool {
 	if err == nil {
 		return false
@@ -78,8 +81,12 @@ func IsNoMatchedActorError(err error) bool {
 	return errors.As(err, &target)
 }
 
+// NewServiceFromEnv 根据环境变量创建一个新的评分服务配置。
 func NewServiceFromEnv() *Service {
+	//这里是评分服务的初始化，包括V2解析和fight events的相关配置。
+	// 解析服务地址配置时，优先级为：配置文件 > XIVA_ANALYZE_URL > XIVA_HOST+XIVA_PORT_START/COUNT > 默认值。
 	apiURLs := resolveAnalyzeURLsFromEnv()
+	// 报告数据根目录配置，默认为 ./downloads/fflogs。
 	root := strings.TrimSpace(os.Getenv("FFLOGS_ALL_REPORTS_DIR"))
 	if root == "" {
 		root = defaultReportRoot
@@ -109,6 +116,7 @@ func NewServiceFromEnv() *Service {
 	}
 }
 
+// resolveAnalyzeURLsFromEnv 解析分析URL 列表来源环境变量。
 func resolveAnalyzeURLsFromEnv() []string {
 	if urls := resolveAnalyzeURLsFromConfigDoc(); len(urls) > 0 {
 		return urls
@@ -136,7 +144,7 @@ func resolveAnalyzeURLsFromEnv() []string {
 	isProcessMode := mode == "process" || mode == "processes" || mode == "pool"
 	isThreadsMode := mode == "thread" || mode == "threads"
 
-	// Thread mode serves on a single HTTP port (default 22026), so do not fan out to XIVA_PORT_START+i.
+	// Thread 返回thread信息。
 	if isThreadsMode || (!isProcessMode && mode == "" && portCount > 1) {
 		singlePort := envInt("XIVA_API_PORT", envInt("PORT", 22026))
 		raw := fmt.Sprintf("%s:%d", host, singlePort)
@@ -174,6 +182,7 @@ type analyzeHostEntry struct {
 	Weight  int    `json:"weight"`
 }
 
+// resolveAnalyzeURLsFromConfigDoc 解析分析URL 列表来源配置文档。
 func resolveAnalyzeURLsFromConfigDoc() []string {
 	configPath := strings.TrimSpace(os.Getenv("XIVA_HOSTS_CONFIG"))
 	if configPath == "" {
@@ -187,6 +196,7 @@ func resolveAnalyzeURLsFromConfigDoc() []string {
 	return urls
 }
 
+// loadAnalyzeURLsFromConfigFile 获取分析URL 列表来源配置文件。
 func loadAnalyzeURLsFromConfigFile(configPath string) ([]string, error) {
 	configPath = strings.TrimSpace(configPath)
 	if configPath == "" {
@@ -231,6 +241,7 @@ func loadAnalyzeURLsFromConfigFile(configPath string) ([]string, error) {
 	return nil, fmt.Errorf("unsupported config format")
 }
 
+// buildAnalyzeURLsFromHostEntries 构建分析URL 列表来源主机条目列表。
 func buildAnalyzeURLsFromHostEntries(entries []analyzeHostEntry) []string {
 	out := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -278,6 +289,7 @@ func (s *Service) RecommendedWorkerCount() int {
 	return clampRecommendedConcurrency(s.recommendedWorkerCountFromConfig())
 }
 
+// recommendedWorkerCountFromHealth 根据健康探测结果计算建议并发数。
 func (s *Service) recommendedWorkerCountFromHealth() int {
 	endpoints := uniqueAnalyzeURLs(s.apiURLs)
 	if len(endpoints) == 0 {
@@ -296,6 +308,7 @@ func (s *Service) recommendedWorkerCountFromHealth() int {
 	return total
 }
 
+// recommendedWorkerCountFromConfig 根据配置估算建议并发数。
 func (s *Service) recommendedWorkerCountFromConfig() int {
 	slots := normalizeAnalyzeURLs(s.apiURLs)
 	if len(slots) == 0 {
@@ -307,7 +320,7 @@ func (s *Service) recommendedWorkerCountFromConfig() int {
 		perWorker = 1
 	}
 
-	// Thread pool mode as default: env thread worker count still has highest fallback priority.
+	// Thread 返回thread信息。
 	threadWorkers := envInt("XIVA_THREAD_POOL_SIZE", 0)
 	if threadWorkers == 0 {
 		threadWorkers = envInt("XIVA_PORT_COUNT", 0)
@@ -340,6 +353,7 @@ func (s *Service) recommendedWorkerCountFromConfig() int {
 	return len(slots) * perWorker
 }
 
+// probeAnalyzeEndpointConcurrency 探测分析端点并发。
 func probeAnalyzeEndpointConcurrency(client *http.Client, analyzeURL string) int {
 	healthURL, err := analyzeURLToHealthURL(analyzeURL)
 	if err != nil {
@@ -392,6 +406,7 @@ func probeAnalyzeEndpointConcurrency(client *http.Client, analyzeURL string) int
 	return 1
 }
 
+// analyzeURLToHealthURL 将分析端点 URL 转换为健康检查 URL。
 func analyzeURLToHealthURL(analyzeURL string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(analyzeURL))
 	if err != nil {
@@ -405,6 +420,7 @@ func analyzeURLToHealthURL(analyzeURL string) (string, error) {
 	return parsed.String(), nil
 }
 
+// analyzeURLToReadyURL 将分析端点 URL 转换为就绪检查 URL。
 func analyzeURLToReadyURL(analyzeURL string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(analyzeURL))
 	if err != nil {
@@ -418,6 +434,7 @@ func analyzeURLToReadyURL(analyzeURL string) (string, error) {
 	return parsed.String(), nil
 }
 
+// probeAnalyzeEndpointReady 探测分析端点就绪。
 func probeAnalyzeEndpointReady(client *http.Client, analyzeURL string) bool {
 	readyURL, err := analyzeURLToReadyURL(analyzeURL)
 	if err != nil {
@@ -438,6 +455,7 @@ func probeAnalyzeEndpointReady(client *http.Client, analyzeURL string) bool {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
+// parsePositiveIntAny 从任意值中解析正整数。
 func parsePositiveIntAny(v any) int {
 	switch value := v.(type) {
 	case int:
@@ -468,6 +486,7 @@ func parsePositiveIntAny(v any) int {
 	return 0
 }
 
+// normalizeAnalyzeURLs 解析分析URL 列表。
 func normalizeAnalyzeURLs(urls []string) []string {
 	if len(urls) == 0 {
 		return nil
@@ -483,6 +502,7 @@ func normalizeAnalyzeURLs(urls []string) []string {
 	return out
 }
 
+// uniqueAnalyzeURLs 去重分析URL 列表。
 func uniqueAnalyzeURLs(urls []string) []string {
 	if len(urls) == 0 {
 		return nil
@@ -503,6 +523,7 @@ func uniqueAnalyzeURLs(urls []string) []string {
 	return out
 }
 
+// countLocalAnalyzeURLs 返回数量本地分析URL 列表。
 func countLocalAnalyzeURLs(urls []string) int {
 	if len(urls) == 0 {
 		return 0
@@ -547,6 +568,7 @@ func countLocalAnalyzeURLs(urls []string) int {
 	return count
 }
 
+// clampRecommendedConcurrency 将建议并发限制在安全范围内。
 func clampRecommendedConcurrency(v int) int {
 	if v <= 0 {
 		return 1
@@ -557,6 +579,7 @@ func clampRecommendedConcurrency(v int) int {
 	return v
 }
 
+// envInt 读取整数。
 func envInt(key string, fallback int) int {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
@@ -569,6 +592,7 @@ func envInt(key string, fallback int) int {
 	return v
 }
 
+// envBool 读取布尔值。
 func envBool(key string, fallback bool) bool {
 	raw := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
 	if raw == "" {
@@ -726,6 +750,7 @@ type ChecklistGCDGate struct {
 	Factor          float64
 }
 
+// BuildChecklistRuleScoresFromRaw 构建清单规则评分结果来源原始数据。
 func BuildChecklistRuleScoresFromRaw(raw datatypes.JSON) []ChecklistRuleScore {
 	comp := BuildChecklistComputationFromRaw(raw)
 	if comp == nil || len(comp.Rules) == 0 {
@@ -742,6 +767,7 @@ func BuildChecklistRuleScoresFromRaw(raw datatypes.JSON) []ChecklistRuleScore {
 	return out
 }
 
+// BuildChecklistComputationFromRaw 从原始数据构建清单计算结果。
 func BuildChecklistComputationFromRaw(raw datatypes.JSON) *ChecklistComputation {
 	if len(raw) == 0 {
 		return nil
@@ -760,6 +786,7 @@ func BuildChecklistComputationFromRaw(raw datatypes.JSON) *ChecklistComputation 
 	return buildChecklistComputation(checklist)
 }
 
+// BuildChecklistGCDGateFromRaw 从原始数据构建清单 GCD 门控信息。
 func BuildChecklistGCDGateFromRaw(raw datatypes.JSON) *ChecklistGCDGate {
 	if len(raw) == 0 {
 		return defaultChecklistGCDGate()
@@ -778,12 +805,13 @@ func BuildChecklistGCDGateFromRaw(raw datatypes.JSON) *ChecklistGCDGate {
 	return buildChecklistGCDGate(checklist)
 }
 
+// ScoreFight 返回评分战斗信息。
 func (s *Service) ScoreFight(ctx context.Context, playerID uint, reportCode string, fightID int) error {
 	_, err := s.ScoreFightWithEndpoint(ctx, playerID, reportCode, fightID)
 	return err
 }
 
-// ScoreFightWithEndpoint 执行评分并返回实际执行解析的主机地址（host:port）。
+// ScoreFightWithEndpoint 返回评分战斗端点信息。
 func (s *Service) ScoreFightWithEndpoint(ctx context.Context, playerID uint, reportCode string, fightID int) (string, error) {
 	report, err := loadReportRow(playerID, reportCode)
 	if err != nil {
@@ -941,10 +969,12 @@ func (s *Service) RefreshAllPlayersTeamAndStability() (int, error) {
 	return len(playerIDs), nil
 }
 
+// PreviewScoreFromAnalysisFile 从分析文件预览评分结果。
 func (s *Service) PreviewScoreFromAnalysisFile(analysisFile, actorName string) (*PreviewScore, error) {
 	return s.PreviewScoreFromAnalysisFileWithContext(analysisFile, PreviewFightContext{ActorName: actorName})
 }
 
+// PreviewScoreFromAnalysisFileWithContext 从本地分析结果文件预览评分，支持提供战斗上下文（如击杀、战斗百分比等）以获得更准确的评分。
 func (s *Service) PreviewScoreFromAnalysisFileWithContext(analysisFile string, ctx PreviewFightContext) (*PreviewScore, error) {
 	data, err := os.ReadFile(analysisFile)
 	if err != nil {
@@ -975,7 +1005,7 @@ func (s *Service) PreviewScoreFromAnalysisFileWithContext(analysisFile string, c
 
 		checkRaw, conf := computeChecklist(moduleMap["checklist"])
 		checkAbs := computeChecklistAbs(checkRaw, conf, moduleMap["checklist"])
-		// File preview mode has no player history; use a neutral baseline.
+		// File 返回文件信息。
 		checkAdj := conf*checkAbs + (1-conf)*70
 
 		suggestionPenalty := computeSuggestionPenalty(moduleMap["suggestions"])
@@ -1060,6 +1090,7 @@ type fightScoreUpdate struct {
 	ScoredAt            time.Time
 }
 
+// buildScoreRow 构建评分记录。
 func (s *Service) buildScoreRow(playerID uint, reportCode string, fight fightRow, actor analyzedActor) (*fightScoreUpdate, error) {
 	moduleMap := make(map[string]map[string]interface{}, len(actor.Modules))
 	for _, module := range actor.Modules {
@@ -1115,6 +1146,7 @@ func (s *Service) buildScoreRow(playerID uint, reportCode string, fight fightRow
 	}, nil
 }
 
+// selectScoringActor 从候选角色中选择评分目标角色。
 func selectScoringActor(playerName, expectedJob string, masterData any, actors []analyzedActor) (analyzedActor, bool) {
 	if len(actors) == 0 {
 		return analyzedActor{}, false
@@ -1159,6 +1191,7 @@ func selectScoringActor(playerName, expectedJob string, masterData any, actors [
 	return analyzedActor{}, false
 }
 
+// extractMasterActorIDs 提取主节点角色ID 列表。
 func extractMasterActorIDs(masterData any, playerName string) map[string]struct{} {
 	playerName = strings.TrimSpace(playerName)
 	if playerName == "" {
@@ -1195,6 +1228,7 @@ func extractMasterActorIDs(masterData any, playerName string) map[string]struct{
 	return ids
 }
 
+// toActorIDString 将角色 ID 转换为字符串表示。
 func toActorIDString(v any) (string, bool) {
 	switch val := v.(type) {
 	case float64:
@@ -1224,6 +1258,7 @@ func toActorIDString(v any) (string, bool) {
 	}
 }
 
+// actorNameEquals 判断两个角色名称是否等价。
 func actorNameEquals(a, b string) bool {
 	a = strings.TrimSpace(a)
 	b = strings.TrimSpace(b)
@@ -1236,6 +1271,7 @@ func actorNameEquals(a, b string) bool {
 	return normalizeNameKey(a) == normalizeNameKey(b)
 }
 
+// normalizeNameKey 解析名称键。
 func normalizeNameKey(raw string) string {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	replacer := strings.NewReplacer(
@@ -1252,6 +1288,7 @@ func normalizeNameKey(raw string) string {
 	return replacer.Replace(v)
 }
 
+// pickActor 选择角色。
 func pickActor(actors []analyzedActor, actorName string) (analyzedActor, bool) {
 	if actorName != "" {
 		for _, actor := range actors {
@@ -1267,6 +1304,7 @@ func pickActor(actors []analyzedActor, actorName string) (analyzedActor, bool) {
 	return analyzedActor{}, false
 }
 
+// uniqueActorNames 去重角色名称列表。
 func uniqueActorNames(actors []analyzedActor) []string {
 	if len(actors) == 0 {
 		return []string{}
@@ -1289,6 +1327,7 @@ func uniqueActorNames(actors []analyzedActor) []string {
 	return names
 }
 
+// postAnalyze 发送分析。
 func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*analyzeResponse, []byte, string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1363,6 +1402,7 @@ func (s *Service) postAnalyze(ctx context.Context, payload analyzeRequest) (*ana
 	return nil, nil, lastEndpoint, lastErr
 }
 
+// PrefetchFightEvents 返回预取战斗事件列表。
 func (s *Service) PrefetchFightEvents(ctx context.Context, reportCode string, fightID int, startMS, endMS int64) (string, error) {
 	if !shouldUseRemoteFetchTransport() {
 		return "", nil
@@ -1391,6 +1431,7 @@ func (s *Service) PrefetchFightEvents(ctx context.Context, reportCode string, fi
 	return analyzeEndpointHost(endpoint), err
 }
 
+// postPrefetch 发送预取。
 func (s *Service) postPrefetch(ctx context.Context, payload prefetchRequest) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1463,6 +1504,7 @@ func (s *Service) postPrefetch(ctx context.Context, payload prefetchRequest) (st
 	return lastEndpoint, lastErr
 }
 
+// analyzeURLToPrefetchURL 将分析端点 URL 转换为预取端点 URL。
 func analyzeURLToPrefetchURL(endpoint string) string {
 	trimmed := strings.TrimSpace(endpoint)
 	if trimmed == "" {
@@ -1481,6 +1523,7 @@ func analyzeURLToPrefetchURL(endpoint string) string {
 	return u.String()
 }
 
+// pickAliveAnalyzeURLs 选择可用分析URL 列表。
 func (s *Service) pickAliveAnalyzeURLs() ([]string, error) {
 	now := time.Now()
 
@@ -1528,7 +1571,7 @@ func (s *Service) pickAliveAnalyzeURLs() ([]string, error) {
 	return aliveWeighted, nil
 }
 
-// CandidateAnalyzeHosts 返回当前可用的解析主机（仅 host，不含 path）。
+// CandidateAnalyzeHosts 返回候选分析主机列表。
 func (s *Service) CandidateAnalyzeHosts() []string {
 	urls := s.apiURLs
 	if alive, err := s.pickAliveAnalyzeURLs(); err == nil && len(alive) > 0 {
@@ -1552,10 +1595,12 @@ func (s *Service) CandidateAnalyzeHosts() []string {
 	return out
 }
 
+// pickAnalyzeURLForPayload 为载荷选择分析服务 URL。
 func (s *Service) pickAnalyzeURLForPayload(payload analyzeRequest, attempt int) string {
 	return s.pickAnalyzeURLForPayloadFromURLs(payload, attempt, s.apiURLs)
 }
 
+// pickAnalyzeURLForPayloadFromURLs 从候选 URL 集合中为载荷选择分析地址。
 func (s *Service) pickAnalyzeURLForPayloadFromURLs(payload analyzeRequest, attempt int, urls []string) string {
 	if len(urls) == 0 {
 		return defaultAnalyzeURL
@@ -1565,7 +1610,7 @@ func (s *Service) pickAnalyzeURLForPayloadFromURLs(payload analyzeRequest, attem
 	}
 
 	if code := strings.TrimSpace(payload.Code); code != "" {
-		if mappedHost, ok := cluster.GlobalReportHostRegistry().ResolveHost(code); ok {
+		if mappedHost, ok := clusterserver.GlobalReportHostRegistry().ResolveHost(code); ok {
 			preferred := make([]string, 0, len(urls))
 			for _, endpoint := range urls {
 				if hostMatches(analyzeEndpointHost(endpoint), mappedHost) {
@@ -1605,12 +1650,14 @@ func (s *Service) pickAnalyzeURLForPayloadFromURLs(payload analyzeRequest, attem
 	return urls[final]
 }
 
+// hostMatches 判断主机匹配是否满足条件。
 func hostMatches(a, b string) bool {
 	ha := cluster.NormalizeHost(a)
 	hb := cluster.NormalizeHost(b)
 	return ha != "" && hb != "" && ha == hb
 }
 
+// analyzeEndpointHost 返回分析端点主机信息。
 func analyzeEndpointHost(endpoint string) string {
 	trimmed := strings.TrimSpace(endpoint)
 	if trimmed == "" {
@@ -1627,6 +1674,7 @@ func analyzeEndpointHost(endpoint string) string {
 	return trimmed
 }
 
+// pickAnalyzeURL 选择分析URL。
 func (s *Service) pickAnalyzeURL() string {
 	if len(s.apiURLs) == 0 {
 		return defaultAnalyzeURL
@@ -1635,6 +1683,7 @@ func (s *Service) pickAnalyzeURL() string {
 	return s.apiURLs[(idx-1)%uint64(len(s.apiURLs))]
 }
 
+// normalizeAnalyzeURL 解析分析URL。
 func normalizeAnalyzeURL(raw string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -1646,6 +1695,7 @@ func normalizeAnalyzeURL(raw string) (string, error) {
 	return u.String(), nil
 }
 
+// computeChecklist 计算清单。
 func computeChecklist(metrics map[string]interface{}) (raw float64, confidence float64) {
 	if len(metrics) == 0 {
 		return 0, 0
@@ -1687,6 +1737,7 @@ func computeChecklist(metrics map[string]interface{}) (raw float64, confidence f
 	return raw, confidence
 }
 
+// computeChecklistAbs 计算清单绝对值。
 func computeChecklistAbs(raw, confidence float64, metrics map[string]interface{}) float64 {
 	confidenceFactor := 0.7 + 0.3*clamp01(confidence)
 	gate := buildChecklistGCDGate(metrics)
@@ -1706,6 +1757,7 @@ type checklistRuleEval struct {
 	expectedWeight float64
 }
 
+// buildChecklistRuleScores 构建清单规则评分结果。
 func buildChecklistRuleScores(metrics map[string]interface{}) []ChecklistRuleScore {
 	comp := buildChecklistComputation(metrics)
 	if comp == nil || len(comp.Rules) == 0 {
@@ -1722,6 +1774,7 @@ func buildChecklistRuleScores(metrics map[string]interface{}) []ChecklistRuleSco
 	return out
 }
 
+// buildChecklistComputation 构建清单计算明细。
 func buildChecklistComputation(metrics map[string]interface{}) *ChecklistComputation {
 	evals := evaluateChecklistRules(metrics)
 	if len(evals) == 0 {
@@ -1757,6 +1810,7 @@ func buildChecklistComputation(metrics map[string]interface{}) *ChecklistComputa
 	}
 }
 
+// buildChecklistGCDGate 构建清单 GCD 门控数据。
 func buildChecklistGCDGate(metrics map[string]interface{}) *ChecklistGCDGate {
 	base := defaultChecklistGCDGate()
 	percent, ok := extractChecklistGCDCoveragePercent(metrics)
@@ -1776,6 +1830,7 @@ func buildChecklistGCDGate(metrics map[string]interface{}) *ChecklistGCDGate {
 	}
 }
 
+// defaultChecklistGCDGate 返回默认清单 GCD 门控配置。
 func defaultChecklistGCDGate() *ChecklistGCDGate {
 	return &ChecklistGCDGate{
 		Found:  false,
@@ -1785,11 +1840,13 @@ func defaultChecklistGCDGate() *ChecklistGCDGate {
 	}
 }
 
+// checklistGCDGateFactor 计算清单 GCD 门控系数。
 func checklistGCDGateFactor(coverage01 float64) float64 {
 	g := clamp01(coverage01)
 	return defaultChecklistGCDGateAlpha + (1-defaultChecklistGCDGateAlpha)*math.Pow(g, defaultChecklistGCDGateBeta)
 }
 
+// extractChecklistGCDCoveragePercent 提取清单 GCD 覆盖率百分比。
 func extractChecklistGCDCoveragePercent(metrics map[string]interface{}) (float64, bool) {
 	if len(metrics) == 0 {
 		return 0, false
@@ -1832,6 +1889,7 @@ func extractChecklistGCDCoveragePercent(metrics map[string]interface{}) (float64
 	return 0, false
 }
 
+// evaluateChecklistRules 评估清单规则并产出规则评分。
 func evaluateChecklistRules(metrics map[string]interface{}) []checklistRuleEval {
 	rulesRaw, ok := metrics["rules"].([]interface{})
 	if !ok || len(rulesRaw) == 0 {
@@ -1913,6 +1971,7 @@ func evaluateChecklistRules(metrics map[string]interface{}) []checklistRuleEval 
 	return evals
 }
 
+// computeSuggestionPenalty 计算建议惩罚。
 func computeSuggestionPenalty(metrics map[string]interface{}) float64 {
 	if len(metrics) == 0 {
 		return 0
@@ -1945,6 +2004,7 @@ func computeSuggestionPenalty(metrics map[string]interface{}) float64 {
 	return penalty
 }
 
+// computeUtilityScore 计算效用评分。
 func computeUtilityScore(moduleMap map[string]map[string]interface{}) float64 {
 	candidates := []map[string]interface{}{moduleMap["utilities"], moduleMap["defensives"]}
 	rateValues := make([]float64, 0, 2)
@@ -1985,6 +2045,7 @@ func computeUtilityScore(moduleMap map[string]map[string]interface{}) float64 {
 	return clamp100(sum / float64(len(rateValues)))
 }
 
+// computeSurvivalPenalty 计算生存惩罚。
 func computeSurvivalPenalty(f fightRow) float64 {
 	penalty := 0.0
 	if !f.Kill {
@@ -2003,6 +2064,7 @@ func computeSurvivalPenalty(f fightRow) float64 {
 	return penalty
 }
 
+// computeJobModuleScore 计算职业模块评分。
 func computeJobModuleScore(moduleMap map[string]map[string]interface{}) float64 {
 	common := map[string]struct{}{
 		"about": {}, "checklist": {}, "suggestions": {}, "utilities": {}, "defensives": {}, "statistics": {},
@@ -2043,6 +2105,7 @@ func computeJobModuleScore(moduleMap map[string]map[string]interface{}) float64 
 	return clamp100(sum / float64(len(scores)))
 }
 
+// combineBattleScore 汇总各维度分数得到战斗评分。
 func combineBattleScore(role string, checklistAdj, suggestionScore, utilityScore, survivalScore, jobModuleScore float64) float64 {
 	type part struct {
 		weight float64
@@ -2067,10 +2130,11 @@ func combineBattleScore(role string, checklistAdj, suggestionScore, utilityScore
 		return 0
 	}
 	base := sum / weight
-	// Keep some role-specific module flavor without dominating the checklist-based score.
+	// Keep 返回keep信息。
 	return clamp100(base*0.9 + jobModuleScore*0.1)
 }
 
+// fightWeight 返回战斗权重信息。
 func fightWeight(kill bool, fightPercent, bossPercent, minWeight, maxWeight, exponent float64) float64 {
 	if kill {
 		return maxWeight
@@ -2101,6 +2165,7 @@ func fightWeight(kill bool, fightPercent, bossPercent, minWeight, maxWeight, exp
 	return weight
 }
 
+// fightProgressPercent 计算战斗进度百分比。
 func fightProgressPercent(fightPercent, bossPercent float64) float64 {
 	remaining := normalizeRemainingPercent(fightPercent)
 	if remaining < 0 {
@@ -2119,11 +2184,12 @@ func fightProgressPercent(fightPercent, bossPercent float64) float64 {
 	return progress
 }
 
+// normalizeRemainingPercent 规范化剩余血量百分比。
 func normalizeRemainingPercent(v float64) float64 {
 	if v <= 0 {
 		return -1
 	}
-	// FFLogs field can be either 40.93 (%) or 4093 (basis points), normalize to [0,100].
+	// FFLogs 返回fflogs信息。
 	if v > 100 {
 		v = v / 100
 	}
@@ -2136,6 +2202,7 @@ func normalizeRemainingPercent(v float64) float64 {
 	return v
 }
 
+// parseEnvFloat 解析环境变量浮点值。
 func parseEnvFloat(key string, fallback float64) float64 {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
@@ -2148,6 +2215,7 @@ func parseEnvFloat(key string, fallback float64) float64 {
 	return v
 }
 
+// roleFromJob 返回角色来源职业。
 func roleFromJob(job string) string {
 	upper := strings.ToUpper(job)
 	switch upper {
@@ -2160,6 +2228,7 @@ func roleFromJob(job string) string {
 	}
 }
 
+// canonicalJobKey 返回标准化职业键。
 func canonicalJobKey(raw string) string {
 	v := strings.ToUpper(strings.TrimSpace(raw))
 	v = strings.ReplaceAll(v, "-", "_")
@@ -2218,10 +2287,12 @@ func canonicalJobKey(raw string) string {
 	}
 }
 
+// CanonicalJobKey 返回标准化职业键。
 func CanonicalJobKey(raw string) string {
 	return canonicalJobKey(raw)
 }
 
+// isTransientAnalyzeError 判断瞬时分析错误是否满足条件。
 func isTransientAnalyzeError(err error) bool {
 	if err == nil {
 		return false
@@ -2234,6 +2305,7 @@ func isTransientAnalyzeError(err error) bool {
 		strings.Contains(msg, "refused")
 }
 
+// shouldFallbackAnalyzeInline 判断回退分析内联是否满足条件。
 func shouldFallbackAnalyzeInline(err error) bool {
 	if err == nil {
 		return false
@@ -2251,6 +2323,7 @@ func shouldFallbackAnalyzeInline(err error) bool {
 	return false
 }
 
+// shouldRetryAnalyzePending 判断重试分析待处理是否满足条件。
 func shouldRetryAnalyzePending(err error) bool {
 	if err == nil {
 		return false
@@ -2259,6 +2332,7 @@ func shouldRetryAnalyzePending(err error) bool {
 	return strings.Contains(msg, "remote_fetch_pending")
 }
 
+// shouldUseRemoteFetchTransport 判断是否使用远端拉取传输方式。
 func shouldUseRemoteFetchTransport() bool {
 	mode := strings.TrimSpace(strings.ToLower(os.Getenv("XIVA_EVENTS_TRANSPORT_MODE")))
 	switch mode {
@@ -2270,6 +2344,7 @@ func shouldUseRemoteFetchTransport() bool {
 	return envBool("XIVA_REMOTE_FETCH_EVENTS", false)
 }
 
+// resolveRemoteFetchConfig 解析远端拉取配置。
 func resolveRemoteFetchConfig() (*analyzeFetch, error) {
 	apiKey := strings.TrimSpace(os.Getenv("FFLOGS_V1_API_KEY"))
 	if apiKey == "" {
@@ -2298,6 +2373,7 @@ func resolveRemoteFetchConfig() (*analyzeFetch, error) {
 	}, nil
 }
 
+// loadV1APIKeyFromDB 从数据库加载 V1 API Key。
 func loadV1APIKeyFromDB() (string, error) {
 	var row struct {
 		ID    int    `gorm:"column:id"`
@@ -2325,6 +2401,7 @@ LIMIT 1
 	return apiKey, nil
 }
 
+// waitRetry 等待重试。
 func waitRetry(ctx context.Context, attempt int) error {
 	if attempt < 1 {
 		attempt = 1
@@ -2343,6 +2420,7 @@ func waitRetry(ctx context.Context, attempt int) error {
 	}
 }
 
+// loadPlayerName 获取玩家名称。
 func loadPlayerName(playerID uint) string {
 	var player models.Player
 	if err := db.DB.Select("name").Where("id = ?", playerID).First(&player).Error; err != nil {
@@ -2351,6 +2429,7 @@ func loadPlayerName(playerID uint) string {
 	return player.Name
 }
 
+// loadReportRow 获取报告记录。
 func loadReportRow(playerID uint, code string) (*models.Report, error) {
 	var reports []models.Report
 	q := db.DB.Model(&models.Report{}).
@@ -2390,6 +2469,7 @@ func loadReportRow(playerID uint, code string) (*models.Report, error) {
 	return &fallback, nil
 }
 
+// selectPreferredReportRow 选择优先报告记录。
 func selectPreferredReportRow(reports []models.Report, code string) *models.Report {
 	normalizedCode := strings.TrimSpace(code)
 	bestIndex := -1
@@ -2415,6 +2495,7 @@ func selectPreferredReportRow(reports []models.Report, code string) *models.Repo
 	return nil
 }
 
+// reportRowRank 返回报告记录排序。
 func reportRowRank(report models.Report, code string) int {
 	masterMatch := strings.EqualFold(strings.TrimSpace(report.MasterReport), code)
 	sourceMatch := strings.EqualFold(strings.TrimSpace(report.SourceReport), code)
@@ -2431,6 +2512,7 @@ func reportRowRank(report models.Report, code string) int {
 	}
 }
 
+// reportMetadataHasMasterData 判断报告元数据是否包含主战斗数据。
 func reportMetadataHasMasterData(raw datatypes.JSON) bool {
 	if len(raw) == 0 {
 		return false
@@ -2443,6 +2525,7 @@ func reportMetadataHasMasterData(raw datatypes.JSON) bool {
 	return ok
 }
 
+// loadFightRow 获取战斗记录。
 func loadFightRow(playerID uint, reportCode string, fightID int) (fightRow, error) {
 	var rows []fightRow
 	codeJSON, _ := json.Marshal([]string{reportCode})
@@ -2467,6 +2550,7 @@ func loadFightRow(playerID uint, reportCode string, fightID int) (fightRow, erro
 	return rows[0], nil
 }
 
+// readEvents 读取事件列表。
 func readEvents(filePath string) (any, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -2494,6 +2578,7 @@ func readEvents(filePath string) (any, error) {
 	return nil, fmt.Errorf("unsupported events format")
 }
 
+// extractMasterData 提取报告中的主战斗数据。
 func extractMasterData(raw datatypes.JSON) (any, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("report_metadata empty")
@@ -2509,6 +2594,7 @@ func extractMasterData(raw datatypes.JSON) (any, error) {
 	return md, nil
 }
 
+// buildFightJSON 构建战斗JSON。
 func buildFightJSON(row fightRow) fightJSON {
 	fight := fightJSON{
 		ID:              row.FightID,
@@ -2527,6 +2613,7 @@ func buildFightJSON(row fightRow) fightJSON {
 	return fight
 }
 
+// updateFightSyncScore 更新战斗同步评分。
 func updateFightSyncScore(score *fightScoreUpdate) error {
 	updates := map[string]interface{}{
 		"job":                   score.Job,
@@ -2566,6 +2653,7 @@ func updateFightSyncScore(score *fightScoreUpdate) error {
 	return nil
 }
 
+// refreshPlayerBattleAbility 更新玩家战斗能力。
 func refreshPlayerBattleAbility(playerID uint) error {
 	if playerID == 0 {
 		return nil
@@ -2600,6 +2688,7 @@ func refreshPlayerBattleAbility(playerID uint) error {
 	return nil
 }
 
+// refreshPlayerTeamContribution 刷新玩家团队贡献评分。
 func refreshPlayerTeamContribution(playerID uint) error {
 	if playerID == 0 {
 		return nil
@@ -2651,6 +2740,7 @@ type rawStabilityMetrics struct {
 	MajorMistakes float64
 }
 
+// refreshPlayerStabilityScore 更新玩家稳定性评分。
 func refreshPlayerStabilityScore(playerID uint) error {
 	if playerID == 0 {
 		return nil
@@ -2715,6 +2805,7 @@ func refreshPlayerStabilityScore(playerID uint) error {
 	return nil
 }
 
+// stabilityPhaseWeight 返回稳定性阶段权重。
 func stabilityPhaseWeight(fight stabilityFightRow, firstKillByEncounter map[int]int64) float64 {
 	if fight.EncounterID <= 0 {
 		if fight.Kill {
@@ -2733,6 +2824,7 @@ func stabilityPhaseWeight(fight stabilityFightRow, firstKillByEncounter map[int]
 	return 1
 }
 
+// computeFightStabilityScore 计算战斗稳定性评分。
 func computeFightStabilityScore(fight stabilityFightRow) float64 {
 	raw := extractRawStabilityMetrics(fight.RawModuleMetrics)
 	extraPenalty := raw.Deaths*12 + raw.AvoidableHits*2.5 + raw.MajorMistakes*5
@@ -2747,6 +2839,7 @@ func computeFightStabilityScore(fight stabilityFightRow) float64 {
 	return clamp100(100 - penalty)
 }
 
+// extractRawStabilityMetrics 提取原始数据稳定性指标集。
 func extractRawStabilityMetrics(raw datatypes.JSON) rawStabilityMetrics {
 	if len(raw) == 0 {
 		return rawStabilityMetrics{}
@@ -2800,6 +2893,7 @@ func extractRawStabilityMetrics(raw datatypes.JSON) rawStabilityMetrics {
 	}
 }
 
+// findMaxNumericByKey 查找最大值数值键。
 func findMaxNumericByKey(v any, matcher func(string) bool) float64 {
 	maxVal := -1.0
 	var walk func(any)
@@ -2826,12 +2920,14 @@ func findMaxNumericByKey(v any, matcher func(string) bool) float64 {
 	return maxVal
 }
 
+// normalizeMetricKey 解析指标键。
 func normalizeMetricKey(key string) string {
 	normalized := strings.ToLower(strings.TrimSpace(key))
 	replacer := strings.NewReplacer("_", "", "-", "", " ", "", ".", "")
 	return replacer.Replace(normalized)
 }
 
+// weightedStdDev 返回加权标准偏差。
 func weightedStdDev(values, weights []float64) float64 {
 	if len(values) == 0 || len(values) != len(weights) {
 		return 0
@@ -2869,6 +2965,7 @@ func weightedStdDev(values, weights []float64) float64 {
 	return math.Sqrt(variance)
 }
 
+// refreshPlayerProgressionSpeed 刷新玩家开荒速度评分。
 func refreshPlayerProgressionSpeed(playerID uint) error {
 	if playerID == 0 {
 		return nil
@@ -2922,6 +3019,7 @@ func refreshPlayerProgressionSpeed(playerID uint) error {
 	return nil
 }
 
+// refreshPlayerPotentialScore 更新玩家潜力评分。
 func refreshPlayerPotentialScore(playerID uint) error {
 	if playerID == 0 {
 		return nil
@@ -2987,6 +3085,7 @@ func refreshPlayerPotentialScore(playerID uint) error {
 	return nil
 }
 
+// computeEncounterProgressionScore 计算单个遭遇战的开荒进度评分。
 func computeEncounterProgressionScore(attempts []models.FightSyncMap) (float64, float64) {
 	if len(attempts) == 0 {
 		return 0, 0
@@ -3020,7 +3119,7 @@ func computeEncounterProgressionScore(attempts []models.FightSyncMap) (float64, 
 			improvement := progress - prevProgress
 			switch {
 			case improvement >= 10:
-				// Team changed and progress jumped: discount this attempt to reduce unfair blame.
+				// Team 返回team信息。
 				cost = 0.5
 			case improvement <= -10:
 				cost = 1.15
@@ -3057,6 +3156,7 @@ func computeEncounterProgressionScore(attempts []models.FightSyncMap) (float64, 
 	return clamp100(base), weight
 }
 
+// partySignature 返回队伍签名信息。
 func partySignature(names []string) string {
 	if len(names) == 0 {
 		return ""
@@ -3076,6 +3176,7 @@ func partySignature(names []string) string {
 	return strings.Join(normalized, "|")
 }
 
+// loadJobBaseline 获取职业基线。
 func loadJobBaseline(playerID uint, job string) float64 {
 	canonical := canonicalJobKey(job)
 	if canonical == "" {
@@ -3125,6 +3226,7 @@ type checklistRuleKind struct {
 	isDamageBuffUptime bool
 }
 
+// classifyChecklistRule 返回分类清单规则。
 func classifyChecklistRule(ruleName, ruleDesc string, reqNames []string) checklistRuleKind {
 	texts := make([]string, 0, 2+len(reqNames))
 	if ruleName != "" {
@@ -3152,7 +3254,7 @@ func classifyChecklistRule(ruleName, ruleDesc string, reqNames []string) checkli
 		"chaos thrust",
 	)
 
-	// Passive damage-buff uptime style rules: keep damage-up states/buffs active.
+	// Passive 返回passive信息。
 	isDamageBuffUptime := containsAny(joined,
 		"buff常驻",
 		"保持暗黑状态",
@@ -3174,6 +3276,7 @@ func classifyChecklistRule(ruleName, ruleDesc string, reqNames []string) checkli
 	}
 }
 
+// checklistRequirementScore 返回清单要求评分。
 func checklistRequirementScore(percent, target float64, kind checklistRuleKind) float64 {
 	if percent <= 0 {
 		return 0
@@ -3196,6 +3299,7 @@ func checklistRequirementScore(percent, target float64, kind checklistRuleKind) 
 	return math.Pow(ratio, expo)
 }
 
+// checklistRulePriority 返回清单规则优先级。
 func checklistRulePriority(kind checklistRuleKind) float64 {
 	multiplier := 1.0
 	if kind.isGCD {
@@ -3213,6 +3317,7 @@ func checklistRulePriority(kind checklistRuleKind) float64 {
 	return multiplier
 }
 
+// maxFloat 返回最大值浮点值信息。
 func maxFloat(a, b float64) float64 {
 	if a > b {
 		return a
@@ -3220,6 +3325,7 @@ func maxFloat(a, b float64) float64 {
 	return b
 }
 
+// minFloat 返回最小值浮点值信息。
 func minFloat(values ...float64) float64 {
 	if len(values) == 0 {
 		return 0
@@ -3233,6 +3339,7 @@ func minFloat(values ...float64) float64 {
 	return minVal
 }
 
+// textFromUnknown 从未知类型值提取文本。
 func textFromUnknown(v interface{}) string {
 	if s, ok := v.(string); ok {
 		return strings.TrimSpace(s)
@@ -3240,6 +3347,7 @@ func textFromUnknown(v interface{}) string {
 	return ""
 }
 
+// containsAny 判断任意值是否满足条件。
 func containsAny(s string, needles ...string) bool {
 	for _, needle := range needles {
 		if needle != "" && strings.Contains(s, needle) {
@@ -3249,6 +3357,7 @@ func containsAny(s string, needles ...string) bool {
 	return false
 }
 
+// numberFromUnknown 返回数值来源未知值。
 func numberFromUnknown(v interface{}) float64 {
 	switch val := v.(type) {
 	case float64:
@@ -3274,10 +3383,12 @@ func numberFromUnknown(v interface{}) float64 {
 	return -1
 }
 
+// strconvParseFloat 安全解析字符串为浮点数。
 func strconvParseFloat(s string) (float64, error) {
 	return strconv.ParseFloat(strings.TrimSpace(s), 64)
 }
 
+// clamp01 将数值限制在 0 到 1 区间。
 func clamp01(v float64) float64 {
 	if v < 0 {
 		return 0
@@ -3288,6 +3399,7 @@ func clamp01(v float64) float64 {
 	return v
 }
 
+// clamp100 将数值限制在 0 到 100 区间。
 func clamp100(v float64) float64 {
 	if v < 0 {
 		return 0
@@ -3298,6 +3410,7 @@ func clamp100(v float64) float64 {
 	return v
 }
 
+// roundToFixed 转换四舍五入定点。
 func roundToFixed(v float64, digits int) float64 {
 	if digits < 0 {
 		return v

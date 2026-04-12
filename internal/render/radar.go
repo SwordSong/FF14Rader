@@ -18,6 +18,7 @@ type RadarChart struct {
 	Height int
 }
 
+// NewRadarChart 创建雷达图渲染器实例。
 func NewRadarChart(w, h int) *RadarChart {
 	return &RadarChart{Width: w, Height: h}
 }
@@ -125,6 +126,7 @@ func (r *RadarChart) Draw(perf *models.Performance, outputPath string) error {
 	return r.DrawMetrics("九维评分", labels, values, outputPath)
 }
 
+// clampMetric 限制指标。
 func clampMetric(v float64) float64 {
 	if v < 0 {
 		return 0
@@ -135,6 +137,7 @@ func clampMetric(v float64) float64 {
 	return v
 }
 
+// loadFontFaceWithFallback 按顺序尝试候选字体并返回首个可用字体。
 func loadFontFaceWithFallback(dc *gg.Context, size float64) {
 	paths := []string{
 		"/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -152,6 +155,7 @@ func loadFontFaceWithFallback(dc *gg.Context, size float64) {
 	}
 }
 
+// loadFontFaceCompat 按兼容模式加载字体并返回字形信息。
 func loadFontFaceCompat(dc *gg.Context, path string, size float64) error {
 	if err := dc.LoadFontFace(path, size); err == nil {
 		return nil

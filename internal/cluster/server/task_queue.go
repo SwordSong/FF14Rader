@@ -1,4 +1,4 @@
-package cluster
+package server
 
 import (
 	"fmt"
@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	cluster "github.com/user/ff14rader/internal/cluster"
 )
 
 const (
@@ -15,6 +17,7 @@ const (
 	taskDoneKeepTTL   = 30 * time.Minute
 )
 
+// DispatchTask 表示一个待分发或执行中的任务。
 type DispatchTask struct {
 	ID         string    `json:"id"`
 	PlayerID   uint      `json:"playerId"`
@@ -37,6 +40,7 @@ type DispatchTaskQueue struct {
 
 var globalDispatchTaskQueue = NewDispatchTaskQueue()
 
+// NewDispatchTaskQueue 创建分发任务队列。
 func NewDispatchTaskQueue() *DispatchTaskQueue {
 	return &DispatchTaskQueue{
 		tasks:    make(map[string]*DispatchTask),
@@ -44,12 +48,13 @@ func NewDispatchTaskQueue() *DispatchTaskQueue {
 	}
 }
 
+// GlobalDispatchTaskQueue 返回全局分发任务队列。
 func GlobalDispatchTaskQueue() *DispatchTaskQueue {
 	return globalDispatchTaskQueue
 }
 
 func reportTaskKey(playerID uint, reportCode string) string {
-	return fmt.Sprintf("%d:%s", playerID, NormalizeReportCode(reportCode))
+	return fmt.Sprintf("%d:%s", playerID, cluster.NormalizeReportCode(reportCode))
 }
 
 func (q *DispatchTaskQueue) cleanupDoneLocked(now time.Time) {
@@ -67,8 +72,9 @@ func (q *DispatchTaskQueue) cleanupDoneLocked(now time.Time) {
 	}
 }
 
+// EnqueueReports 入队报告列表。
 func (q *DispatchTaskQueue) EnqueueReports(playerID uint, host string, reports []string) (int, error) {
-	h := NormalizeHost(host)
+	h := cluster.NormalizeHost(host)
 	if playerID == 0 {
 		return 0, fmt.Errorf("invalid playerID")
 	}
@@ -87,7 +93,7 @@ func (q *DispatchTaskQueue) EnqueueReports(playerID uint, host string, reports [
 	q.cleanupDoneLocked(now)
 
 	for _, raw := range reports {
-		code := NormalizeReportCode(raw)
+		code := cluster.NormalizeReportCode(raw)
 		if code == "" {
 			continue
 		}
@@ -122,8 +128,9 @@ func (q *DispatchTaskQueue) EnqueueReports(playerID uint, host string, reports [
 	return queued, nil
 }
 
+// Claim 领取任务。
 func (q *DispatchTaskQueue) Claim(host string, limit int, lease time.Duration) []DispatchTask {
-	h := NormalizeHost(host)
+	h := cluster.NormalizeHost(host)
 	if h == "" || limit <= 0 {
 		return nil
 	}
@@ -197,9 +204,10 @@ func (q *DispatchTaskQueue) Claim(host string, limit int, lease time.Duration) [
 	return out
 }
 
+// Ack 确认任务执行结果。
 func (q *DispatchTaskQueue) Ack(taskID, host string, success bool, errText string) bool {
 	id := strings.TrimSpace(taskID)
-	h := NormalizeHost(host)
+	h := cluster.NormalizeHost(host)
 	if id == "" || h == "" {
 		return false
 	}
@@ -232,6 +240,7 @@ func (q *DispatchTaskQueue) Ack(taskID, host string, success bool, errText strin
 	return true
 }
 
+// IsReportDone 判断报告是否已完成。
 func (q *DispatchTaskQueue) IsReportDone(playerID uint, reportCode string) bool {
 	key := reportTaskKey(playerID, reportCode)
 	if key == "" {
@@ -253,6 +262,7 @@ func (q *DispatchTaskQueue) IsReportDone(playerID uint, reportCode string) bool 
 	return task.Status == taskStatusDone
 }
 
+// Snapshot 返回任务快照。
 func (q *DispatchTaskQueue) Snapshot() []DispatchTask {
 	q.mu.Lock()
 	defer q.mu.Unlock()

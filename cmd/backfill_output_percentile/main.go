@@ -30,13 +30,9 @@ func main() {
 	if cfg.PostgresWriteDSN == "" || cfg.PostgresReadDSN == "" {
 		log.Fatalf("Postgres DSN missing (POSTGRES_WRITE_DSN/POSTGRES_READ_DSN)")
 	}
-	if cfg.FFLogsClientID == "" || cfg.FFLogsClientSecret == "" {
-		log.Fatalf("FFLogs credentials missing (FFLOGS_CLIENT_ID/FFLOGS_CLIENT_SECRET)")
-	}
-
 	db.InitDB(cfg.PostgresWriteDSN, cfg.PostgresReadDSN)
 
-	client := api.NewFFLogsClient(cfg.FFLogsClientID, cfg.FFLogsClientSecret)
+	client := api.NewFFLogsClient()
 	syncManager := api.NewSyncManager(client)
 
 	if playerID > 0 {

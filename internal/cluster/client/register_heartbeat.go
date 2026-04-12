@@ -1,4 +1,4 @@
-package cluster
+package client
 
 import (
 	"bytes"
@@ -6,20 +6,15 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
-	"os"
-	"strconv"
 	"strings"
 	"time"
+
+	cluster "github.com/user/ff14rader/internal/cluster"
 )
 
 const (
-	defaultHeartbeatInterval = 30 * time.Second
-	defaultHostTTL           = 2 * time.Minute
-	defaultEvictInterval     = 30 * time.Second
-	defaultRegisterTimeout   = 10 * time.Second
-	defaultHeartbeatTimeout  = 5 * time.Second
-	defaultRegisterWait      = 20 * time.Second
+	defaultRegisterTimeout  = 10 * time.Second
+	defaultHeartbeatTimeout = 5 * time.Second
 )
 
 type masterRegisterPayload struct {
@@ -31,111 +26,15 @@ type masterHeartbeatPayload struct {
 	Host string `json:"host"`
 }
 
-func envDurationSeconds(key string, fallback time.Duration) time.Duration {
-	raw := strings.TrimSpace(os.Getenv(key))
-	if raw == "" {
-		return fallback
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil || v <= 0 {
-		return fallback
-	}
-	return time.Duration(v) * time.Second
-}
-
-func envBool(key string, fallback bool) bool {
-	raw := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
-	if raw == "" {
-		return fallback
-	}
-	switch raw {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return fallback
-	}
-}
-
-func ClusterMasterEndpoint() string {
-	raw := strings.TrimSpace(os.Getenv("CLUSTER_MASTER_ENDPOINT"))
-	if raw == "" {
-		raw = strings.TrimSpace(os.Getenv("CLUSTER_MASTER_URL"))
-	}
-	if raw == "" {
-		return ""
-	}
-	if !strings.Contains(raw, "://") {
-		raw = "http://" + raw
-	}
-
-	u, err := url.Parse(raw)
-	if err != nil || strings.TrimSpace(u.Host) == "" {
-		return ""
-	}
-	u.Path = ""
-	u.RawPath = ""
-	u.RawQuery = ""
-	u.Fragment = ""
-	return strings.TrimRight(u.String(), "/")
-}
-
-func ClusterAutoRegisterEnabled() bool {
-	master := ClusterMasterEndpoint()
-	if master == "" {
-		return false
-	}
-	return envBool("CLUSTER_AUTO_REGISTER", true)
-}
-
-func ClusterHeartbeatInterval() time.Duration {
-	return envDurationSeconds("CLUSTER_HEARTBEAT_INTERVAL_SEC", defaultHeartbeatInterval)
-}
-
-func ClusterHostTTL() time.Duration {
-	return envDurationSeconds("CLUSTER_HOST_TTL_SEC", defaultHostTTL)
-}
-
-func ClusterEvictInterval() time.Duration {
-	return envDurationSeconds("CLUSTER_EVICT_INTERVAL_SEC", defaultEvictInterval)
-}
-
-func ClusterRegisterWait() time.Duration {
-	return envDurationSeconds("CLUSTER_REGISTER_WAIT_SEC", defaultRegisterWait)
-}
-
-func StartRegistryEvictLoop(registry *ReportHostRegistry) {
-	if registry == nil {
-		return
-	}
-	ttl := ClusterHostTTL()
-	interval := ClusterEvictInterval()
-	if ttl <= 0 || interval <= 0 {
-		return
-	}
-
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			expiredHosts, removedReports := registry.EvictExpiredHosts(ttl)
-			if len(expiredHosts) == 0 {
-				continue
-			}
-			log.Printf("[CLUSTER] 节点过期剔除 hosts=%v removedReports=%d ttl=%s", expiredHosts, removedReports, ttl)
-		}
-	}()
-}
-
-func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
-	if registry == nil || !ClusterAutoRegisterEnabled() {
+// StartAutoRegisterAndHeartbeat 启动客户端自动注册与心跳。
+func StartAutoRegisterAndHeartbeat() {
+	if !ClusterAutoRegisterEnabled() {
 		return
 	}
 
 	master := ClusterMasterEndpoint()
-	host := LocalHost()
-	scanDir := ReportsScanDir()
+	host := cluster.LocalHost()
+	scanDir := cluster.ReportsScanDir()
 	heartbeatInterval := ClusterHeartbeatInterval()
 	if heartbeatInterval < 3*time.Second {
 		heartbeatInterval = 3 * time.Second
@@ -147,7 +46,7 @@ func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
 		registerWait := ClusterRegisterWait()
 
 		registerOnce := func() {
-			reports, err := CollectReportCodesFromDir(scanDir)
+			reports, err := cluster.CollectReportCodesFromDir(scanDir)
 			if err != nil {
 				log.Printf("[CLUSTER] 自动注册读取本地 reports 失败 host=%s dir=%s err=%v", host, scanDir, err)
 				return
@@ -177,14 +76,14 @@ func StartAutoRegisterAndHeartbeat(registry *ReportHostRegistry) {
 				registerOnce()
 				continue
 			}
-			registry.HeartbeatHost(host)
 		}
 	}()
 }
 
+// waitMasterReady 等待主节点健康检查通过。
 func waitMasterReady(client *http.Client, masterEndpoint string, timeout time.Duration) error {
 	if timeout <= 0 {
-		timeout = defaultRegisterWait
+		timeout = 20 * time.Second
 	}
 	deadline := time.Now().Add(timeout)
 	healthURL := strings.TrimRight(masterEndpoint, "/") + "/healthz"
@@ -208,11 +107,9 @@ func waitMasterReady(client *http.Client, masterEndpoint string, timeout time.Du
 	}
 }
 
+// postRegisterToMaster 向主节点发送报告注册请求。
 func postRegisterToMaster(client *http.Client, masterEndpoint, host string, reports []string) error {
-	payload := masterRegisterPayload{
-		Host:    host,
-		Reports: reports,
-	}
+	payload := masterRegisterPayload{Host: host, Reports: reports}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -236,6 +133,7 @@ func postRegisterToMaster(client *http.Client, masterEndpoint, host string, repo
 	return nil
 }
 
+// postHeartbeatToMaster 向主节点发送心跳请求。
 func postHeartbeatToMaster(client *http.Client, masterEndpoint, host string) error {
 	payload := masterHeartbeatPayload{Host: host}
 	body, err := json.Marshal(payload)

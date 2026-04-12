@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/user/ff14rader/internal/db"
 )
 
 const (
@@ -19,12 +20,8 @@ const (
 )
 
 type FFLogsClient struct {
-	clientID     string
-	clientSecret string
-	accessToken  string
-	tokenExpiry  time.Time
-	mu           sync.RWMutex
-	httpClient   *http.Client
+	mu         sync.RWMutex
+	httpClient *http.Client
 
 	// 配额统计
 	TotalCalls    int     // 累计调用次数
@@ -33,12 +30,10 @@ type FFLogsClient struct {
 	PointsResetIn int     // 重置剩余时间 (秒)
 }
 
-// NewFFLogsClient 创建一个新的 FFLogs 客户端
-func NewFFLogsClient(clientID, clientSecret string) *FFLogsClient {
+// NewFFLogsClient 创建日志平台 V2 客户端实例。
+func NewFFLogsClient() *FFLogsClient {
 	return &FFLogsClient{
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		httpClient:   &http.Client{Timeout: getV2Timeout()},
+		httpClient: &http.Client{Timeout: getV2Timeout()},
 	}
 }
 
@@ -54,62 +49,36 @@ func (c *FFLogsClient) PrintQuotaSummary() {
 	fmt.Printf("---------------------------\n")
 }
 
-// GetAccessToken 获取或刷新 OAuth2 令牌
-func (c *FFLogsClient) GetAccessToken() (string, error) {
-	c.mu.RLock()
-	if c.accessToken != "" && time.Now().Before(c.tokenExpiry) {
-		token := c.accessToken
-		c.mu.RUnlock()
-		return token, nil
-	}
-	c.mu.RUnlock()
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// 再次检查以防竞态
-	if c.accessToken != "" && time.Now().Before(c.tokenExpiry) {
-		return c.accessToken, nil
+// GetAccessToken 获取或刷新日志平台 V2 访问令牌。
+func GetAccessToken() (string, error) {
+	var row struct {
+		ID    int    `gorm:"column:id"`
+		APIID string `gorm:"column:api_id"`
 	}
 
-	data := url.Values{}
-	data.Set("grant_type", "client_credentials")
-
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+	err := db.DB.Raw(`
+	SELECT id, api_id
+	FROM fflogskey
+	WHERE ver = 2
+	AND COALESCE(api_id, '') <> ''
+	AND COALESCE(used, 0) < 2900
+	ORDER BY COALESCE(used, 0) ASC, id ASC
+	LIMIT 1
+	`).Scan(&row).Error
 	if err != nil {
 		return "", err
 	}
 
-	req.SetBasicAuth(c.clientID, c.clientSecret)
-	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("获取令牌失败: %s", resp.Status)
+	apiID := strings.TrimSpace(row.APIID)
+	if row.ID <= 0 || apiID == "" {
+		return "", fmt.Errorf("fflogskey 中没有可用的 ver=2 api_id")
 	}
 
-	var result struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-
-	c.accessToken = result.AccessToken
-	// 提前 1 分钟过期以保证安全
-	c.tokenExpiry = time.Now().Add(time.Duration(result.ExpiresIn-60) * time.Second)
-
-	return c.accessToken, nil
+	_ = db.DB.Exec(`UPDATE fflogskey SET used = COALESCE(used, 0) + 1 WHERE id = ?`, row.ID).Error
+	return apiID, nil
 }
 
-// ExecuteQuery 执行 GraphQL 查询
+// ExecuteQuery 执行日志平台图查询请求。
 func (c *FFLogsClient) ExecuteQuery(ctx context.Context, query string, variables map[string]interface{}) (map[string]interface{}, error) {
 	retries := getV2RetryCount()
 	attempts := retries + 1
@@ -124,7 +93,7 @@ func (c *FFLogsClient) ExecuteQuery(ctx context.Context, query string, variables
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, getV2Timeout())
-		token, err := c.GetAccessToken()
+		token, err := GetAccessToken()
 		if err != nil {
 			cancel()
 			return nil, err
@@ -199,7 +168,7 @@ func (c *FFLogsClient) ExecuteQuery(ctx context.Context, query string, variables
 		c.TotalCalls++
 		if response.Data != nil {
 			if rateLimitData, ok := response.Data["rateLimitData"].(map[string]interface{}); ok {
-				// FFLogs V2 API 字段为 pointsSpentThisHour
+				// FFLogs 返回fflogs信息。
 				if spent, ok := rateLimitData["pointsSpentThisHour"].(float64); ok {
 					// 注意：pointsSpentThisHour 是本小时累计，不是单次消耗
 					// 我们这里仅更新 client 记录的总配额状态
@@ -224,13 +193,13 @@ func (c *FFLogsClient) ExecuteQuery(ctx context.Context, query string, variables
 	return nil, lastErr
 }
 
+// invalidateToken 清除当前令牌，强制下次调用刷新
 func (c *FFLogsClient) invalidateToken() {
 	c.mu.Lock()
-	c.accessToken = ""
-	c.tokenExpiry = time.Time{}
 	c.mu.Unlock()
 }
 
+// getV2Timeout 获取V2超时。
 func getV2Timeout() time.Duration {
 	const defaultTimeout = 120 * time.Second
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V2_TIMEOUT_SEC")); raw != "" {
@@ -241,6 +210,7 @@ func getV2Timeout() time.Duration {
 	return defaultTimeout
 }
 
+// getV2RetryCount 获取V2重试数量。
 func getV2RetryCount() int {
 	const defaultRetries = 2
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V2_RETRY")); raw != "" {
@@ -251,6 +221,7 @@ func getV2RetryCount() int {
 	return defaultRetries
 }
 
+// shouldRetryRequest 判断请求失败后是否应重试。
 func shouldRetryRequest(err error, statusCode int) bool {
 	if statusCode == http.StatusTooManyRequests {
 		return true

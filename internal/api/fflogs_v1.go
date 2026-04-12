@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/user/ff14rader/internal/cluster"
+	clusterserver "github.com/user/ff14rader/internal/cluster/server"
 	"github.com/user/ff14rader/internal/db"
 	"github.com/user/ff14rader/internal/models"
 )
@@ -36,7 +37,7 @@ type v1FightsResponse struct {
 	End    int64     `json:"end"`
 	Title  string    `json:"title"`
 	Fights []v1Fight `json:"fights"`
-	// Processing is true when FFLogs is still building the report.
+	// Processing 返回processing信息。
 	Processing bool `json:"processing"`
 }
 
@@ -93,7 +94,7 @@ type clusterExecuteReportsResponse struct {
 
 // downloadV1Reports 并行下载多个报告的战斗详情和事件数据，返回成功下载的报告代码列表
 
-// downloadV1Reports 根据 fight_sync_maps 的 MasterID 下载 V1 事件数据
+// downloadV1Reports 下载并处理指定玩家的 V1 报告数据。
 func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]string, error) {
 	reportWorkers := getV1ReportConcurrency()
 	fightWorkers := getV1DownloadConcurrency()
@@ -150,11 +151,11 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 		}
 
 		localHost := cluster.LocalHost()
-		taskMode := clusterTaskMode()
+		taskMode := clusterserver.ClusterTaskMode()
 		reportAssignedHost := make(map[string]string, len(reportCodes))
 		for _, code := range reportCodes {
 			fightCount := len(grouped[code])
-			assigned := cluster.GlobalReportHostRegistry().AssignHostForReport(code, fightCount, candidateHosts)
+			assigned := clusterserver.GlobalReportHostRegistry().AssignHostForReport(code, fightCount, candidateHosts)
 			reportAssignedHost[code] = assigned
 			if assigned == "" {
 				log.Printf("[CLUSTER] 报告 %s 未匹配到可用 host，回退本地执行", code)
@@ -189,7 +190,7 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 					assignedHost := reportAssignedHost[code]
 					if assignedHost != "" && assignedHost != localHost {
 						if taskMode == "pull" {
-							queued, queueErr := cluster.GlobalDispatchTaskQueue().EnqueueReports(playerID, assignedHost, []string{code})
+							queued, queueErr := clusterserver.GlobalDispatchTaskQueue().EnqueueReports(playerID, assignedHost, []string{code})
 							if queueErr == nil {
 								if queued > 0 {
 									log.Printf("[CLUSTER] 报告 %s 已入队等待 host=%s 拉取执行", code, assignedHost)
@@ -281,6 +282,7 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 	}
 }
 
+// markCompletedReportParseLogs 将下载完成的报告标记为已完成解析。
 func markCompletedReportParseLogs(playerID uint) error {
 	return db.DB.Exec(`
 UPDATE reports r
@@ -297,6 +299,7 @@ WHERE r.player_id = ?
 `, playerID).Error
 }
 
+// getV1ApiKey 获取V1API键。
 func getV1ApiKey() (string, error) {
 	key := strings.TrimSpace(os.Getenv("FFLOGS_V1_API_KEY"))
 	if key == "" {
@@ -305,6 +308,7 @@ func getV1ApiKey() (string, error) {
 	return key, nil
 }
 
+// getV1BaseURL 获取日志平台 V1 接口基础地址。
 func getV1BaseURL() string {
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_BASE_URL")); raw != "" {
 		return strings.TrimRight(raw, "/")
@@ -312,6 +316,7 @@ func getV1BaseURL() string {
 	return defaultV1BaseURL
 }
 
+// getAllReportsDir 获取全量报告列表目录。
 func getAllReportsDir() string {
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_ALL_REPORTS_DIR")); raw != "" {
 		return raw
@@ -319,6 +324,7 @@ func getAllReportsDir() string {
 	return defaultAllReportsDir
 }
 
+// getV1DownloadConcurrency 获取 V1 战斗下载并发数。
 func getV1DownloadConcurrency() int {
 	const defaultConcurrency = 3
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_CONCURRENCY")); raw != "" {
@@ -329,6 +335,7 @@ func getV1DownloadConcurrency() int {
 	return defaultConcurrency
 }
 
+// getV1ReportConcurrency 获取V1报告并发。
 func getV1ReportConcurrency() int {
 	const defaultConcurrency = 2
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_REPORT_CONCURRENCY")); raw != "" {
@@ -339,6 +346,7 @@ func getV1ReportConcurrency() int {
 	return defaultConcurrency
 }
 
+// getV1ReportTimeout 获取V1报告超时。
 func getV1ReportTimeout() time.Duration {
 	const defaultTimeout = 120 * time.Second
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_REPORT_TIMEOUT_SEC")); raw != "" {
@@ -349,6 +357,7 @@ func getV1ReportTimeout() time.Duration {
 	return defaultTimeout
 }
 
+// getV1RetryCount 获取V1重试数量。
 func getV1RetryCount() int {
 	const defaultRetry = 1
 	if raw := strings.TrimSpace(os.Getenv("FFLOGS_V1_RETRY")); raw != "" {
@@ -359,6 +368,7 @@ func getV1RetryCount() int {
 	return defaultRetry
 }
 
+// getV1TranslateEnabled 获取V1翻译启用状态。
 func getV1TranslateEnabled() bool {
 	raw := strings.TrimSpace(strings.ToLower(os.Getenv("FFLOGS_V1_TRANSLATE")))
 	switch raw {
@@ -371,6 +381,7 @@ func getV1TranslateEnabled() bool {
 	}
 }
 
+// newV1HTTPClient 创建 V1 报告下载专用 HTTP 客户端。
 func newV1HTTPClient(timeout time.Duration) *http.Client {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -396,6 +407,7 @@ func newV1HTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// fetchV1Fights 返回拉取V1战斗列表。
 func fetchV1Fights(ctx context.Context, client *http.Client, baseURL, apiKey, code string) (*v1FightsResponse, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -431,6 +443,7 @@ func fetchV1Fights(ctx context.Context, client *http.Client, baseURL, apiKey, co
 	return &parsed, nil
 }
 
+// fetchV1Events 返回拉取V1事件列表。
 func fetchV1Events(ctx context.Context, client *http.Client, baseURL, apiKey, code string, fight v1Fight) ([]map[string]interface{}, error) {
 	if fight.EndTime <= fight.StartTime {
 		return nil, fmt.Errorf("invalid fight time range")
@@ -442,6 +455,7 @@ func fetchV1Events(ctx context.Context, client *http.Client, baseURL, apiKey, co
 	return events, nil
 }
 
+// fetchV1EventsRange 拉取V1事件列表范围。
 func fetchV1EventsRange(ctx context.Context, client *http.Client, baseURL, apiKey, code string, start, end int64) ([]map[string]interface{}, v1EventsFetchStats, error) {
 	if end <= start {
 		return nil, v1EventsFetchStats{}, fmt.Errorf("invalid time range")
@@ -473,6 +487,7 @@ func fetchV1EventsRange(ctx context.Context, client *http.Client, baseURL, apiKe
 	return all, stats, nil
 }
 
+// fetchV1EventsPage 返回拉取V1事件列表分页。
 func fetchV1EventsPage(ctx context.Context, client *http.Client, baseURL, apiKey, code string, start, end int64) (*v1EventsResponse, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -513,6 +528,7 @@ func fetchV1EventsPage(ctx context.Context, client *http.Client, baseURL, apiKey
 	return &parsed, nil
 }
 
+// writeJSON 写入JSON。
 func writeJSON(path string, payload interface{}) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -521,6 +537,7 @@ func writeJSON(path string, payload interface{}) error {
 	return os.WriteFile(path, data, 0644)
 }
 
+// truncate 返回截断。
 func truncate(input string, max int) string {
 	if max <= 0 || len(input) <= max {
 		return input
@@ -528,6 +545,7 @@ func truncate(input string, max int) string {
 	return input[:max]
 }
 
+// toV1SavedEventsPayload 组装用于持久化的 V1 事件载荷结构。
 func toV1SavedEventsPayload(events []map[string]interface{}) v1SavedEventsPayload {
 	return v1SavedEventsPayload{
 		Events: events,
@@ -535,6 +553,7 @@ func toV1SavedEventsPayload(events []map[string]interface{}) v1SavedEventsPayloa
 	}
 }
 
+// downloadV1Report 下载单份 V1 报告的战斗与事件数据。
 func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey, rootDir string, playerID uint, code string, pending []pendingFightEntry, fightWorkers int, fightTimeout time.Duration) (int, bool, error) {
 	fights, err := fetchV1Fights(ctx, client, baseURL, apiKey, code)
 	if err != nil {
@@ -725,12 +744,14 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 	return int(successCount), reportDone && atomic.LoadInt32(&allDone) == 1, nil
 }
 
+// markFightDownloadedByID 标记战斗已下载id。
 func markFightDownloadedByID(mappingID uint) error {
 	return db.DB.Model(&models.FightSyncMap{}).
 		Where("id = ?", mappingID).
 		Updates(map[string]interface{}{"downloaded": true, "downloaded_at": time.Now()}).Error
 }
 
+// isFightDownloadedByMasterID 判断战斗已下载主节点id是否满足条件。
 func isFightDownloadedByMasterID(masterID string) (bool, error) {
 	var count int64
 	if err := db.DB.Model(&models.FightSyncMap{}).
@@ -741,6 +762,7 @@ func isFightDownloadedByMasterID(masterID string) (bool, error) {
 	return count > 0, nil
 }
 
+// isUsableV1EventsFile 判断可用V1事件列表文件是否满足条件。
 func isUsableV1EventsFile(eventsPath string) bool {
 	data, err := os.ReadFile(eventsPath)
 	if err != nil || len(data) == 0 {
@@ -765,6 +787,7 @@ func isUsableV1EventsFile(eventsPath string) bool {
 	return false
 }
 
+// isReportDownloadedByMaster 判断报告已下载主节点是否满足条件。
 func isReportDownloadedByMaster(playerID uint, code string) (bool, error) {
 	var count int64
 	if err := db.DB.Model(&models.FightSyncMap{}).
@@ -775,6 +798,7 @@ func isReportDownloadedByMaster(playerID uint, code string) (bool, error) {
 	return count == 0, nil
 }
 
+// loadPendingFights 加载待处理战斗列表。
 func loadPendingFights(playerID uint) ([]pendingFightEntry, error) {
 	var maps []models.FightSyncMap
 	if err := db.DB.Select("id", "master_id").
@@ -804,6 +828,7 @@ func loadPendingFights(playerID uint) ([]pendingFightEntry, error) {
 	return entries, nil
 }
 
+// groupPendingFights 分组待处理战斗列表。
 func groupPendingFights(entries []pendingFightEntry) map[string][]pendingFightEntry {
 	grouped := make(map[string][]pendingFightEntry)
 	for _, entry := range entries {
@@ -812,6 +837,7 @@ func groupPendingFights(entries []pendingFightEntry) map[string][]pendingFightEn
 	return grouped
 }
 
+// splitMasterID 拆分主节点ID。
 func splitMasterID(masterID string) (string, int, bool) {
 	idx := strings.LastIndex(masterID, "-")
 	if idx <= 0 || idx >= len(masterID)-1 {
@@ -828,6 +854,7 @@ func splitMasterID(masterID string) (string, int, bool) {
 	return code, fightID, true
 }
 
+// clusterControlPort 返回集群控制端口。
 func clusterControlPort() string {
 	if raw := strings.TrimSpace(os.Getenv("CLUSTER_CONTROL_PORT")); raw != "" {
 		return raw
@@ -838,6 +865,7 @@ func clusterControlPort() string {
 	return "22027"
 }
 
+// dispatchReportsToHost 返回分发报告列表目标主机。
 func (s *SyncManager) dispatchReportsToHost(ctx context.Context, host string, playerID uint, reportCodes []string) error {
 	normalizedHost := cluster.NormalizeHost(host)
 	if normalizedHost == "" {
@@ -985,7 +1013,7 @@ func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID uint,
 	return markCompletedReportParseLogs(playerID)
 }
 
-// BackfillPlayerOutputPercentiles 兼容旧命名：直接通过 FFLogs 接口刷新指定玩家 output_ability。
+// BackfillPlayerOutputPercentiles 返回回填玩家输出百分位。
 func (s *SyncManager) BackfillPlayerOutputPercentiles(playerID uint) (int, error) {
 	if playerID == 0 {
 		return 0, nil
@@ -1000,14 +1028,14 @@ func (s *SyncManager) BackfillPlayerOutputPercentiles(playerID uint) (int, error
 	if region == "" {
 		region = "CN"
 	}
-	if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), player.ID, player.Name, player.Server, region); err != nil {
+	if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), uint(player.ID), player.Name, player.Server, region); err != nil {
 		return 0, err
 	}
 
 	return 1, nil
 }
 
-// BackfillAllOutputPercentiles 兼容旧命名：批量通过 FFLogs 接口刷新所有玩家 output_ability。
+// BackfillAllOutputPercentiles 返回backfill全量outputpercentiles信息。
 // 返回处理玩家数量和成功刷新数量。
 func (s *SyncManager) BackfillAllOutputPercentiles() (int, int, error) {
 	var players []models.Player
@@ -1023,7 +1051,7 @@ func (s *SyncManager) BackfillAllOutputPercentiles() (int, int, error) {
 		if region == "" {
 			region = "CN"
 		}
-		if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), player.ID, player.Name, player.Server, region); err != nil {
+		if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), uint(player.ID), player.Name, player.Server, region); err != nil {
 			log.Printf("[WARN] 刷新玩家输出能力失败 player_id=%d name=%s: %v", player.ID, player.Name, err)
 			continue
 		}
@@ -1033,6 +1061,7 @@ func (s *SyncManager) BackfillAllOutputPercentiles() (int, int, error) {
 	return len(players), success, nil
 }
 
+// buildAllReportsIndex 构建全量报告列表索引。
 func buildAllReportsIndex() (map[string]int, error) {
 	rootDir := getAllReportsDir()
 	entries, err := os.ReadDir(rootDir)
