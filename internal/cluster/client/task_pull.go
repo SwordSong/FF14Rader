@@ -13,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/user/ff14rader/internal/api"
 	cluster "github.com/user/ff14rader/internal/cluster"
+	"github.com/user/ff14rader/internal/models"
 )
 
 const (
@@ -23,8 +25,11 @@ const (
 	defaultPullExecTimeout = 25 * time.Minute
 )
 
+var fflogsclient = *api.NewFFLogsClient()
+var syncManager = *api.NewSyncManager(&fflogsclient)
+
 type assignedReportsExecutor interface {
-	ExecuteAssignedReports(ctx context.Context, playerID uint, reports []string) error
+	ExecuteAssignedReports(ctx context.Context, playerID int, reports []string) error
 }
 
 type pullTaskClaimRequest struct {
@@ -42,8 +47,13 @@ type pullTaskAckRequest struct {
 
 type pullTaskItem struct {
 	TaskID   string   `json:"taskId"`
-	PlayerID uint     `json:"playerId"`
+	PlayerID int      `json:"playerId"`
 	Reports  []string `json:"reports"`
+}
+
+type pullPlayerLiteItem struct {
+	Status string            `json:"status"`
+	User   models.PlayerLite `json:"user"`
 }
 
 type pullTaskClaimResponse struct {
@@ -110,6 +120,7 @@ func clusterPullExecTimeout() time.Duration {
 	return time.Duration(envIntWithDefault("CLUSTER_PULL_EXEC_TIMEOUT_SEC", int(defaultPullExecTimeout.Seconds()))) * time.Second
 }
 
+// claimTasksFromMaster 从主节点/api/cluster/tasks/claim请求任务reportCode。
 func claimTasksFromMaster(client *http.Client, master, host string, limit int, lease time.Duration) ([]pullTaskItem, error) {
 	payload := pullTaskClaimRequest{Host: host, Limit: limit, LeaseSec: int(lease.Seconds())}
 	body, err := json.Marshal(payload)
@@ -149,6 +160,46 @@ func claimTasksFromMaster(client *http.Client, master, host string, limit int, l
 	return parsed.Tasks, nil
 }
 
+// 通过/api/cluster/users/claim 获得username+server进行V2查询
+func claimPlayerLiteTasksFromMaster(client *http.Client, master, host string, limit int, lease time.Duration) (models.PlayerLite, error) {
+	payload := pullTaskClaimRequest{Host: host, Limit: limit, LeaseSec: int(lease.Seconds())}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return models.PlayerLite{}, err
+	}
+
+	urlText := strings.TrimRight(master, "/") + "/api/cluster/users/claim"
+	req, err := http.NewRequest(http.MethodPost, urlText, bytes.NewReader(body))
+	if err != nil {
+		return models.PlayerLite{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return models.PlayerLite{}, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return models.PlayerLite{}, fmt.Errorf("claim status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	if len(raw) == 0 {
+		return models.PlayerLite{}, nil
+	}
+
+	var parsed pullPlayerLiteItem
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return models.PlayerLite{}, err
+	}
+	if strings.TrimSpace(strings.ToLower(parsed.Status)) != "ok" {
+		return models.PlayerLite{}, fmt.Errorf("claim non-ok status: %s", parsed.Status)
+	}
+	return parsed.User, nil
+}
+
 func ackTaskToMaster(client *http.Client, master, host, taskID string, success bool, errText string) {
 	payload := pullTaskAckRequest{Host: host, TaskID: taskID, Success: success, Error: strings.TrimSpace(errText)}
 	body, err := json.Marshal(payload)
@@ -177,7 +228,7 @@ func ackTaskToMaster(client *http.Client, master, host, taskID string, success b
 	}
 }
 
-// StartClusterTaskPullLoop 启动客户端后台任务拉取循环并执行分配任务。
+// StartClusterTaskPullLoop 启动集群任务拉取循环。
 func StartClusterTaskPullLoop(executor assignedReportsExecutor) {
 	if executor == nil || !clusterPullEnabled() || clusterTaskMode() != "pull" {
 		return
@@ -230,6 +281,19 @@ func StartClusterTaskPullLoop(executor assignedReportsExecutor) {
 				log.Printf("[CLUSTER] 任务执行完成 host=%s task=%s", host, task.TaskID)
 				ackTaskToMaster(ackClient, master, host, task.TaskID, true, "")
 			}
+
+			//V2接口查询玩家阶段
+			PlayerLite, err := claimPlayerLiteTasksFromMaster(claimClient, master, host, batch, lease)
+			if err != nil {
+				log.Printf("[CLUSTER] 拉取玩家信息任务失败 master=%s host=%s err=%v", master, host, err)
+				return
+			}
+			if PlayerLite.PlayerID != 0 && strings.TrimSpace(PlayerLite.Name) != "" && strings.TrimSpace(PlayerLite.Server) != "" {
+				log.Printf("[CLUSTER] 拉取玩家信息任务成功 host=%s playerId=%d name=%s server=%s", host, PlayerLite.PlayerID, PlayerLite.Name, PlayerLite.Server)
+				ctx := context.Background()
+				syncManager.StartIncrementalSync(ctx, PlayerLite, "CN")
+			}
+
 		}
 
 		runOnce()

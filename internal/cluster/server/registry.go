@@ -7,21 +7,16 @@ import (
 	"time"
 
 	cluster "github.com/user/ff14rader/internal/cluster"
+	"github.com/user/ff14rader/internal/models"
 )
 
 // ReportHostRegistry 维护 reportCode 到 host 的映射及主机负载信息。
 type ReportHostRegistry struct {
 	mu         sync.RWMutex
-	user       map[int]UserInfo
+	user       map[int]models.PlayerLite
 	reportHost map[string]string
 	hostLoad   map[string]int
 	hostSeenAt map[string]time.Time
-}
-
-// UserInfo 保存玩家与服务器信息。
-type UserInfo struct {
-	User   string
-	Server string
 }
 
 var globalReportHostRegistry = NewReportHostRegistry()
@@ -29,7 +24,7 @@ var globalReportHostRegistry = NewReportHostRegistry()
 // NewReportHostRegistry 创建报告主机注册表。
 func NewReportHostRegistry() *ReportHostRegistry {
 	return &ReportHostRegistry{
-		user:       make(map[int]UserInfo),
+		user:       make(map[int]models.PlayerLite),
 		reportHost: make(map[string]string),
 		hostLoad:   make(map[string]int),
 		hostSeenAt: make(map[string]time.Time),
@@ -117,23 +112,23 @@ func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) 
 }
 
 // RegisterUserServer 注册玩家与服务器映射。
-func (r *ReportHostRegistry) RegisterUserServer(playID int, user, server string) bool {
-	user = strings.TrimSpace(user)
-	server = strings.TrimSpace(server)
+func (r *ReportHostRegistry) RegisterUserServer(player models.PlayerLite) bool {
+	user := strings.TrimSpace(player.Name)
+	server := strings.TrimSpace(player.Server)
 	if user == "" || server == "" {
 		return false
 	}
 	r.mu.Lock()
-	r.user[playID] = UserInfo{User: user, Server: server}
+	r.user[player.PlayerID] = player
 	r.mu.Unlock()
 	return true
 }
 
 // SnapshotUsers 返回玩家与服务器映射快照。
-func (r *ReportHostRegistry) SnapshotUsers() map[int]UserInfo {
+func (r *ReportHostRegistry) SnapshotUsers() map[int]models.PlayerLite {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make(map[int]UserInfo, len(r.user))
+	out := make(map[int]models.PlayerLite, len(r.user))
 	for k, v := range r.user {
 		out[k] = v
 	}
@@ -141,16 +136,16 @@ func (r *ReportHostRegistry) SnapshotUsers() map[int]UserInfo {
 }
 
 // ClaimUser 领取一个玩家映射并立即删除，避免多客户端重复处理同一条记录。
-func (r *ReportHostRegistry) ClaimUser(host string) (int, UserInfo, bool) {
+func (r *ReportHostRegistry) ClaimUser(host string) (int, models.PlayerLite, bool) {
 	if cluster.NormalizeHost(host) == "" {
-		return 0, UserInfo{}, false
+		return 0, models.PlayerLite{}, false
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if len(r.user) == 0 {
-		return 0, UserInfo{}, false
+		return 0, models.PlayerLite{}, false
 	}
 
 	ids := make([]int, 0, len(r.user))

@@ -29,12 +29,21 @@ type Player struct {
 	Reports          []Report  `gorm:"foreignKey:PlayerID" json:"reports"`
 	PicHash          string    `gorm:"size:50" json:"pichash"`
 	PicUpdatedAt     time.Time `json:"pic_updated_at"`
+	NewPlayer        bool      `json:"newPlayer"`
+}
+
+type PlayerLite struct {
+	PlayerID  int    `json:"playerId"`
+	NewPlayer bool   `json:"newPlayer"`
+	Name      string `json:"name"`
+	Server    string `json:"server"`
+	Region    string `json:"region"`
 }
 
 // Report 返回报告信息。
 type Report struct {
-	ID             uint           `gorm:"primaryKey"`
-	PlayerID       uint           `gorm:"not null;index" json:"player_id"`
+	ID             int            `gorm:"primaryKey"`
+	PlayerID       int            `gorm:"not null;index" json:"player_id"`
 	MasterReport   string         `gorm:"size:50;not null;index" json:"master_report"`
 	SourceReport   string         `gorm:"size:50;not null;uniqueIndex:idx_reports_player_source" json:"source_report"`
 	ParsedAt       time.Time      `json:"parsed_at"`
@@ -61,12 +70,12 @@ type FightCache struct {
 
 // FightSyncMap 战斗同步映射表 (用于多用户上传去重)
 type FightSyncMap struct {
-	ID                  uint           `gorm:"primaryKey"`
+	ID                  int            `gorm:"primaryKey"`
 	MasterID            string         `gorm:"index;size:100"`             // 基准 ID (第一个入库的战斗记录)
 	SourceIDs           []string       `gorm:"type:jsonb;serializer:json"` // 包含的所有原始报告 ID 列表 (JSON 数组)
 	FriendPlayers       []string       `gorm:"column:friendplayers;type:jsonb;serializer:json" json:"friendplayers"`
 	FriendPlayersUsable bool           `gorm:"column:friendplayers_usable;default:false;index" json:"friendplayers_usable"`
-	PlayerID            uint           `gorm:"index" json:"player_id"`
+	PlayerID            int            `gorm:"index" json:"player_id"`
 	Timestamp           int64          `gorm:"index"` // 战斗开始时间 (Master 的时间)
 	FightID             int            `json:"fight_id"`
 	Kill                bool           `json:"kill"`
@@ -102,8 +111,8 @@ type FightSyncMap struct {
 
 // Performance 指标汇总
 type Performance struct {
-	ID        uint      `gorm:"primaryKey"`
-	PlayerID  uint      `gorm:"index"`
+	ID        int       `gorm:"primaryKey"`
+	PlayerID  int       `gorm:"index"`
 	Version   string    `json:"version"` // 如 "7.0x"
 	Job       string    `json:"job"`
 	UpdatedAt time.Time `json:"updated_at"`

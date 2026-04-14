@@ -45,7 +45,7 @@ const (
 
 type Service struct {
 	apiURLs    []string
-	rrCounter  uint64
+	rrCounter  int64
 	root       string
 	client     *http.Client
 	weightMin  float64
@@ -806,13 +806,13 @@ func BuildChecklistGCDGateFromRaw(raw datatypes.JSON) *ChecklistGCDGate {
 }
 
 // ScoreFight 返回评分战斗信息。
-func (s *Service) ScoreFight(ctx context.Context, playerID uint, reportCode string, fightID int) error {
+func (s *Service) ScoreFight(ctx context.Context, playerID int, reportCode string, fightID int) error {
 	_, err := s.ScoreFightWithEndpoint(ctx, playerID, reportCode, fightID)
 	return err
 }
 
 // ScoreFightWithEndpoint 返回评分战斗端点信息。
-func (s *Service) ScoreFightWithEndpoint(ctx context.Context, playerID uint, reportCode string, fightID int) (string, error) {
+func (s *Service) ScoreFightWithEndpoint(ctx context.Context, playerID int, reportCode string, fightID int) (string, error) {
 	report, err := loadReportRow(playerID, reportCode)
 	if err != nil {
 		return "", err
@@ -934,7 +934,7 @@ func (s *Service) ScoreFightWithEndpoint(ctx context.Context, playerID uint, rep
 }
 
 // RefreshPlayerTeamAndStability 回填单个玩家的团队贡献、稳定度与潜力值。
-func (s *Service) RefreshPlayerTeamAndStability(playerID uint) error {
+func (s *Service) RefreshPlayerTeamAndStability(playerID int) error {
 	if playerID == 0 {
 		return nil
 	}
@@ -952,7 +952,7 @@ func (s *Service) RefreshPlayerTeamAndStability(playerID uint) error {
 
 // RefreshAllPlayersTeamAndStability 回填所有已评分玩家的团队贡献与稳定度，返回回填玩家数。
 func (s *Service) RefreshAllPlayersTeamAndStability() (int, error) {
-	var playerIDs []uint
+	var playerIDs []int
 	if err := db.DB.Table("fight_sync_maps").
 		Distinct("player_id").
 		Where("player_id > 0 AND scored_at IS NOT NULL").
@@ -1070,7 +1070,7 @@ func (s *Service) PreviewScoreFromAnalysisFileWithContext(analysisFile string, c
 }
 
 type fightScoreUpdate struct {
-	PlayerID            uint
+	PlayerID            int
 	MasterID            string
 	ReportCode          string
 	FightID             int
@@ -1091,7 +1091,7 @@ type fightScoreUpdate struct {
 }
 
 // buildScoreRow 构建评分记录。
-func (s *Service) buildScoreRow(playerID uint, reportCode string, fight fightRow, actor analyzedActor) (*fightScoreUpdate, error) {
+func (s *Service) buildScoreRow(playerID int, reportCode string, fight fightRow, actor analyzedActor) (*fightScoreUpdate, error) {
 	moduleMap := make(map[string]map[string]interface{}, len(actor.Modules))
 	for _, module := range actor.Modules {
 		moduleMap[strings.ToLower(module.Handle)] = module.Metrics
@@ -1644,8 +1644,8 @@ func (s *Service) pickAnalyzeURLForPayloadFromURLs(payload analyzeRequest, attem
 		return urls[idx]
 	}
 
-	idx := atomic.AddUint64(&s.rrCounter, 1)
-	base := int((idx - 1) % uint64(len(urls)))
+	idx := atomic.AddInt64(&s.rrCounter, 1)
+	base := int((idx - 1) % int64(len(urls)))
 	final := (base + (attempt - 1)) % len(urls)
 	return urls[final]
 }
@@ -1679,8 +1679,8 @@ func (s *Service) pickAnalyzeURL() string {
 	if len(s.apiURLs) == 0 {
 		return defaultAnalyzeURL
 	}
-	idx := atomic.AddUint64(&s.rrCounter, 1)
-	return s.apiURLs[(idx-1)%uint64(len(s.apiURLs))]
+	idx := atomic.AddInt64(&s.rrCounter, 1)
+	return s.apiURLs[(idx-1)%int64(len(s.apiURLs))]
 }
 
 // normalizeAnalyzeURL 解析分析URL。
@@ -2421,7 +2421,7 @@ func waitRetry(ctx context.Context, attempt int) error {
 }
 
 // loadPlayerName 获取玩家名称。
-func loadPlayerName(playerID uint) string {
+func loadPlayerName(playerID int) string {
 	var player models.Player
 	if err := db.DB.Select("name").Where("id = ?", playerID).First(&player).Error; err != nil {
 		return ""
@@ -2430,7 +2430,7 @@ func loadPlayerName(playerID uint) string {
 }
 
 // loadReportRow 获取报告记录。
-func loadReportRow(playerID uint, code string) (*models.Report, error) {
+func loadReportRow(playerID int, code string) (*models.Report, error) {
 	var reports []models.Report
 	q := db.DB.Model(&models.Report{}).
 		Where("player_id = ? AND (master_report = ? OR source_report = ?)", playerID, code, code).
@@ -2526,7 +2526,7 @@ func reportMetadataHasMasterData(raw datatypes.JSON) bool {
 }
 
 // loadFightRow 获取战斗记录。
-func loadFightRow(playerID uint, reportCode string, fightID int) (fightRow, error) {
+func loadFightRow(playerID int, reportCode string, fightID int) (fightRow, error) {
 	var rows []fightRow
 	codeJSON, _ := json.Marshal([]string{reportCode})
 	if err := db.DB.Table("fight_sync_maps").
@@ -2654,7 +2654,7 @@ func updateFightSyncScore(score *fightScoreUpdate) error {
 }
 
 // refreshPlayerBattleAbility 更新玩家战斗能力。
-func refreshPlayerBattleAbility(playerID uint) error {
+func refreshPlayerBattleAbility(playerID int) error {
 	if playerID == 0 {
 		return nil
 	}
@@ -2689,7 +2689,7 @@ func refreshPlayerBattleAbility(playerID uint) error {
 }
 
 // refreshPlayerTeamContribution 刷新玩家团队贡献评分。
-func refreshPlayerTeamContribution(playerID uint) error {
+func refreshPlayerTeamContribution(playerID int) error {
 	if playerID == 0 {
 		return nil
 	}
@@ -2724,7 +2724,7 @@ func refreshPlayerTeamContribution(playerID uint) error {
 }
 
 type stabilityFightRow struct {
-	ID                uint
+	ID                int
 	EncounterID       int
 	Kill              bool
 	Timestamp         int64
@@ -2741,7 +2741,7 @@ type rawStabilityMetrics struct {
 }
 
 // refreshPlayerStabilityScore 更新玩家稳定性评分。
-func refreshPlayerStabilityScore(playerID uint) error {
+func refreshPlayerStabilityScore(playerID int) error {
 	if playerID == 0 {
 		return nil
 	}
@@ -2966,7 +2966,7 @@ func weightedStdDev(values, weights []float64) float64 {
 }
 
 // refreshPlayerProgressionSpeed 刷新玩家开荒速度评分。
-func refreshPlayerProgressionSpeed(playerID uint) error {
+func refreshPlayerProgressionSpeed(playerID int) error {
 	if playerID == 0 {
 		return nil
 	}
@@ -3020,7 +3020,7 @@ func refreshPlayerProgressionSpeed(playerID uint) error {
 }
 
 // refreshPlayerPotentialScore 更新玩家潜力评分。
-func refreshPlayerPotentialScore(playerID uint) error {
+func refreshPlayerPotentialScore(playerID int) error {
 	if playerID == 0 {
 		return nil
 	}
@@ -3177,7 +3177,7 @@ func partySignature(names []string) string {
 }
 
 // loadJobBaseline 获取职业基线。
-func loadJobBaseline(playerID uint, job string) float64 {
+func loadJobBaseline(playerID int, job string) float64 {
 	canonical := canonicalJobKey(job)
 	if canonical == "" {
 		canonical = strings.ToUpper(strings.TrimSpace(job))

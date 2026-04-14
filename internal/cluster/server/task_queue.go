@@ -20,7 +20,7 @@ const (
 // DispatchTask 表示一个待分发或执行中的任务。
 type DispatchTask struct {
 	ID         string    `json:"id"`
-	PlayerID   uint      `json:"playerId"`
+	PlayerID   int       `json:"playerId"`
 	Host       string    `json:"host"`
 	Reports    []string  `json:"reports"`
 	Status     string    `json:"status"`
@@ -35,7 +35,7 @@ type DispatchTaskQueue struct {
 	mu         sync.Mutex
 	tasks      map[string]*DispatchTask
 	byReport   map[string]string
-	nextTaskID uint64
+	nextTaskID int64
 }
 
 var globalDispatchTaskQueue = NewDispatchTaskQueue()
@@ -53,7 +53,7 @@ func GlobalDispatchTaskQueue() *DispatchTaskQueue {
 	return globalDispatchTaskQueue
 }
 
-func reportTaskKey(playerID uint, reportCode string) string {
+func reportTaskKey(playerID int, reportCode string) string {
 	return fmt.Sprintf("%d:%s", playerID, cluster.NormalizeReportCode(reportCode))
 }
 
@@ -73,7 +73,7 @@ func (q *DispatchTaskQueue) cleanupDoneLocked(now time.Time) {
 }
 
 // EnqueueReports 入队报告列表。
-func (q *DispatchTaskQueue) EnqueueReports(playerID uint, host string, reports []string) (int, error) {
+func (q *DispatchTaskQueue) EnqueueReports(playerID int, host string, reports []string) (int, error) {
 	h := cluster.NormalizeHost(host)
 	if playerID == 0 {
 		return 0, fmt.Errorf("invalid playerID")
@@ -241,7 +241,7 @@ func (q *DispatchTaskQueue) Ack(taskID, host string, success bool, errText strin
 }
 
 // IsReportDone 判断报告是否已完成。
-func (q *DispatchTaskQueue) IsReportDone(playerID uint, reportCode string) bool {
+func (q *DispatchTaskQueue) IsReportDone(playerID int, reportCode string) bool {
 	key := reportTaskKey(playerID, reportCode)
 	if key == "" {
 		return false

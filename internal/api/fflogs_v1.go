@@ -76,14 +76,14 @@ type allReportsFightEntry struct {
 }
 
 type pendingFightEntry struct {
-	MappingID  uint
+	MappingID  int
 	MasterID   string
 	ReportCode string
 	FightID    int
 }
 
 type clusterExecuteReportsRequest struct {
-	PlayerID uint     `json:"playerId"`
+	PlayerID int      `json:"playerId"`
 	Reports  []string `json:"reports"`
 }
 
@@ -95,7 +95,7 @@ type clusterExecuteReportsResponse struct {
 // downloadV1Reports 并行下载多个报告的战斗详情和事件数据，返回成功下载的报告代码列表
 
 // downloadV1Reports 下载并处理指定玩家的 V1 报告数据。
-func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]string, error) {
+func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID int) ([]string, error) {
 	reportWorkers := getV1ReportConcurrency()
 	fightWorkers := getV1DownloadConcurrency()
 	reportTimeout := getV1ReportTimeout()
@@ -283,7 +283,7 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID uint) ([]s
 }
 
 // markCompletedReportParseLogs 将下载完成的报告标记为已完成解析。
-func markCompletedReportParseLogs(playerID uint) error {
+func markCompletedReportParseLogs(playerID int) error {
 	return db.DB.Exec(`
 UPDATE reports r
 SET downloaded = true
@@ -554,7 +554,7 @@ func toV1SavedEventsPayload(events []map[string]interface{}) v1SavedEventsPayloa
 }
 
 // downloadV1Report 下载单份 V1 报告的战斗与事件数据。
-func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey, rootDir string, playerID uint, code string, pending []pendingFightEntry, fightWorkers int, fightTimeout time.Duration) (int, bool, error) {
+func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey, rootDir string, playerID int, code string, pending []pendingFightEntry, fightWorkers int, fightTimeout time.Duration) (int, bool, error) {
 	fights, err := fetchV1Fights(ctx, client, baseURL, apiKey, code)
 	if err != nil {
 		return 0, false, err
@@ -745,7 +745,7 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 }
 
 // markFightDownloadedByID 标记战斗已下载id。
-func markFightDownloadedByID(mappingID uint) error {
+func markFightDownloadedByID(mappingID int) error {
 	return db.DB.Model(&models.FightSyncMap{}).
 		Where("id = ?", mappingID).
 		Updates(map[string]interface{}{"downloaded": true, "downloaded_at": time.Now()}).Error
@@ -788,7 +788,7 @@ func isUsableV1EventsFile(eventsPath string) bool {
 }
 
 // isReportDownloadedByMaster 判断报告已下载主节点是否满足条件。
-func isReportDownloadedByMaster(playerID uint, code string) (bool, error) {
+func isReportDownloadedByMaster(playerID int, code string) (bool, error) {
 	var count int64
 	if err := db.DB.Model(&models.FightSyncMap{}).
 		Where("player_id = ? AND downloaded = ? AND master_id LIKE ?", playerID, false, code+"-%").
@@ -799,7 +799,7 @@ func isReportDownloadedByMaster(playerID uint, code string) (bool, error) {
 }
 
 // loadPendingFights 加载待处理战斗列表。
-func loadPendingFights(playerID uint) ([]pendingFightEntry, error) {
+func loadPendingFights(playerID int) ([]pendingFightEntry, error) {
 	var maps []models.FightSyncMap
 	if err := db.DB.Select("id", "master_id").
 		Where("player_id = ? AND downloaded = ?", playerID, false).
@@ -818,7 +818,7 @@ func loadPendingFights(playerID uint) ([]pendingFightEntry, error) {
 			continue
 		}
 		entries = append(entries, pendingFightEntry{
-			MappingID:  mapping.ID,
+			MappingID:  int(mapping.ID),
 			MasterID:   mapping.MasterID,
 			ReportCode: code,
 			FightID:    fightID,
@@ -866,7 +866,7 @@ func clusterControlPort() string {
 }
 
 // dispatchReportsToHost 返回分发报告列表目标主机。
-func (s *SyncManager) dispatchReportsToHost(ctx context.Context, host string, playerID uint, reportCodes []string) error {
+func (s *SyncManager) dispatchReportsToHost(ctx context.Context, host string, playerID int, reportCodes []string) error {
 	normalizedHost := cluster.NormalizeHost(host)
 	if normalizedHost == "" {
 		return fmt.Errorf("invalid host: %q", host)
@@ -927,7 +927,7 @@ func (s *SyncManager) dispatchReportsToHost(ctx context.Context, host string, pl
 }
 
 // ExecuteAssignedReports 由集群节点调用，仅处理指定报告集合的下载与解析。
-func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID uint, reportCodes []string) error {
+func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID int, reportCodes []string) error {
 	if playerID == 0 {
 		return fmt.Errorf("invalid playerID")
 	}
@@ -1014,13 +1014,12 @@ func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID uint,
 }
 
 // BackfillPlayerOutputPercentiles 返回回填玩家输出百分位。
-func (s *SyncManager) BackfillPlayerOutputPercentiles(playerID uint) (int, error) {
-	if playerID == 0 {
+func (s *SyncManager) BackfillPlayerOutputPercentiles(player models.Player) (int, error) {
+	if player.ID == 0 {
 		return 0, nil
 	}
 
-	var player models.Player
-	if err := db.DB.Select("id", "name", "server", "region").Where("id = ?", playerID).First(&player).Error; err != nil {
+	if err := db.DB.Select("id", "name", "server", "region").Where("id = ?", player.ID).First(&player).Error; err != nil {
 		return 0, err
 	}
 
@@ -1028,7 +1027,7 @@ func (s *SyncManager) BackfillPlayerOutputPercentiles(playerID uint) (int, error
 	if region == "" {
 		region = "CN"
 	}
-	if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), uint(player.ID), player.Name, player.Server, region); err != nil {
+	if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), player, region); err != nil {
 		return 0, err
 	}
 
@@ -1051,7 +1050,7 @@ func (s *SyncManager) BackfillAllOutputPercentiles() (int, int, error) {
 		if region == "" {
 			region = "CN"
 		}
-		if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), uint(player.ID), player.Name, player.Server, region); err != nil {
+		if err := s.refreshPlayerOutputAbilityFromLogs(context.Background(), player, region); err != nil {
 			log.Printf("[WARN] 刷新玩家输出能力失败 player_id=%d name=%s: %v", player.ID, player.Name, err)
 			continue
 		}

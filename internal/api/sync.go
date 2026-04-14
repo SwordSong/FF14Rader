@@ -29,7 +29,7 @@ type SyncManager struct {
 }
 
 type scoreTask struct {
-	mappingID  uint
+	mappingID  int
 	reportCode string
 	fightID    int
 }
@@ -40,52 +40,32 @@ func NewSyncManager(client *FFLogsClient) *SyncManager {
 }
 
 // StartIncrementalSync 启动增量同步流程，包含 V2 查询、数据落库、V1 下载和能力刷新。
-func (s *SyncManager) StartIncrementalSync(ctx context.Context, name, server, region string) error {
-	playerID, username, serverName, regionName, newlyCreated, err := s.resolveOrCreateSyncPlayer(name, server, region)
+func (s *SyncManager) StartIncrementalSync(ctx context.Context, player models.PlayerLite, region string) error {
+	var fullPlayer models.Player
+	err := db.DB.Clauses(dbresolver.Write).Select("id", "pichash").Where("name = ? AND server = ? AND region = ?", player.Name, player.Server, region).First(&fullPlayer).Error
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to fetch full player data: %v", err)
 	}
 
-	allowV2Query, reason, err := shouldRunV2ReportQuery(playerID, newlyCreated)
+	allowV2Query, reason, err := shouldRunV2ReportQuery(fullPlayer)
 	if err != nil {
 		return fmt.Errorf("check v2 query gate failed: %v", err)
 	}
 	if !allowV2Query {
 		log.Printf("[INFO] 跳过 V2 reports 查询: %s", reason)
-		if _, err := s.downloadV1Reports(ctx, playerID); err != nil {
+		if _, err := s.downloadV1Reports(ctx, fullPlayer.ID); err != nil {
 			return err
 		}
-		return s.refreshPlayerOutputAbilityFromLogs(ctx, playerID, username, serverName, regionName)
+		return s.refreshPlayerOutputAbilityFromLogs(ctx, fullPlayer, region)
 	}
 	log.Printf("[INFO] 执行 V2 reports 查询: %s", reason)
 
-	return s.executeV2ReportsQuery(ctx, playerID, username, serverName, regionName)
-}
-
-// resolveOrCreateSyncPlayer 解析玩家信息，若数据库中不存在则创建新玩家记录，并返回玩家 ID 和相关信息。
-func (s *SyncManager) resolveOrCreateSyncPlayer(name, server, region string) (uint, string, string, string, bool, error) {
-	username := strings.TrimSpace(name)
-	serverName := strings.TrimSpace(server)
-	regionName := strings.TrimSpace(region)
-	if regionName == "" {
-		regionName = "CN"
-	}
-	log.Printf("开始同步玩家 [%s-%s] 的数据...", username, serverName)
-
-	playerID, _, newlyCreated, err := EnsurePlayerID(username, serverName, regionName)
-	if err != nil {
-		return 0, "", "", "", false, fmt.Errorf("resolve player failed: %v", err)
-	}
-	if playerID <= 0 {
-		return 0, "", "", "", false, fmt.Errorf("resolve player failed: invalid player id %d", playerID)
-	}
-
-	return uint(playerID), username, serverName, regionName, newlyCreated, nil
+	return s.executeV2ReportsQuery(ctx, fullPlayer, region)
 }
 
 // executeV2ReportsQuery 执行 V2 报告分页查询、落库，并触发后续 V1 下载与能力刷新。
-func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, name, server, region string) error {
-	serverSlug := server
+func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, player models.Player, region string) error {
+	serverSlug := player.Server
 
 	// 确保去重键的唯一索引存在（避免并发创建重复 master 行）
 	// (name, timestamp) 足以区分同一场战斗
@@ -93,7 +73,7 @@ func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, 
 	_ = db.DB.Exec("CREATE INDEX IF NOT EXISTS idx_fight_sync_maps_source_ids_gin ON fight_sync_maps USING GIN (source_ids)")
 
 	// 启动时先自检：若 fights 已全下载但 reports 仍未标记，先修复一次
-	if err := s.selfHealReportDownloadStatus(playerID); err != nil {
+	if err := s.selfHealReportDownloadStatus(player.ID); err != nil {
 		return err
 	}
 
@@ -109,7 +89,7 @@ func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, 
 		startTime = manualStartTime
 		log.Printf("使用硬编码起始时间 (毫秒): %d", startTime)
 	} else {
-		result := db.DB.Model(&models.FightSyncMap{}).Where("player_id = ?", playerID).Order("timestamp desc").First(&lastSync)
+		result := db.DB.Model(&models.FightSyncMap{}).Where("player_id = ?", player.ID).Order("timestamp desc").First(&lastSync)
 		if result.Error == nil {
 			startTime = lastSync.Timestamp * 1000
 			log.Printf("发现历史记录，从时间戳 %d 开始增量拉取", startTime)
@@ -176,9 +156,9 @@ func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, 
 
 	pageConcurrency := getPageConcurrency()
 
-	log.Printf("[DEBUG] Querying FFLogs: Name=%s, ServerSlug=%s, Region=%s, Page=%d, Limit=%d, Cutoff(ms)=%d", name, serverSlug, region, 1, limit, cutoff)
+	log.Printf("[DEBUG] Querying FFLogs: Name=%s, ServerSlug=%s, Region=%s, Page=%d, Limit=%d, Cutoff(ms)=%d", player.Name, serverSlug, region, 1, limit, cutoff)
 	firstVars := map[string]interface{}{
-		"name":   name,
+		"name":   player.Name,
 		"server": serverSlug,
 		"region": region,
 		"limit":  limit,
@@ -198,16 +178,16 @@ func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, 
 	oldest, count := getOldestReportTimeFromReports(reports)
 	if count == 0 {
 		log.Printf("[INFO] 未发现报告数据，结束同步")
-		if err := s.scorePendingDownloadedFights(ctx, playerID); err != nil {
+		if err := s.scorePendingDownloadedFights(ctx, player.ID); err != nil {
 			log.Printf("[SCORE] pending score pass failed on empty report set: %v", err)
 		}
-		if err := markCompletedReportParseLogs(playerID); err != nil {
+		if err := markCompletedReportParseLogs(player.ID); err != nil {
 			return err
 		}
-		if err := s.refreshPlayerOutputAbilityFromLogs(ctx, playerID, name, serverSlug, region); err != nil {
+		if err := s.refreshPlayerOutputAbilityFromLogs(ctx, player, region); err != nil {
 			return err
 		}
-		return touchPlayerV2ReportCheckedAt(playerID)
+		return touchPlayerV2ReportCheckedAt(player.ID)
 	}
 
 	allReports := append([]interface{}{}, reports...)
@@ -242,9 +222,9 @@ func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, 
 						continue
 					}
 
-					log.Printf("[DEBUG] Querying FFLogs: Name=%s, ServerSlug=%s, Region=%s, Page=%d, Limit=%d, Cutoff(ms)=%d", name, serverSlug, region, page, limit, cutoff)
+					log.Printf("[DEBUG] Querying FFLogs: Name=%s, ServerSlug=%s, Region=%s, Page=%d, Limit=%d, Cutoff(ms)=%d", player.Name, serverSlug, region, page, limit, cutoff)
 					vars := map[string]interface{}{
-						"name":   name,
+						"name":   player.Name,
 						"server": serverSlug,
 						"region": region,
 						"limit":  limit,
@@ -318,16 +298,16 @@ func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, 
 
 	log.Printf("[INFO] 汇总报告数量: %d", len(allReports))
 	// 5. 处理报告列表，构建战斗映射并存储 fight_sync_maps，同时记录 reports 以便后续解析和 V1 下载
-	if err := s.syncAllReportsMetadata(playerID, name, allReports); err != nil {
+	if err := s.syncAllReportsMetadata(player, allReports); err != nil {
 		return err
 	}
-	if _, err := s.downloadV1Reports(ctx, playerID); err != nil {
+	if _, err := s.downloadV1Reports(ctx, player.ID); err != nil {
 		return err
 	}
-	if err := s.refreshPlayerOutputAbilityFromLogs(ctx, playerID, name, serverSlug, region); err != nil {
+	if err := s.refreshPlayerOutputAbilityFromLogs(ctx, player, region); err != nil {
 		return err
 	}
-	if err := touchPlayerV2ReportCheckedAt(playerID); err != nil {
+	if err := touchPlayerV2ReportCheckedAt(player.ID); err != nil {
 		return err
 	}
 
@@ -335,7 +315,7 @@ func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, playerID uint, 
 }
 
 // selfHealReportDownloadStatus 自检并修复战斗与报告下载状态不一致问题。
-func (s *SyncManager) selfHealReportDownloadStatus(playerID uint) error {
+func (s *SyncManager) selfHealReportDownloadStatus(playerID int) error {
 	var pendingFights int64
 	if err := db.DB.Model(&models.FightSyncMap{}).
 		Where("player_id = ? AND downloaded = ?", playerID, false).
@@ -361,12 +341,12 @@ func (s *SyncManager) selfHealReportDownloadStatus(playerID uint) error {
 }
 
 // scorePendingDownloadedFights 对已下载但未完成评分的战斗执行补评分。
-func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID uint) error {
+func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID int) error {
 	return s.scorePendingDownloadedFightsByReports(ctx, playerID, nil)
 }
 
 // scorePendingDownloadedFightsByReports 按可选报告范围筛选并并发执行待评分战斗。
-func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context, playerID uint, reportCodes []string) error {
+func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context, playerID int, reportCodes []string) error {
 	if s.scorer == nil {
 		return nil
 	}
@@ -465,7 +445,7 @@ func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context,
 
 	for _, task := range tasks {
 		wg.Add(1)
-		go func(mappingID uint, reportCode string, fightID int) {
+		go func(mappingID int, reportCode string, fightID int) {
 			defer wg.Done()
 			sem <- struct{}{}
 			atomic.AddInt64(&activeCount, 1)
@@ -565,7 +545,7 @@ func getScoreConcurrency(scorer *scoring.Service) int {
 }
 
 // markFightParsedDoneIdempotent 幂等地将战斗标记为已解析完成。
-func markFightParsedDoneIdempotent(mappingID uint) (bool, error) {
+func markFightParsedDoneIdempotent(mappingID int) (bool, error) {
 	res := db.DB.Model(&models.FightSyncMap{}).
 		Where("id = ? AND parsed_done = ?", mappingID, false).
 		Update("parsed_done", true)
@@ -576,7 +556,7 @@ func markFightParsedDoneIdempotent(mappingID uint) (bool, error) {
 }
 
 // markFightSkippedNoMatch 将无匹配角色的战斗标记为已处理并写入零分占位结果。
-func markFightSkippedNoMatch(mappingID uint) error {
+func markFightSkippedNoMatch(mappingID int) error {
 	var row models.FightSyncMap
 	if err := db.DB.Select("job").Where("id = ?", mappingID).First(&row).Error; err != nil {
 		return err
@@ -608,7 +588,7 @@ func markFightSkippedNoMatch(mappingID uint) error {
 }
 
 // processSyncData 处理同步响应数据并提取报告列表。
-func (s *SyncManager) processSyncData(playerID uint, charName string, data map[string]interface{}) error {
+func (s *SyncManager) processSyncData(playerID int, charName string, data map[string]interface{}) error {
 	reports, _, err := extractReportsFromData(data)
 	if err != nil {
 		log.Printf("[DEBUG] GraphQL Response: %+v", data)
@@ -619,7 +599,7 @@ func (s *SyncManager) processSyncData(playerID uint, charName string, data map[s
 }
 
 // processSyncReports 处理报告列表并构建战斗映射写入数据库。
-func (s *SyncManager) processSyncReports(playerID uint, charName string, reports []interface{}) error {
+func (s *SyncManager) processSyncReports(playerID int, charName string, reports []interface{}) error {
 	if len(reports) == 0 {
 		return nil
 	}
@@ -859,7 +839,7 @@ func (s *SyncManager) processSyncReports(playerID uint, charName string, reports
 }
 
 // mergeEventPayload 将战斗详情数据和事件数据合并成一个新的 JSON 数据，方便后续存储和使用
-func (s *SyncManager) writeReports(playerID uint, masters []*masterFight, reportMetadata map[string]datatypes.JSON, reportSummaries map[string]reportSummary) error {
+func (s *SyncManager) writeReports(playerID int, masters []*masterFight, reportMetadata map[string]datatypes.JSON, reportSummaries map[string]reportSummary) error {
 	if len(masters) == 0 {
 		return nil
 	}
@@ -1132,12 +1112,12 @@ func getPageConcurrency() int {
 }
 
 // syncAllReportsMetadata 返回同步全量报告列表元数据。
-func (s *SyncManager) syncAllReportsMetadata(playerID uint, name string, reports []interface{}) error {
+func (s *SyncManager) syncAllReportsMetadata(player models.Player, reports []interface{}) error {
 	if len(reports) == 0 {
 		return nil
 	}
 	//这里的逻辑是先处理报告列表，提取报告代码，并与数据库中已有的报告解析日志进行对比，确定哪些报告是新的需要下载的 V1 报告，同时更新数据库中的报告解析日志状态，以便后续下载和处理。
-	if err := s.processSyncReports(playerID, name, reports); err != nil {
+	if err := s.processSyncReports(player.ID, player.Name, reports); err != nil {
 		return err
 	}
 
@@ -1153,7 +1133,7 @@ func (s *SyncManager) syncAllReportsMetadata(playerID uint, name string, reports
 }
 
 // finalizeAllReportsDownloads 收尾更新已下载报告状态与玩家报告集合。
-func (s *SyncManager) finalizeAllReportsDownloads(playerID uint, downloaded []string) error {
+func (s *SyncManager) finalizeAllReportsDownloads(playerID int, downloaded []string) error {
 	if len(downloaded) == 0 {
 		return nil
 	}
@@ -1514,50 +1494,52 @@ func absInt64(v int64) int64 {
 }
 
 // EnsurePlayerID 确保玩家记录存在，返回玩家 ID；如果不存在则创建新记录
-func EnsurePlayerID(name, server, region string) (int, string, bool, error) {
+func EnsurePlayerID(name, server, region string) (models.PlayerLite, string, error) {
 	var player models.Player
+	var playerLite models.PlayerLite
 	err := db.DB.Clauses(dbresolver.Write).Select("id", "pichash").Where("name = ? AND server = ? AND region = ?", name, server, region).First(&player).Error
+	playerLite.PlayerID = player.ID
+	playerLite.Name = name
+	playerLite.Server = server
 	if err == nil {
-		return player.ID, player.PicHash, false, nil
+		// 已存在玩家记录，返回 ID 和 PicHash
+		playerLite.NewPlayer = false
+		return playerLite, player.PicHash, nil
 	}
 
-	newPlayer := models.Player{
-		Name:   name,
-		Server: server,
-		Region: region,
+	if errCreate := db.DB.Clauses(dbresolver.Write).Create(&playerLite).Error; errCreate != nil {
+		// 创建玩家记录失败，返回错误
+		return models.PlayerLite{}, "", errCreate
 	}
-	if errCreate := db.DB.Clauses(dbresolver.Write).Create(&newPlayer).Error; errCreate != nil {
-		return 0, "", false, errCreate
-	}
-
-	return newPlayer.ID, player.PicHash, true, nil
+	// 成功创建新玩家记录，返回新 ID 和 PicHash（可能为空）
+	return playerLite, "", nil
 }
 
 // shouldRunV2ReportQuery 根据玩家状态和更新时间判断是否执行 V2 报告查询。
-func shouldRunV2ReportQuery(playerID uint, newlyCreated bool) (bool, string, error) {
-	if playerID == 0 {
+func shouldRunV2ReportQuery(player models.Player) (bool, string, error) {
+	if player.ID == 0 {
 		return true, "player_id=0 fallback", nil
 	}
-	if newlyCreated {
+	if player.NewPlayer {
 		return true, "新创建玩家，首次同步直接查询", nil
 	}
 
-	var player models.Player
-	if err := db.DB.Select("id", "created_at", "updated_at").Where("id = ?", playerID).First(&player).Error; err != nil {
+	var playerRecord models.Player
+	if err := db.DB.Select("id", "created_at", "updated_at").Where("id = ?", player.ID).First(&playerRecord).Error; err != nil {
 		return false, "", err
 	}
 
-	if player.UpdatedAt.IsZero() {
+	if playerRecord.UpdatedAt.IsZero() {
 		return true, "updated_at 为空，执行查询", nil
 	}
 
-	if player.CreatedAt.Equal(player.UpdatedAt) {
-		if time.Since(player.CreatedAt) < 24*time.Hour {
+	if playerRecord.CreatedAt.Equal(playerRecord.UpdatedAt) {
+		if time.Since(playerRecord.CreatedAt) < 24*time.Hour {
 			return true, "新创建玩家（created_at==updated_at 且 <24h）", nil
 		}
 	}
 
-	age := time.Since(player.UpdatedAt)
+	age := time.Since(playerRecord.UpdatedAt)
 	if age >= 24*time.Hour {
 		return true, fmt.Sprintf("updated_at 超过24小时（%.1fh）", age.Hours()), nil
 	}
@@ -1566,7 +1548,7 @@ func shouldRunV2ReportQuery(playerID uint, newlyCreated bool) (bool, string, err
 }
 
 // touchPlayerV2ReportCheckedAt 更新玩家 V2 查询检查时间。
-func touchPlayerV2ReportCheckedAt(playerID uint) error {
+func touchPlayerV2ReportCheckedAt(playerID int) error {
 	if playerID == 0 {
 		return nil
 	}
@@ -1576,11 +1558,11 @@ func touchPlayerV2ReportCheckedAt(playerID uint) error {
 }
 
 // refreshPlayerOutputAbilityFromLogs 拉取并更新玩家输出能力评分。
-func (s *SyncManager) refreshPlayerOutputAbilityFromLogs(ctx context.Context, playerID uint, name, server, region string) error {
-	name = strings.TrimSpace(name)
-	server = strings.TrimSpace(server)
+func (s *SyncManager) refreshPlayerOutputAbilityFromLogs(ctx context.Context, player models.Player, region string) error {
+	name := strings.TrimSpace(player.Name)
+	server := strings.TrimSpace(player.Server)
 	region = strings.TrimSpace(region)
-	if playerID == 0 || name == "" || server == "" || region == "" {
+	if player.ID == 0 || name == "" || server == "" || region == "" {
 		return nil
 	}
 
@@ -1590,7 +1572,7 @@ func (s *SyncManager) refreshPlayerOutputAbilityFromLogs(ctx context.Context, pl
 	}
 
 	return db.DB.Model(&models.Player{}).
-		Where("id = ?", playerID).
+		Where("id = ?", player.ID).
 		UpdateColumn("output_ability", ability).Error
 }
 

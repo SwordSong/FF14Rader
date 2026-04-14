@@ -63,7 +63,7 @@ type ackTaskRequest struct {
 
 type pullTaskResponseItem struct {
 	TaskID   string   `json:"taskId"`
-	PlayerID uint     `json:"playerId"`
+	PlayerID int      `json:"playerId"`
 	Reports  []string `json:"reports"`
 	Host     string   `json:"host"`
 }
@@ -157,6 +157,7 @@ func (s *Service) claimUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	playerID, info, claimed := clusterserver.GlobalReportHostRegistry().ClaimUser(host)
+	log.Printf("领取玩家信息成功 host=%s playerId=%d user=%s server=%s", host, playerID, info.Name, info.Server)
 	if !claimed {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":  "ok",
@@ -173,7 +174,7 @@ func (s *Service) claimUserHandler(w http.ResponseWriter, r *http.Request) {
 		"claimed": true,
 		"user": map[string]interface{}{
 			"playerId": playerID,
-			"username": info.User,
+			"username": info.Name,
 			"server":   info.Server,
 		},
 		"time": time.Now().Format(time.RFC3339),
@@ -376,24 +377,24 @@ func (s *Service) raderHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Dashboard UA:%v Args:%v", r.Header.Get("User-Agent"), params)
-	playid, picHash, newplayer, err := api.EnsurePlayerID(params[0], params[1], "CN")
+	player, pichash, err := api.EnsurePlayerID(params[0], params[1], "CN")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	// 如果是新玩家就返回提示
-	if (newplayer || picHash == "") && playid != 0 {
-		log.Printf("新玩家注册或无雷达图: %d %s-%s", playid, params[0], params[1])
-		storedUser := clusterserver.GlobalReportHostRegistry().RegisterUserServer(playid, params[0], params[1])
+	if (player.NewPlayer || pichash == "") && player.PlayerID != 0 {
+		log.Printf("新玩家注册或无雷达图: %d %s-%s", player.PlayerID, params[0], params[1])
+		storedUser := clusterserver.GlobalReportHostRegistry().RegisterUserServer(player)
 		if storedUser != false {
-			log.Printf("玩家注册到集群服务器用户映射表成功: %d %s-%s", playid, params[0], params[1])
+			log.Printf("玩家注册到集群服务器用户映射表成功: ID: %d 新玩家：%t %s-%s", player.PlayerID, player.NewPlayer, player.Name, player.Server)
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"status":   "ok",
 				"path":     r.URL.Path,
 				"query":    query,
-				"playerId": playid,
+				"playerId": player.PlayerID,
 				"查询添加":     storedUser,
-				"picHash":  picHash,
+				"picHash":  pichash,
 				"time":     time.Now().Format(time.RFC3339),
 			})
 
@@ -401,15 +402,15 @@ func (s *Service) raderHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		//传入
 	} else {
-		log.Printf("玩家查询: %d %s-%s", playid, params[0], params[1])
+		log.Printf("玩家查询: %d %s-%s", player.PlayerID, player.Name, player.Server)
 	}
 	//这里是把玩家注册到集群服务器的用户映射表里，后续可以在调度任务时根据 playerID 定向调度到特定实例，或者在查询报告时优先查询这个玩家所在实例的报告
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":   "ok",
 		"path":     r.URL.Path,
 		"query":    query,
-		"playerId": playid,
-		"picHash":  picHash,
+		"playerId": player.PlayerID,
+		"picHash":  pichash,
 		"time":     time.Now().Format(time.RFC3339),
 	})
 }
