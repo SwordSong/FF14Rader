@@ -62,12 +62,13 @@ func StartAutoRegisterAndHeartbeat() {
 
 		registerOnce := func(reason string) {
 			normalizedReason := normalizeRegisterReason(reason)
+			reasonPurpose := registerReasonPurpose(normalizedReason)
 			count, err := registerLocalReportsWithEvents(registerClient, master, host, scanDir, normalizedReason)
 			if err != nil {
-				log.Printf("[CLUSTER] 自动注册失败 source=%s master=%s host=%s dir=%s err=%v", normalizedReason, master, host, scanDir, err)
+				log.Printf("[CLUSTER] 注册报告：%s source=%s master=%s host=%s dir=%s status=failed err=%v", reasonPurpose, normalizedReason, master, host, scanDir, err)
 				return
 			}
-			log.Printf("[CLUSTER] 自动注册成功 source=%s master=%s host=%s reports=%d", normalizedReason, master, host, count)
+			log.Printf("[CLUSTER] 注册报告：%s source=%s master=%s host=%s reports=%d", reasonPurpose, normalizedReason, master, host, count)
 		}
 
 		heartbeatOnce := func() error {
@@ -161,6 +162,23 @@ func normalizeRegisterReason(reason string) string {
 		return "client_unspecified"
 	}
 	return normalized
+}
+
+func registerReasonPurpose(reason string) string {
+	switch normalizeRegisterReason(reason) {
+	case registerReasonInit:
+		return "程序初始化上报本地report"
+	case registerReasonReconnect:
+		return "重连服务端上报本地report"
+	case "v2_parse_completed":
+		return "V2解析完成上报"
+	case "events_parse_completed":
+		return "Events解析完成上报"
+	case "db_pending_unparsed_report", "db_pending_unparsed":
+		return "从数据库中拉取未下载解析的report"
+	default:
+		return "未标注目的"
+	}
 }
 
 func loadPendingEventsByReport() (map[string]int, error) {

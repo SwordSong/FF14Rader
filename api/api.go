@@ -297,7 +297,7 @@ func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request)
 	var legacyReports []string
 	if err := json.Unmarshal(req.Reports, &legacyReports); err == nil {
 		added, total := clusterserver.GlobalReportHostRegistry().RegisterHostReports(host, legacyReports)
-		log.Printf("[CLUSTER] 注册报告：%s (旧格式) source=%s host=%s reports=%d addedOrMoved=%d 当前总报告数=%d", reasonPurpose, reason, host, len(legacyReports), added, total)
+		log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s reports=%d addedOrMoved=%d 当前总报告数=%d", reasonPurpose, reason, host, len(legacyReports), added, total)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":       "ok",
 			"host":         host,
@@ -337,7 +337,7 @@ func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	added, total := clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, effectiveHost, events)
-	log.Printf("[CLUSTER] 注册报告：%s (新格式) source=%s host=%s report=%s entries=%d events=%d addedOrMoved=%d 当前总报告数=%d", reasonPurpose, reason, effectiveHost, reportCode, len(entries), events, added, total)
+	log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s entries=%d events=%d addedOrMoved=%d 当前总报告数=%d", reasonPurpose, reason, effectiveHost, reportCode, len(entries), events, added, total)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":       "ok",
 		"host":         effectiveHost,

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -115,7 +114,6 @@ func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) 
 		}
 		existing.Host = h
 		r.reportHost[code] = existing
-		log.Printf("[CLUSTER] 注册报告 host=%s report=%s", h, code)
 		added++
 	}
 
@@ -152,7 +150,6 @@ func (r *ReportHostRegistry) RegisterReportWithEvents(reportCode, host string, e
 	}
 
 	r.reportHost[code] = newEntry
-	log.Printf("[CLUSTER] 注册报告 host=%s report=%s events=%d", h, code, newEntry.Events)
 	return 1, len(r.reportHost)
 }
 
