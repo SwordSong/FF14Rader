@@ -936,19 +936,11 @@ func (s *SyncManager) dispatchReportsToHost(ctx context.Context, host string, pl
 }
 
 // ExecuteAssignedReports 由集群节点调用，仅处理指定报告集合的下载与解析。
-func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID int, reportCodes []string) error {
+func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID int, reportCodes []string, eventIndexes []int) error {
 	if playerID == 0 {
 		return fmt.Errorf("invalid playerID")
 	}
 	if len(reportCodes) == 0 {
-		return nil
-	}
-
-	pending, err := loadPendingFights(playerID)
-	if err != nil {
-		return err
-	}
-	if len(pending) == 0 {
 		return nil
 	}
 
@@ -964,59 +956,68 @@ func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID int, 
 		return nil
 	}
 
+	requestedCodes := make([]string, 0, len(codeSet))
+	for code := range codeSet {
+		requestedCodes = append(requestedCodes, code)
+	}
+	sort.Strings(requestedCodes)
+
+	pending, err := loadPendingFights(playerID)
+	if err != nil {
+		return err
+	}
+
 	selected := make([]pendingFightEntry, 0, len(pending))
 	for _, entry := range pending {
 		if _, ok := codeSet[cluster.NormalizeReportCode(entry.ReportCode)]; ok {
 			selected = append(selected, entry)
 		}
 	}
-	if len(selected) == 0 {
-		return nil
-	}
-
-	reportTimeout := getV1ReportTimeout()
-	apiKey, err := getV1ApiKey()
-	if err != nil {
-		return err
-	}
-
-	baseURL := getV1BaseURL()
-	rootDir := getAllReportsDir()
-	client := newV1HTTPClient(reportTimeout)
-	fightWorkers := getV1DownloadConcurrency()
-	if err := os.MkdirAll(rootDir, 0755); err != nil {
-		return fmt.Errorf("create reports dir failed: %v", err)
-	}
-
-	grouped := groupPendingFights(selected)
-	codes := make([]string, 0, len(grouped))
-	for code := range grouped {
-		codes = append(codes, code)
-	}
-	sort.Strings(codes)
-
-	doneReports := make([]string, 0, len(codes))
-	for _, code := range codes {
-		pendingFights := grouped[code]
-		if len(pendingFights) == 0 {
-			continue
-		}
-
-		_, reportDone, err := downloadV1Report(ctx, client, baseURL, apiKey, rootDir, playerID, code, pendingFights, fightWorkers, reportTimeout)
+	if len(selected) > 0 {
+		reportTimeout := getV1ReportTimeout()
+		apiKey, err := getV1ApiKey()
 		if err != nil {
-			return fmt.Errorf("execute assigned report %s failed: %v", code, err)
-		}
-		if reportDone {
-			doneReports = append(doneReports, code)
-		}
-	}
-
-	if len(doneReports) > 0 {
-		if err := s.finalizeAllReportsDownloads(playerID, doneReports); err != nil {
 			return err
 		}
+
+		baseURL := getV1BaseURL()
+		rootDir := getAllReportsDir()
+		client := newV1HTTPClient(reportTimeout)
+		fightWorkers := getV1DownloadConcurrency()
+		if err := os.MkdirAll(rootDir, 0755); err != nil {
+			return fmt.Errorf("create reports dir failed: %v", err)
+		}
+
+		grouped := groupPendingFights(selected)
+		codes := make([]string, 0, len(grouped))
+		for code := range grouped {
+			codes = append(codes, code)
+		}
+		sort.Strings(codes)
+
+		doneReports := make([]string, 0, len(codes))
+		for _, code := range codes {
+			pendingFights := grouped[code]
+			if len(pendingFights) == 0 {
+				continue
+			}
+
+			_, reportDone, err := downloadV1Report(ctx, client, baseURL, apiKey, rootDir, playerID, code, pendingFights, fightWorkers, reportTimeout)
+			if err != nil {
+				return fmt.Errorf("execute assigned report %s failed: %v", code, err)
+			}
+			if reportDone {
+				doneReports = append(doneReports, code)
+			}
+		}
+
+		if len(doneReports) > 0 {
+			if err := s.finalizeAllReportsDownloads(playerID, doneReports); err != nil {
+				return err
+			}
+		}
 	}
-	if err := s.scorePendingDownloadedFightsByReports(ctx, playerID, codes); err != nil {
+	if err := s.scorePendingDownloadedFightsByReportsAndFightIDs(ctx, playerID, requestedCodes, eventIndexes); err != nil {
 		log.Printf("[SCORE] assigned score pass failed: %v", err)
 	}
 	return markCompletedReportParseLogs(playerID)

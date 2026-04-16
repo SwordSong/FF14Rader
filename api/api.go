@@ -69,10 +69,11 @@ type raderRequest struct {
 }
 
 type pullTaskResponseItem struct {
-	TaskID   string   `json:"taskId"`
-	PlayerID int      `json:"playerId"`
-	Reports  []string `json:"reports"`
-	Host     string   `json:"host"`
+	TaskID       string   `json:"taskId"`
+	PlayerID     int      `json:"playerId"`
+	Reports      []string `json:"reports"`
+	EventIndexes []int    `json:"eventIndexes,omitempty"`
+	Host         string   `json:"host"`
 }
 
 type taskWSRequest struct {
@@ -110,6 +111,52 @@ type pendingClaimSeedRow struct {
 	Events     int    `gorm:"column:events"`
 }
 
+type pendingParsedEventSeedRow struct {
+	PlayerID   int    `gorm:"column:player_id"`
+	ReportCode string `gorm:"column:report_code"`
+	EventIndex int    `gorm:"column:event_index"`
+}
+
+type pendingParsedSeedItem struct {
+	PlayerID     int
+	ReportCode   string
+	EventIndexes []int
+}
+
+func collectPendingParsedSeedItems(rows []pendingParsedEventSeedRow) []pendingParsedSeedItem {
+	if len(rows) == 0 {
+		return nil
+	}
+	items := make([]pendingParsedSeedItem, 0)
+	itemByKey := make(map[string]int, len(rows))
+	seenEventByKey := make(map[string]map[int]struct{}, len(rows))
+
+	for _, row := range rows {
+		code := cluster.NormalizeReportCode(row.ReportCode)
+		eventIdx := row.EventIndex
+		if row.PlayerID == 0 || code == "" || eventIdx <= 0 {
+			continue
+		}
+
+		key := fmt.Sprintf("%d:%s", row.PlayerID, code)
+		itemIndex, ok := itemByKey[key]
+		if !ok {
+			itemIndex = len(items)
+			itemByKey[key] = itemIndex
+			items = append(items, pendingParsedSeedItem{PlayerID: row.PlayerID, ReportCode: code, EventIndexes: make([]int, 0, 4)})
+			seenEventByKey[key] = make(map[int]struct{})
+		}
+
+		if _, seen := seenEventByKey[key][eventIdx]; seen {
+			continue
+		}
+		seenEventByKey[key][eventIdx] = struct{}{}
+		items[itemIndex].EventIndexes = append(items[itemIndex].EventIndexes, eventIdx)
+	}
+
+	return items
+}
+
 // enqueuePendingTasksForHost 当任务队列为空时，根据待处理 fights 为当前 host 补充可领取任务。
 func enqueuePendingTasksForHost(host string, limit int) (int, error) {
 	h := cluster.NormalizeHost(host)
@@ -137,7 +184,25 @@ func enqueuePendingTasksForHost(host string, limit int) (int, error) {
 	`, limit*8).Scan(&rows).Error; err != nil {
 		return 0, err
 	}
-	if len(rows) == 0 {
+
+	parseRows := make([]pendingParsedEventSeedRow, 0)
+	if err := db.DB.Raw(`
+		SELECT
+			player_id,
+			split_part(master_id, '-', 1) AS report_code,
+			CASE
+				WHEN split_part(master_id, '-', 2) ~ '^[0-9]+$' THEN split_part(master_id, '-', 2)::int
+				ELSE 0
+			END AS event_index
+		FROM fight_sync_maps
+		WHERE downloaded = true AND parsed_done = false
+		ORDER BY id DESC
+		LIMIT ?
+	`, limit*64).Scan(&parseRows).Error; err != nil {
+		return 0, err
+	}
+	parseItems := collectPendingParsedSeedItems(parseRows)
+	if len(rows) == 0 && len(parseItems) == 0 {
 		return 0, nil
 	}
 
@@ -172,6 +237,47 @@ func enqueuePendingTasksForHost(host string, limit int) (int, error) {
 			_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(code, h, events)
 			reason := "db_pending_unparsed_report"
 			log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s events=%d", registerReasonPurpose(reason), reason, h, code, events)
+		}
+		if queuedTotal >= limit {
+			break
+		}
+	}
+
+	if queuedTotal >= limit {
+		return queuedTotal, nil
+	}
+
+	for _, item := range parseItems {
+		code := cluster.NormalizeReportCode(item.ReportCode)
+		if item.PlayerID == 0 || code == "" {
+			continue
+		}
+
+		entry, exists := snapshot[code]
+		mappedHost := ""
+		if exists {
+			mappedHost = cluster.NormalizeHost(entry.Host)
+		}
+		if mappedHost != "" && mappedHost != h {
+			continue
+		}
+
+		events := len(item.EventIndexes)
+		if events <= 0 {
+			continue
+		}
+
+		queued, err := clusterserver.GlobalDispatchTaskQueue().EnqueueReportsWithEventIndexes(item.PlayerID, h, []string{code}, item.EventIndexes)
+		if err != nil {
+			continue
+		}
+		if queued > 0 {
+			queuedTotal += queued
+			added, _ := clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(code, h, events)
+			reason := "db_pending_downloaded_unparsed_event"
+			if added > 0 {
+				log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s events=%d", registerReasonPurpose(reason), reason, h, code, events)
+			}
 		}
 		if queuedTotal >= limit {
 			break
@@ -217,6 +323,8 @@ func registerReasonPurpose(reason string) string {
 		return "V2解析完成上报"
 	case "events_parse_completed":
 		return "Events解析完成上报"
+	case "db_pending_downloaded_unparsed_event":
+		return "从数据库中拉取已下载未解析的event"
 	case "db_pending_unparsed_report", "db_pending_unparsed":
 		return "从数据库中拉取未下载解析的report"
 	default:
@@ -245,6 +353,19 @@ func effectiveClaimLimit(limit int, capacity int, inFlight int) int {
 	return limit
 }
 
+func taskPayloadSummary(reports []string, eventIndexes []int) string {
+	reportsCount := len(reports)
+	eventCount := len(eventIndexes)
+	if reportsCount == 0 {
+		return fmt.Sprintf("reports=%d eventIndexes=%d", reportsCount, eventCount)
+	}
+	first := cluster.NormalizeReportCode(reports[0])
+	if reportsCount == 1 {
+		return fmt.Sprintf("reports=%d eventIndexes=%d report=%s", reportsCount, eventCount, first)
+	}
+	return fmt.Sprintf("reports=%d eventIndexes=%d firstReport=%s", reportsCount, eventCount, first)
+}
+
 func claimTasksForHost(host string, limit int, leaseSec int) ([]pullTaskResponseItem, error) {
 	limit, leaseSec = normalizeClaimArgs(limit, leaseSec)
 
@@ -261,11 +382,14 @@ func claimTasksForHost(host string, limit int, leaseSec int) ([]pullTaskResponse
 
 	resp := make([]pullTaskResponseItem, 0, len(tasks))
 	for _, task := range tasks {
+		summary := taskPayloadSummary(task.Reports, task.EventIndexes)
+		log.Printf("[CLUSTER] 下发任务摘要 host=%s task=%s player=%d %s", cluster.NormalizeHost(host), task.ID, task.PlayerID, summary)
 		resp = append(resp, pullTaskResponseItem{
-			TaskID:   task.ID,
-			PlayerID: task.PlayerID,
-			Reports:  append([]string(nil), task.Reports...),
-			Host:     task.Host,
+			TaskID:       task.ID,
+			PlayerID:     task.PlayerID,
+			Reports:      append([]string(nil), task.Reports...),
+			EventIndexes: append([]int(nil), task.EventIndexes...),
+			Host:         task.Host,
 		})
 	}
 
@@ -337,7 +461,9 @@ func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	added, total := clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, effectiveHost, events)
-	log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s entries=%d events=%d addedOrMoved=%d 当前总报告数=%d", reasonPurpose, reason, effectiveHost, reportCode, len(entries), events, added, total)
+	if added > 0 {
+		log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s entries=%d events=%d addedOrMoved=%d 当前总报告数=%d", reasonPurpose, reason, effectiveHost, reportCode, len(entries), events, added, total)
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":       "ok",
 		"host":         effectiveHost,
@@ -570,9 +696,11 @@ func (s *Service) taskWSHandler(w http.ResponseWriter, r *http.Request) {
 			if payload.Success {
 				for _, reportCode := range reports {
 					normalized := cluster.NormalizeReportCode(reportCode)
-					_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, host, 0)
+					added, _ := clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, host, 0)
 					reason := "events_parse_completed"
-					log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s events=0", registerReasonPurpose(reason), reason, host, normalized)
+					if added > 0 {
+						log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s events=0", registerReasonPurpose(reason), reason, host, normalized)
+					}
 				}
 			}
 

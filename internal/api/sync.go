@@ -375,6 +375,11 @@ func (s *SyncManager) scorePendingDownloadedFights(ctx context.Context, playerID
 
 // scorePendingDownloadedFightsByReports 按可选报告范围筛选并并发执行待评分战斗。
 func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context, playerID int, reportCodes []string) error {
+	return s.scorePendingDownloadedFightsByReportsAndFightIDs(ctx, playerID, reportCodes, nil)
+}
+
+// scorePendingDownloadedFightsByReportsAndFightIDs 按报告与可选 event 序号筛选并并发执行待评分战斗。
+func (s *SyncManager) scorePendingDownloadedFightsByReportsAndFightIDs(ctx context.Context, playerID int, reportCodes []string, fightIDs []int) error {
 	if s.scorer == nil {
 		return nil
 	}
@@ -390,6 +395,20 @@ func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context,
 			allowed[normalized] = struct{}{}
 		}
 		if len(allowed) == 0 {
+			return nil
+		}
+	}
+
+	var allowedFightIDs map[int]struct{}
+	if len(fightIDs) > 0 {
+		allowedFightIDs = make(map[int]struct{}, len(fightIDs))
+		for _, fightID := range fightIDs {
+			if fightID <= 0 {
+				continue
+			}
+			allowedFightIDs[fightID] = struct{}{}
+		}
+		if len(allowedFightIDs) == 0 {
 			return nil
 		}
 	}
@@ -413,6 +432,11 @@ func (s *SyncManager) scorePendingDownloadedFightsByReports(ctx context.Context,
 		}
 		if len(allowed) > 0 {
 			if _, ok := allowed[strings.ToUpper(strings.TrimSpace(code))]; !ok {
+				continue
+			}
+		}
+		if len(allowedFightIDs) > 0 {
+			if _, ok := allowedFightIDs[fightID]; !ok {
 				continue
 			}
 		}

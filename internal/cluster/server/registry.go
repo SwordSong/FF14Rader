@@ -141,8 +141,20 @@ func (r *ReportHostRegistry) RegisterReportWithEvents(reportCode, host string, e
 	}
 
 	existing, exists := r.reportHost[code]
+	if exists {
+		existingHost := cluster.NormalizeHost(existing.Host)
+		// 多主机重复上报同一 report 且事件数未变化时，保持现有路由，避免主机抖动与重复上报噪音。
+		if existingHost != "" && existing.Events == events {
+			return 0, len(r.reportHost)
+		}
+	}
+
 	newEntry := existing
-	newEntry.Host = h
+	if h != "" {
+		newEntry.Host = h
+	} else {
+		newEntry.Host = cluster.NormalizeHost(existing.Host)
+	}
 	newEntry.Events = events
 
 	if exists && existing.Host == newEntry.Host && existing.Events == newEntry.Events {

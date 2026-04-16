@@ -29,14 +29,15 @@ const (
 )
 
 type taskPullExecutor interface {
-	ExecuteAssignedReports(ctx context.Context, playerID int, reports []string) error
+	ExecuteAssignedReports(ctx context.Context, playerID int, reports []string, eventIndexes []int) error
 	StartIncrementalSync(ctx context.Context, player models.PlayerLite, region string) error
 }
 
 type pullTaskItem struct {
-	TaskID   string   `json:"taskId"`
-	PlayerID int      `json:"playerId"`
-	Reports  []string `json:"reports"`
+	TaskID       string   `json:"taskId"`
+	PlayerID     int      `json:"playerId"`
+	Reports      []string `json:"reports"`
+	EventIndexes []int    `json:"eventIndexes,omitempty"`
 }
 
 type pullClaimUser struct {
@@ -101,6 +102,19 @@ type taskWSClient struct {
 	nextID  uint64
 
 	writeMu sync.Mutex
+}
+
+func pulledTaskSummary(reports []string, eventIndexes []int) string {
+	reportsCount := len(reports)
+	eventCount := len(eventIndexes)
+	if reportsCount == 0 {
+		return fmt.Sprintf("reports=%d eventIndexes=%d", reportsCount, eventCount)
+	}
+	first := cluster.NormalizeReportCode(reports[0])
+	if reportsCount == 1 {
+		return fmt.Sprintf("reports=%d eventIndexes=%d report=%s", reportsCount, eventCount, first)
+	}
+	return fmt.Sprintf("reports=%d eventIndexes=%d firstReport=%s", reportsCount, eventCount, first)
 }
 
 func envIntWithDefault(key string, fallback int) int {
@@ -752,10 +766,11 @@ func StartClusterTaskPullLoop(executor taskPullExecutor) {
 					continue
 				}
 
-				log.Printf("[CLUSTER] 拉取任务成功 host=%s task=%s player=%d reports=%v", host, task.TaskID, task.PlayerID, task.Reports)
+				summary := pulledTaskSummary(task.Reports, task.EventIndexes)
+				log.Printf("[CLUSTER] 拉取任务成功 host=%s task=%s player=%d %s", host, task.TaskID, task.PlayerID, summary)
 				atomic.AddInt32(&executingTasks, 1)
 				execCtx, cancel := context.WithTimeout(context.Background(), execTimeout)
-				err = executor.ExecuteAssignedReports(execCtx, task.PlayerID, task.Reports)
+				err = executor.ExecuteAssignedReports(execCtx, task.PlayerID, task.Reports, task.EventIndexes)
 				cancel()
 				atomic.AddInt32(&executingTasks, -1)
 

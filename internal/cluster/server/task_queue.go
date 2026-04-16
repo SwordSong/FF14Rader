@@ -19,16 +19,17 @@ const (
 
 // DispatchTask 表示一个待分发或执行中的任务。
 type DispatchTask struct {
-	ID         string    `json:"id"`
-	PlayerID   int       `json:"playerId"`
-	Host       string    `json:"host"`
-	Reports    []string  `json:"reports"`
-	Status     string    `json:"status"`
-	ClaimedBy  string    `json:"claimedBy,omitempty"`
-	LeaseUntil time.Time `json:"leaseUntil,omitempty"`
-	LastError  string    `json:"lastError,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
-	UpdatedAt  time.Time `json:"updatedAt"`
+	ID           string    `json:"id"`
+	PlayerID     int       `json:"playerId"`
+	Host         string    `json:"host"`
+	Reports      []string  `json:"reports"`
+	EventIndexes []int     `json:"eventIndexes,omitempty"`
+	Status       string    `json:"status"`
+	ClaimedBy    string    `json:"claimedBy,omitempty"`
+	LeaseUntil   time.Time `json:"leaseUntil,omitempty"`
+	LastError    string    `json:"lastError,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
 type DispatchTaskQueue struct {
@@ -72,8 +73,46 @@ func (q *DispatchTaskQueue) cleanupDoneLocked(now time.Time) {
 	}
 }
 
+func normalizeEventIndexes(indexes []int) []int {
+	if len(indexes) == 0 {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(indexes))
+	out := make([]int, 0, len(indexes))
+	for _, idx := range indexes {
+		if idx <= 0 {
+			continue
+		}
+		if _, ok := seen[idx]; ok {
+			continue
+		}
+		seen[idx] = struct{}{}
+		out = append(out, idx)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Ints(out)
+	return out
+}
+
+func mergeEventIndexes(existing []int, incoming []int) []int {
+	if len(incoming) == 0 {
+		return normalizeEventIndexes(existing)
+	}
+	combined := make([]int, 0, len(existing)+len(incoming))
+	combined = append(combined, existing...)
+	combined = append(combined, incoming...)
+	return normalizeEventIndexes(combined)
+}
+
 // EnqueueReports 入队报告列表。
 func (q *DispatchTaskQueue) EnqueueReports(playerID int, host string, reports []string) (int, error) {
+	return q.EnqueueReportsWithEventIndexes(playerID, host, reports, nil)
+}
+
+// EnqueueReportsWithEventIndexes 入队报告列表并携带待解析 event 序号。
+func (q *DispatchTaskQueue) EnqueueReportsWithEventIndexes(playerID int, host string, reports []string, eventIndexes []int) (int, error) {
 	h := cluster.NormalizeHost(host)
 	if playerID == 0 {
 		return 0, fmt.Errorf("invalid playerID")
@@ -87,6 +126,7 @@ func (q *DispatchTaskQueue) EnqueueReports(playerID int, host string, reports []
 
 	now := time.Now()
 	queued := 0
+	normalizedEvents := normalizeEventIndexes(eventIndexes)
 
 	q.mu.Lock()
 	q.cleanupDoneLocked(now)
@@ -102,6 +142,7 @@ func (q *DispatchTaskQueue) EnqueueReports(playerID int, host string, reports []
 			if existing != nil {
 				if existing.Status == taskStatusPending {
 					existing.Host = h
+					existing.EventIndexes = mergeEventIndexes(existing.EventIndexes, normalizedEvents)
 					existing.UpdatedAt = now
 				}
 				continue
@@ -112,13 +153,14 @@ func (q *DispatchTaskQueue) EnqueueReports(playerID int, host string, reports []
 		q.nextTaskID++
 		taskID := fmt.Sprintf("t-%d", q.nextTaskID)
 		q.tasks[taskID] = &DispatchTask{
-			ID:        taskID,
-			PlayerID:  playerID,
-			Host:      h,
-			Reports:   []string{code},
-			Status:    taskStatusPending,
-			CreatedAt: now,
-			UpdatedAt: now,
+			ID:           taskID,
+			PlayerID:     playerID,
+			Host:         h,
+			Reports:      []string{code},
+			EventIndexes: append([]int(nil), normalizedEvents...),
+			Status:       taskStatusPending,
+			CreatedAt:    now,
+			UpdatedAt:    now,
 		}
 		q.byReport[key] = taskID
 		queued++
@@ -194,15 +236,16 @@ func (q *DispatchTaskQueue) Claim(host string, limit int, lease time.Duration) [
 		task.LeaseUntil = now.Add(lease)
 		task.UpdatedAt = now
 		out = append(out, DispatchTask{
-			ID:         task.ID,
-			PlayerID:   task.PlayerID,
-			Host:       task.Host,
-			Reports:    append([]string(nil), task.Reports...),
-			Status:     task.Status,
-			ClaimedBy:  task.ClaimedBy,
-			LeaseUntil: task.LeaseUntil,
-			CreatedAt:  task.CreatedAt,
-			UpdatedAt:  task.UpdatedAt,
+			ID:           task.ID,
+			PlayerID:     task.PlayerID,
+			Host:         task.Host,
+			Reports:      append([]string(nil), task.Reports...),
+			EventIndexes: append([]int(nil), task.EventIndexes...),
+			Status:       task.Status,
+			ClaimedBy:    task.ClaimedBy,
+			LeaseUntil:   task.LeaseUntil,
+			CreatedAt:    task.CreatedAt,
+			UpdatedAt:    task.UpdatedAt,
 		})
 	}
 	return out
@@ -281,16 +324,17 @@ func (q *DispatchTaskQueue) Snapshot() []DispatchTask {
 			continue
 		}
 		out = append(out, DispatchTask{
-			ID:         task.ID,
-			PlayerID:   task.PlayerID,
-			Host:       task.Host,
-			Reports:    append([]string(nil), task.Reports...),
-			Status:     task.Status,
-			ClaimedBy:  task.ClaimedBy,
-			LeaseUntil: task.LeaseUntil,
-			LastError:  task.LastError,
-			CreatedAt:  task.CreatedAt,
-			UpdatedAt:  task.UpdatedAt,
+			ID:           task.ID,
+			PlayerID:     task.PlayerID,
+			Host:         task.Host,
+			Reports:      append([]string(nil), task.Reports...),
+			EventIndexes: append([]int(nil), task.EventIndexes...),
+			Status:       task.Status,
+			ClaimedBy:    task.ClaimedBy,
+			LeaseUntil:   task.LeaseUntil,
+			LastError:    task.LastError,
+			CreatedAt:    task.CreatedAt,
+			UpdatedAt:    task.UpdatedAt,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
