@@ -736,6 +736,7 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 					logProgress(entry.FightID, "失败(更新数据库)")
 					return
 				}
+				bumpV1APIKeyUsage(apiKey)
 
 				log.Printf("[V1][PROFILE] fight %s-%d 拉取完成 | pages=%d events=%d fetch耗时=%s 写盘耗时=%s 文件大小=%.2fMB 总耗时=%s", code, fight.ID, fetchStats.Pages, fetchStats.Events, fetchStats.FetchElapsed, writeElapsed, float64(fileBytes)/(1024*1024), time.Since(fightStartedAt))
 
@@ -768,6 +769,21 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 	}
 
 	return int(successCount), reportDone && atomic.LoadInt32(&allDone) == 1, nil
+}
+
+func bumpV1APIKeyUsage(apiKey string) {
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		return
+	}
+
+	if err := db.DB.Exec(`
+		UPDATE fflogskey
+		SET used = COALESCE(used, 0) + 1
+		WHERE ver = 1 AND api_id = ?
+	`, key).Error; err != nil {
+		log.Printf("[V1] 更新fflogskey.used失败 api_id=%s err=%v", key, err)
+	}
 }
 
 // markFightDownloadedByID 标记战斗已下载id。

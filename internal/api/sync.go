@@ -57,6 +57,11 @@ type reportHostEntry struct {
 	Host   string `json:"host"`
 }
 
+type pendingReportEventsCountRow struct {
+	ReportCode string `gorm:"column:report_code"`
+	Events     int    `gorm:"column:events"`
+}
+
 // NewSyncManager 创建一个新的同步管理器
 func NewSyncManager(client *FFLogsClient) *SyncManager {
 	return &SyncManager{client: client, scorer: scoring.NewServiceFromEnv()}
@@ -1583,6 +1588,39 @@ func postReportHostAssignmentsToClusterMaster(assignments map[string]reportHostE
 	return firstErr
 }
 
+func loadPendingEventCountsForReports(reportCodes []string) (map[string]int, error) {
+	if len(reportCodes) == 0 {
+		return map[string]int{}, nil
+	}
+
+	rows := make([]pendingReportEventsCountRow, 0)
+	if err := db.DB.Raw(`
+		SELECT
+			split_part(master_id, '-', 1) AS report_code,
+			COUNT(*)::int AS events
+		FROM fight_sync_maps
+		WHERE parsed_done = false
+			AND split_part(master_id, '-', 1) IN ?
+		GROUP BY split_part(master_id, '-', 1)
+	`, reportCodes).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]int, len(rows))
+	for _, row := range rows {
+		code := cluster.NormalizeReportCode(row.ReportCode)
+		if code == "" {
+			continue
+		}
+		events := row.Events
+		if events < 0 {
+			events = 0
+		}
+		out[code] = events
+	}
+	return out, nil
+}
+
 // postReportsToClusterMaster 将报告代码列表上报给集群主节点，供集群内其他节点查询和使用。
 func postReportsToClusterMaster(codes []string) error {
 	master := clusterMasterEndpointFromEnv()
@@ -1595,12 +1633,22 @@ func postReportsToClusterMaster(codes []string) error {
 		return nil
 	}
 
+	pendingEventCounts, countErr := loadPendingEventCountsForReports(reports)
+	if countErr != nil {
+		log.Printf("[CLUSTER] 加载V2待处理event统计失败 reports=%d err=%v", len(reports), countErr)
+		pendingEventCounts = map[string]int{}
+	}
+
 	var firstErr error
 	for _, code := range reports {
+		events := pendingEventCounts[code]
+		if events < 0 {
+			events = 0
+		}
 		payload := clusterRegisterReportsPayload{
 			Report: code,
-			// 同上：V2 解析结果上报仅传事件量，Host 始终留空。
-			Entry:  []reportHostEntry{{Events: 0, Host: ""}},
+			// V2 上报实时带上待处理 event 数；Host 始终留空，避免覆盖主节点路由决策。
+			Entry:  []reportHostEntry{{Events: events, Host: ""}},
 			Reason: clusterRegisterReasonV2Completed,
 		}
 		if err := postClusterReportsRegister(master, payload); err != nil {
