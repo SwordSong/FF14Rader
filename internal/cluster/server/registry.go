@@ -1,6 +1,7 @@
 package server
 
 import (
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -11,12 +12,19 @@ import (
 )
 
 // ReportHostRegistry 维护 reportCode 到 host 的映射及主机负载信息。
+// reportHost的设计理念是快速查询report在哪个host上下载解析的，如果内部的host是空字符串，表示该report没有被任何host注册，外部调用方选择本地处理。
+// 如果是本机解析的report，并且events数量大于0则让本机再次处理，这是为了让一个report的文件在一个主机上面处理，避免同一个report在多个主机上重复下载解析。对于分布式环境，建议外部调用方在分配host时优先考虑已经注册了该report的host，这样可以利用已经下载好的文件进行解析，减少网络传输和重复下载的开销。
 type ReportHostRegistry struct {
 	mu         sync.RWMutex
-	user       map[int]models.PlayerLite
-	reportHost map[string]string
-	hostLoad   map[string]int
-	hostSeenAt map[string]time.Time
+	user       map[int]models.PlayerLite  // playerID -> PlayerLite
+	reportHost map[string]reportHostEntry // reportCode -> {events,host}
+	hostLoad   map[string]int             // host -> 当前负载（可自定义为正在处理的报告数量等）
+	hostSeenAt map[string]time.Time       // host -> 最近心跳时间
+}
+
+type reportHostEntry struct {
+	Events int    `json:"events"`
+	Host   string `json:"host"`
 }
 
 var globalReportHostRegistry = NewReportHostRegistry()
@@ -25,7 +33,7 @@ var globalReportHostRegistry = NewReportHostRegistry()
 func NewReportHostRegistry() *ReportHostRegistry {
 	return &ReportHostRegistry{
 		user:       make(map[int]models.PlayerLite),
-		reportHost: make(map[string]string),
+		reportHost: make(map[string]reportHostEntry),
 		hostLoad:   make(map[string]int),
 		hostSeenAt: make(map[string]time.Time),
 	}
@@ -62,6 +70,7 @@ func dedupeHosts(hosts []string) []string {
 	return out
 }
 
+// touchHostLocked 更新主机最近心跳时间，必须在持有锁的情况下调用。
 func (r *ReportHostRegistry) touchHostLocked(host string, now time.Time) {
 	r.hostSeenAt[host] = now
 	if _, ok := r.hostLoad[host]; !ok {
@@ -88,27 +97,65 @@ func (r *ReportHostRegistry) SeedHostReportsFromDir(host, dirPath string) (int, 
 // RegisterHostReports 注册主机与报告映射。
 func (r *ReportHostRegistry) RegisterHostReports(host string, reports []string) (added int, total int) {
 	h := cluster.NormalizeHost(host)
-	if h == "" {
-		return 0, len(r.reportHost)
-	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.touchHostLocked(h, time.Now())
+	if h != "" {
+		r.touchHostLocked(h, time.Now())
+	}
 
 	for _, raw := range reports {
 		code := cluster.NormalizeReportCode(raw)
 		if code == "" {
 			continue
 		}
-		if existing, ok := r.reportHost[code]; ok && existing == h {
+		existing, exists := r.reportHost[code]
+		if exists && existing.Host == h {
 			continue
 		}
-		r.reportHost[code] = h
+		existing.Host = h
+		r.reportHost[code] = existing
+		log.Printf("[CLUSTER] 注册报告 host=%s report=%s", h, code)
 		added++
 	}
 
 	return added, len(r.reportHost)
+}
+
+// RegisterReportWithEvents 注册单个报告映射并可携带事件数量。
+func (r *ReportHostRegistry) RegisterReportWithEvents(reportCode, host string, events int) (added int, total int) {
+	code := cluster.NormalizeReportCode(reportCode)
+	if code == "" {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		return 0, len(r.reportHost)
+	}
+
+	h := cluster.NormalizeHost(host)
+	if events < 0 {
+		events = 0
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if h != "" {
+		r.touchHostLocked(h, time.Now())
+	}
+
+	existing, exists := r.reportHost[code]
+	newEntry := existing
+	newEntry.Host = h
+	if events > 0 || !exists {
+		newEntry.Events = events
+	}
+
+	if exists && existing.Host == newEntry.Host && existing.Events == newEntry.Events {
+		return 0, len(r.reportHost)
+	}
+
+	r.reportHost[code] = newEntry
+	log.Printf("[CLUSTER] 注册报告 host=%s report=%s events=%d", h, code, newEntry.Events)
+	return 1, len(r.reportHost)
 }
 
 // RegisterUserServer 注册玩家与服务器映射。
@@ -181,8 +228,15 @@ func (r *ReportHostRegistry) ResolveHost(reportCode string) (string, bool) {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	host, ok := r.reportHost[code]
-	return host, ok
+	entry, ok := r.reportHost[code]
+	if !ok {
+		return "", false
+	}
+	host := cluster.NormalizeHost(entry.Host)
+	if host == "" {
+		return "", false
+	}
+	return host, true
 }
 
 // AssignHostForReport 为报告分配主机并更新负载统计。
@@ -199,10 +253,14 @@ func (r *ReportHostRegistry) AssignHostForReport(reportCode string, fightCount i
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if mapped, ok := r.reportHost[code]; ok {
-		if len(candidates) == 0 || containsHost(candidates, mapped) {
+	if entry, ok := r.reportHost[code]; ok {
+		mapped := cluster.NormalizeHost(entry.Host)
+		if mapped != "" && (len(candidates) == 0 || containsHost(candidates, mapped)) {
+			entry.Host = mapped
+			entry.Events = fightCount
+			r.reportHost[code] = entry
 			r.hostLoad[mapped] += fightCount
-			r.hostSeenAt[mapped] = time.Now()
+			r.touchHostLocked(mapped, time.Now())
 			return mapped
 		}
 	}
@@ -221,7 +279,7 @@ func (r *ReportHostRegistry) AssignHostForReport(reportCode string, fightCount i
 	})
 
 	chosen := candidates[0]
-	r.reportHost[code] = chosen
+	r.reportHost[code] = reportHostEntry{Events: fightCount, Host: chosen}
 	r.hostLoad[chosen] += fightCount
 	r.touchHostLocked(chosen, time.Now())
 	return chosen
@@ -256,7 +314,8 @@ func (r *ReportHostRegistry) EvictExpiredHosts(ttl time.Duration) ([]string, int
 	}
 
 	removedReports := 0
-	for code, host := range r.reportHost {
+	for code, entry := range r.reportHost {
+		host := cluster.NormalizeHost(entry.Host)
 		if _, ok := expiredSet[host]; ok {
 			delete(r.reportHost, code)
 			removedReports++
@@ -268,10 +327,10 @@ func (r *ReportHostRegistry) EvictExpiredHosts(ttl time.Duration) ([]string, int
 }
 
 // Snapshot 返回报告到主机映射快照。
-func (r *ReportHostRegistry) Snapshot() map[string]string {
+func (r *ReportHostRegistry) Snapshot() map[string]reportHostEntry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make(map[string]string, len(r.reportHost))
+	out := make(map[string]reportHostEntry, len(r.reportHost))
 	for k, v := range r.reportHost {
 		out[k] = v
 	}

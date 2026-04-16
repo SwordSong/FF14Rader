@@ -89,7 +89,6 @@ func (q *DispatchTaskQueue) EnqueueReports(playerID int, host string, reports []
 	queued := 0
 
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.cleanupDoneLocked(now)
 
 	for _, raw := range reports {
@@ -123,6 +122,11 @@ func (q *DispatchTaskQueue) EnqueueReports(playerID int, host string, reports []
 		}
 		q.byReport[key] = taskID
 		queued++
+	}
+	q.mu.Unlock()
+
+	if queued > 0 {
+		GlobalTaskNotifyHub().NotifyTaskAvailable(h, queued)
 	}
 
 	return queued, nil

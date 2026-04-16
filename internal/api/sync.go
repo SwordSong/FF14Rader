@@ -1,18 +1,25 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	cluster "github.com/user/ff14rader/internal/cluster"
+	clusterserver "github.com/user/ff14rader/internal/cluster/server"
 	"github.com/user/ff14rader/internal/db"
 	"github.com/user/ff14rader/internal/models"
 	"github.com/user/ff14rader/internal/scoring"
@@ -34,29 +41,43 @@ type scoreTask struct {
 	fightID    int
 }
 
+type clusterRegisterReportsPayload struct {
+	Report string            `json:"report"`
+	Entry  []reportHostEntry `json:"reports"`
+}
+
+type reportHostEntry struct {
+	Events int    `json:"events"`
+	Host   string `json:"host"`
+}
+
 // NewSyncManager 创建一个新的同步管理器
 func NewSyncManager(client *FFLogsClient) *SyncManager {
 	return &SyncManager{client: client, scorer: scoring.NewServiceFromEnv()}
 }
 
-// StartIncrementalSync 启动增量同步流程，包含 V2 查询、数据落库、V1 下载和能力刷新。
+// StartIncrementalSync 启动增量同步流程，包含 V2 查询、report code上报。
 func (s *SyncManager) StartIncrementalSync(ctx context.Context, player models.PlayerLite, region string) error {
 	var fullPlayer models.Player
-	err := db.DB.Clauses(dbresolver.Write).Select("id", "pichash").Where("name = ? AND server = ? AND region = ?", player.Name, player.Server, region).First(&fullPlayer).Error
+	err := db.DB.Clauses(dbresolver.Write).Where("name = ? AND server = ? AND region = ?", player.Name, player.Server, region).First(&fullPlayer).Error
 	if err != nil {
 		return fmt.Errorf("failed to fetch full player data: %v", err)
 	}
-
+	//allowV2Query是一个布尔值，表示是否允许使用 V2 查询；reason是一个字符串，说明为什么允许或不允许使用 V2 查询。
 	allowV2Query, reason, err := shouldRunV2ReportQuery(fullPlayer)
 	if err != nil {
 		return fmt.Errorf("check v2 query gate failed: %v", err)
 	}
 	if !allowV2Query {
 		log.Printf("[INFO] 跳过 V2 reports 查询: %s", reason)
-		if _, err := s.downloadV1Reports(ctx, fullPlayer.ID); err != nil {
-			return err
+		reportHostAssignments, assignErr := s.buildPendingReportHostAssignments(fullPlayer.ID)
+		if assignErr != nil {
+			return fmt.Errorf("build reportcode-host assignments failed: %v", assignErr)
 		}
-		return s.refreshPlayerOutputAbilityFromLogs(ctx, fullPlayer, region)
+		if err := postReportHostAssignmentsToClusterMaster(reportHostAssignments); err != nil {
+			return fmt.Errorf("post reportcode-host assignments failed: %v", err)
+		}
+		return nil
 	}
 	log.Printf("[INFO] 执行 V2 reports 查询: %s", reason)
 
@@ -66,6 +87,7 @@ func (s *SyncManager) StartIncrementalSync(ctx context.Context, player models.Pl
 // executeV2ReportsQuery 执行 V2 报告分页查询、落库，并触发后续 V1 下载与能力刷新。
 func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, player models.Player, region string) error {
 	serverSlug := player.Server
+	// log.Printf("[INFO] DEBUG 查询: %+v", player)
 
 	// 确保去重键的唯一索引存在（避免并发创建重复 master 行）
 	// (name, timestamp) 足以区分同一场战斗
@@ -301,15 +323,15 @@ func (s *SyncManager) executeV2ReportsQuery(ctx context.Context, player models.P
 	if err := s.syncAllReportsMetadata(player, allReports); err != nil {
 		return err
 	}
-	if _, err := s.downloadV1Reports(ctx, player.ID); err != nil {
-		return err
-	}
-	if err := s.refreshPlayerOutputAbilityFromLogs(ctx, player, region); err != nil {
-		return err
-	}
-	if err := touchPlayerV2ReportCheckedAt(player.ID); err != nil {
-		return err
-	}
+	// if _, err := s.downloadV1Reports(ctx, player.ID); err != nil {
+	// 	return err
+	// }
+	// if err := s.refreshPlayerOutputAbilityFromLogs(ctx, player, region); err != nil {
+	// 	return err
+	// }
+	// if err := touchPlayerV2ReportCheckedAt(player.ID); err != nil {
+	// 	return err
+	// }
 
 	return nil
 }
@@ -834,6 +856,10 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 	}
 
 	wg.Wait()
+	if err := postReportsToClusterMaster(uniqueCodes); err != nil {
+		log.Printf("[CLUSTER] 上报 reportCode 失败 reports=%d err=%v", len(uniqueCodes), err)
+	}
+
 	log.Printf("多线程并行同步完成")
 	return nil
 }
@@ -1231,6 +1257,328 @@ func uniqueReportCodes(reports []interface{}) []string {
 		out = append(out, code)
 	}
 	return out
+}
+
+func clusterMasterEndpointFromEnv() string {
+	raw := strings.TrimSpace(os.Getenv("CLUSTER_MASTER_ENDPOINT"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("CLUSTER_MASTER_URL"))
+	}
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil || strings.TrimSpace(u.Host) == "" {
+		return ""
+	}
+	u.Path = ""
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+	return strings.TrimRight(u.String(), "/")
+}
+
+func normalizeReportCodesForClusterRegister(codes []string) []string {
+	set := make(map[string]struct{}, len(codes))
+	for _, raw := range codes {
+		code := cluster.NormalizeReportCode(raw)
+		if code == "" {
+			continue
+		}
+		set[code] = struct{}{}
+	}
+	out := make([]string, 0, len(set))
+	for code := range set {
+		out = append(out, code)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func normalizeCandidateHosts(hosts []string) []string {
+	seen := make(map[string]struct{}, len(hosts))
+	out := make([]string, 0, len(hosts))
+	for _, raw := range hosts {
+		host := cluster.NormalizeHost(raw)
+		if host == "" {
+			continue
+		}
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func buildHostCapacities(candidateHosts []string, scorer *scoring.Service) map[string]int {
+	capacities := make(map[string]int, len(candidateHosts))
+	for _, host := range candidateHosts {
+		capacities[host] = 1
+	}
+
+	if scorer == nil {
+		return capacities
+	}
+
+	for rawHost, capacity := range scorer.CandidateAnalyzeHostCapacities() {
+		host := cluster.NormalizeHost(rawHost)
+		if host == "" {
+			continue
+		}
+		if capacity <= 0 {
+			capacity = 1
+		}
+		capacities[host] = capacity
+	}
+
+	return capacities
+}
+
+func buildHostLoadByEvents(reports map[string]reportHostEntry) map[string]int {
+	load := make(map[string]int)
+	for _, entry := range reports {
+		host := cluster.NormalizeHost(entry.Host)
+		if host == "" {
+			continue
+		}
+		events := entry.Events
+		if events <= 0 {
+			events = 1
+		}
+		load[host] += events
+	}
+	return load
+}
+
+// chooseHostByRegistryRule 按 reportHost 语义选择主机：
+// 1) host 为空（或未注册）时，调用方选择本机处理；
+// 2) host 为本机且 events>0 时，继续本机处理，保持同 report 在单机解析；
+// 3) 其余情况沿用已注册 host，避免跨机重复下载解析。
+func chooseHostByRegistryRule(reportCode string, snapshot map[string]reportHostEntry, localHost string) string {
+	local := cluster.NormalizeHost(localHost)
+	if local == "" {
+		local = "127.0.0.1"
+	}
+
+	code := cluster.NormalizeReportCode(reportCode)
+	if code == "" {
+		return local
+	}
+
+	entry, exists := snapshot[code]
+	if !exists {
+		entry, exists = snapshot[reportCode]
+	}
+	if !exists {
+		return local
+	}
+
+	mapped := cluster.NormalizeHost(entry.Host)
+	if mapped == "" {
+		return local
+	}
+	if mapped == local && entry.Events > 0 {
+		return local
+	}
+
+	return mapped
+}
+
+func chooseHostByCapacity(candidateHosts []string, hostLoad map[string]int, hostCapacities map[string]int, pendingEvents int) string {
+	if len(candidateHosts) == 0 {
+		return ""
+	}
+	if pendingEvents <= 0 {
+		pendingEvents = 1
+	}
+
+	bestHost := ""
+	bestScore := math.MaxFloat64
+	bestProjected := int(^uint(0) >> 1)
+
+	for _, host := range candidateHosts {
+		capacity := hostCapacities[host]
+		if capacity <= 0 {
+			capacity = 1
+		}
+
+		projected := hostLoad[host] + pendingEvents
+		score := float64(projected) / float64(capacity)
+		if bestHost == "" ||
+			score < bestScore ||
+			(score == bestScore && (projected < bestProjected || (projected == bestProjected && host < bestHost))) {
+			bestHost = host
+			bestScore = score
+			bestProjected = projected
+		}
+	}
+
+	return bestHost
+}
+
+func fetchClusterReportsSnapshot(master string) (map[string]reportHostEntry, error) {
+	_ = master
+
+	snapshot := clusterserver.GlobalReportHostRegistry().Snapshot()
+	if len(snapshot) == 0 {
+		return map[string]reportHostEntry{}, nil
+	}
+
+	out := make(map[string]reportHostEntry, len(snapshot))
+	for code, entry := range snapshot {
+		out[code] = reportHostEntry{Events: entry.Events, Host: entry.Host}
+	}
+	return out, nil
+}
+
+// buildPendingReportHostAssignments 构建待处理报告的主机分配。
+func (s *SyncManager) buildPendingReportHostAssignments(playerID int) (map[string]reportHostEntry, error) {
+	pending, err := loadPendingFights(playerID)
+	if err != nil {
+		return nil, err
+	}
+	if len(pending) == 0 {
+		return map[string]reportHostEntry{}, nil
+	}
+
+	grouped := groupPendingFights(pending)
+	reportCodes := make([]string, 0, len(grouped))
+	for code := range grouped {
+		reportCodes = append(reportCodes, code)
+	}
+	sort.Strings(reportCodes)
+
+	localHost := cluster.LocalHost()
+	snapshot := make(map[string]reportHostEntry)
+	if master := clusterMasterEndpointFromEnv(); master != "" {
+		if fetched, err := fetchClusterReportsSnapshot(master); err != nil {
+			log.Printf("[CLUSTER] 拉取报告分配快照失败 master=%s err=%v", master, err)
+		} else {
+			for code, entry := range fetched {
+				snapshot[code] = entry
+			}
+		}
+	}
+
+	assignments := make(map[string]reportHostEntry, len(reportCodes))
+	for _, code := range reportCodes {
+		fightCount := len(grouped[code])
+		assigned := chooseHostByRegistryRule(code, snapshot, localHost)
+		assignments[code] = reportHostEntry{Events: fightCount, Host: assigned}
+		normalizedCode := cluster.NormalizeReportCode(code)
+		if normalizedCode != "" {
+			snapshot[normalizedCode] = reportHostEntry{Events: fightCount, Host: assigned}
+		}
+		_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(code, assigned, fightCount)
+	}
+
+	return assignments, nil
+}
+
+func postClusterReportsRegister(master string, payload clusterRegisterReportsPayload) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	urlText := strings.TrimRight(master, "/") + "/api/cluster/reports/register"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlText, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	log.Printf("[CLUSTER] 上报报告注册结果 master=%s report=%s entries=%d status=%d", master, payload.Report, len(payload.Entry), resp.StatusCode)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("register reports status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+	return nil
+}
+
+// postReportHostAssignmentsToClusterMaster 将报告主机分配结果上报给集群主节点，供集群内其他节点查询和使用。
+func postReportHostAssignmentsToClusterMaster(assignments map[string]reportHostEntry) error {
+	if len(assignments) == 0 {
+		return nil
+	}
+
+	master := clusterMasterEndpointFromEnv()
+	if master == "" {
+		return nil
+	}
+
+	reportCodes := make([]string, 0, len(assignments))
+	for code := range assignments {
+		reportCodes = append(reportCodes, code)
+	}
+	sort.Strings(reportCodes)
+
+	var firstErr error
+	for _, rawCode := range reportCodes {
+		code := cluster.NormalizeReportCode(rawCode)
+		if code == "" {
+			continue
+		}
+		entry := assignments[rawCode]
+		payload := clusterRegisterReportsPayload{
+			Report: code,
+			// 注意：客户端通过 V2 解析得到的 reportHost 上报时，Host 必须留空。
+			// 这里不要改成 entry.Host，避免客户端覆盖主节点的全局路由决策。
+			Entry: []reportHostEntry{{Events: entry.Events, Host: ""}},
+		}
+		if err := postClusterReportsRegister(master, payload); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	return firstErr
+}
+
+// postReportsToClusterMaster 将报告代码列表上报给集群主节点，供集群内其他节点查询和使用。
+func postReportsToClusterMaster(codes []string) error {
+	master := clusterMasterEndpointFromEnv()
+	if master == "" {
+		return nil
+	}
+
+	reports := normalizeReportCodesForClusterRegister(codes)
+	if len(reports) == 0 {
+		return nil
+	}
+
+	var firstErr error
+	for _, code := range reports {
+		payload := clusterRegisterReportsPayload{
+			Report: code,
+			// 同上：V2 解析结果上报仅传事件量，Host 始终留空。
+			Entry: []reportHostEntry{{Events: 0, Host: ""}},
+		}
+		if err := postClusterReportsRegister(master, payload); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	return firstErr
 }
 
 // 辅助函数：检查 Actor 是否在某场战斗中

@@ -10,8 +10,8 @@ import (
 
 // StartWorker 启动工作协程。
 func StartWorker() {
-	fflogsClient := internalapi.NewFFLogsClient()
-	syncManager := internalapi.NewSyncManager(fflogsClient)
+	fflogsClient := *internalapi.NewFFLogsClient()
+	syncManager := *internalapi.NewSyncManager(&fflogsClient)
 
 	localHost := cluster.LocalHost()
 	scanDir := cluster.ReportsScanDir()
@@ -23,5 +23,5 @@ func StartWorker() {
 	}
 
 	clusterclient.StartAutoRegisterAndHeartbeat()
-	clusterclient.StartClusterTaskPullLoop(syncManager)
+	clusterclient.StartClusterTaskPullLoop(&syncManager)
 }

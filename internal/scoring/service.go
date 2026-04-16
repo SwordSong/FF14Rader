@@ -1595,6 +1595,45 @@ func (s *Service) CandidateAnalyzeHosts() []string {
 	return out
 }
 
+// CandidateAnalyzeHostCapacities 返回候选分析主机的容量估计（按主机聚合 maxConcurrency）。
+func (s *Service) CandidateAnalyzeHostCapacities() map[string]int {
+	urls := s.apiURLs
+	if alive, err := s.pickAliveAnalyzeURLs(); err == nil && len(alive) > 0 {
+		urls = alive
+	}
+
+	endpoints := uniqueAnalyzeURLs(urls)
+	out := make(map[string]int)
+	if len(endpoints) == 0 {
+		for _, host := range s.CandidateAnalyzeHosts() {
+			out[host] = 1
+		}
+		return out
+	}
+
+	probeClient := &http.Client{Timeout: 1200 * time.Millisecond}
+	for _, endpoint := range endpoints {
+		host := cluster.NormalizeHost(analyzeEndpointHost(endpoint))
+		if host == "" {
+			continue
+		}
+
+		capacity := probeAnalyzeEndpointConcurrency(probeClient, endpoint)
+		if capacity <= 0 {
+			capacity = 1
+		}
+		out[host] += capacity
+	}
+
+	if len(out) == 0 {
+		for _, host := range s.CandidateAnalyzeHosts() {
+			out[host] = 1
+		}
+	}
+
+	return out
+}
+
 // pickAnalyzeURLForPayload 为载荷选择分析服务 URL。
 func (s *Service) pickAnalyzeURLForPayload(payload analyzeRequest, attempt int) string {
 	return s.pickAnalyzeURLForPayloadFromURLs(payload, attempt, s.apiURLs)

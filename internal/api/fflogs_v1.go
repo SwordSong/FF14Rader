@@ -143,28 +143,37 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID int) ([]st
 		}
 		sort.Strings(reportCodes)
 
-		candidateHosts := []string{cluster.LocalHost()}
-		if s.scorer != nil {
-			if hosts := s.scorer.CandidateAnalyzeHosts(); len(hosts) > 0 {
-				candidateHosts = hosts
+		localHost := cluster.LocalHost()
+		normalizedLocalHost := cluster.NormalizeHost(localHost)
+		if normalizedLocalHost == "" {
+			normalizedLocalHost = "127.0.0.1"
+		}
+		reportSnapshot := make(map[string]reportHostEntry)
+		if master := clusterMasterEndpointFromEnv(); master != "" {
+			if snapshot, fetchErr := fetchClusterReportsSnapshot(master); fetchErr != nil {
+				log.Printf("[CLUSTER] 拉取报告分配快照失败 master=%s err=%v", master, fetchErr)
+			} else {
+				for code, entry := range snapshot {
+					reportSnapshot[code] = entry
+				}
 			}
 		}
-
-		localHost := cluster.LocalHost()
 		taskMode := clusterserver.ClusterTaskMode()
 		reportAssignedHost := make(map[string]string, len(reportCodes))
+		// 客户端按 reportHost 规则路由，避免同一 report 跨机重复下载解析。
 		for _, code := range reportCodes {
 			fightCount := len(grouped[code])
-			assigned := clusterserver.GlobalReportHostRegistry().AssignHostForReport(code, fightCount, candidateHosts)
+			assigned := chooseHostByRegistryRule(code, reportSnapshot, normalizedLocalHost)
+			_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(code, assigned, fightCount)
 			reportAssignedHost[code] = assigned
-			if assigned == "" {
-				log.Printf("[CLUSTER] 报告 %s 未匹配到可用 host，回退本地执行", code)
-				continue
+			normalizedCode := cluster.NormalizeReportCode(code)
+			if normalizedCode != "" {
+				reportSnapshot[normalizedCode] = reportHostEntry{Events: fightCount, Host: assigned}
 			}
-			if assigned == localHost {
-				log.Printf("[CLUSTER] 报告 %s 分配到本机 host=%s fights=%d", code, assigned, fightCount)
+			if cluster.NormalizeHost(assigned) == normalizedLocalHost {
+				log.Printf("[CLUSTER] 报告 %s 按注册规则分配到本机 host=%s fights=%d", code, assigned, fightCount)
 			} else {
-				log.Printf("[CLUSTER] 报告 %s 分配到远端 host=%s fights=%d", code, assigned, fightCount)
+				log.Printf("[CLUSTER] 报告 %s 按注册规则分配到已注册远端 host=%s fights=%d", code, assigned, fightCount)
 			}
 		}
 
@@ -187,8 +196,8 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID int) ([]st
 						continue
 					}
 
-					assignedHost := reportAssignedHost[code]
-					if assignedHost != "" && assignedHost != localHost {
+					assignedHost := cluster.NormalizeHost(reportAssignedHost[code])
+					if assignedHost != "" && assignedHost != normalizedLocalHost {
 						if taskMode == "pull" {
 							queued, queueErr := clusterserver.GlobalDispatchTaskQueue().EnqueueReports(playerID, assignedHost, []string{code})
 							if queueErr == nil {

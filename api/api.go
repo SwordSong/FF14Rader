@@ -14,18 +14,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/rs/cors"
 	"github.com/user/ff14rader/internal/api"
 	"github.com/user/ff14rader/internal/cluster"
 	clusterserver "github.com/user/ff14rader/internal/cluster/server"
+	"github.com/user/ff14rader/internal/db"
 )
 
 // context key for request id
@@ -35,30 +39,32 @@ const requestIDKey ctxKey = "requestID"
 
 type Service struct{}
 
+var taskWSUpgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+type registerReportEntry struct {
+	Events int    `json:"events"`
+	Host   string `json:"host"`
+}
+
 type registerReportsRequest struct {
-	Host    string   `json:"host"`
-	Reports []string `json:"reports"`
+	Host    string          `json:"host"`
+	Report  string          `json:"report"`
+	Reports json.RawMessage `json:"reports"`
 }
 
 type heartbeatRequest struct {
 	Host string `json:"host"`
 }
 
-type claimTasksRequest struct {
-	Host     string `json:"host"`
-	Limit    int    `json:"limit"`
-	LeaseSec int    `json:"leaseSec"`
-}
-
-type claimUserRequest struct {
-	Host string `json:"host"`
-}
-
-type ackTaskRequest struct {
-	Host    string `json:"host"`
-	TaskID  string `json:"taskId"`
-	Success bool   `json:"success"`
-	Error   string `json:"error"`
+type raderRequest struct {
+	Username string `json:"username"`
+	Server   string `json:"server"`
 }
 
 type pullTaskResponseItem struct {
@@ -68,7 +74,154 @@ type pullTaskResponseItem struct {
 	Host     string   `json:"host"`
 }
 
-// 注册报告接口，供客户端调用，注册客户端的 reportCode 列表，并返回当前映射状态
+type taskWSRequest struct {
+	Type      string          `json:"type"`
+	RequestID string          `json:"requestId,omitempty"`
+	Action    string          `json:"action,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+type taskWSResponse struct {
+	Type      string      `json:"type"`
+	RequestID string      `json:"requestId,omitempty"`
+	Action    string      `json:"action,omitempty"`
+	Status    string      `json:"status"`
+	Error     string      `json:"error,omitempty"`
+	Payload   interface{} `json:"payload,omitempty"`
+}
+
+type taskWSClaimPayload struct {
+	Limit    int `json:"limit"`
+	LeaseSec int `json:"leaseSec"`
+}
+
+type taskWSAckPayload struct {
+	TaskID  string `json:"taskId"`
+	Success bool   `json:"success"`
+	Error   string `json:"error"`
+}
+
+type pendingClaimSeedRow struct {
+	PlayerID   int    `gorm:"column:player_id"`
+	ReportCode string `gorm:"column:report_code"`
+	Events     int    `gorm:"column:events"`
+}
+
+// enqueuePendingTasksForHost 当任务队列为空时，根据待处理 fights 为当前 host 补充可领取任务。
+func enqueuePendingTasksForHost(host string, limit int) (int, error) {
+	h := cluster.NormalizeHost(host)
+	if h == "" {
+		return 0, nil
+	}
+	if limit <= 0 {
+		limit = 1
+	}
+	if limit > 128 {
+		limit = 128
+	}
+
+	rows := make([]pendingClaimSeedRow, 0)
+	if err := db.DB.Raw(`
+		SELECT
+			player_id,
+			split_part(master_id, '-', 1) AS report_code,
+			COUNT(*)::int AS events
+		FROM fight_sync_maps
+		WHERE downloaded = false
+		GROUP BY player_id, split_part(master_id, '-', 1)
+		ORDER BY COUNT(*) DESC
+		LIMIT ?
+	`, limit*8).Scan(&rows).Error; err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	snapshot := clusterserver.GlobalReportHostRegistry().Snapshot()
+	queuedTotal := 0
+	for _, row := range rows {
+		code := cluster.NormalizeReportCode(row.ReportCode)
+		if row.PlayerID == 0 || code == "" {
+			continue
+		}
+
+		entry, exists := snapshot[code]
+		mappedHost := ""
+		if exists {
+			mappedHost = cluster.NormalizeHost(entry.Host)
+		}
+		if mappedHost != "" && mappedHost != h {
+			continue
+		}
+
+		events := row.Events
+		if events <= 0 {
+			events = 1
+		}
+
+		queued, err := clusterserver.GlobalDispatchTaskQueue().EnqueueReports(row.PlayerID, h, []string{code})
+		if err != nil {
+			continue
+		}
+		if queued > 0 {
+			queuedTotal += queued
+			_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(code, h, events)
+		}
+		if queuedTotal >= limit {
+			break
+		}
+	}
+
+	return queuedTotal, nil
+}
+
+func normalizeClaimArgs(limit int, leaseSec int) (int, int) {
+	if limit <= 0 {
+		limit = 1
+	}
+	if limit > 16 {
+		limit = 16
+	}
+
+	if leaseSec <= 0 {
+		leaseSec = 900
+	}
+	if leaseSec > 3600 {
+		leaseSec = 3600
+	}
+
+	return limit, leaseSec
+}
+
+func claimTasksForHost(host string, limit int, leaseSec int) ([]pullTaskResponseItem, error) {
+	limit, leaseSec = normalizeClaimArgs(limit, leaseSec)
+
+	tasks := clusterserver.GlobalDispatchTaskQueue().Claim(host, limit, time.Duration(leaseSec)*time.Second)
+	if len(tasks) == 0 {
+		seeded, seedErr := enqueuePendingTasksForHost(host, limit)
+		if seedErr != nil {
+			log.Printf("[CLUSTER] 任务队列补入队失败 host=%s err=%v", host, seedErr)
+		} else if seeded > 0 {
+			log.Printf("[CLUSTER] 任务队列为空，按 host 补入队 host=%s seeded=%d", host, seeded)
+			tasks = clusterserver.GlobalDispatchTaskQueue().Claim(host, limit, time.Duration(leaseSec)*time.Second)
+		}
+	}
+
+	resp := make([]pullTaskResponseItem, 0, len(tasks))
+	for _, task := range tasks {
+		resp = append(resp, pullTaskResponseItem{
+			TaskID:   task.ID,
+			PlayerID: task.PlayerID,
+			Reports:  append([]string(nil), task.Reports...),
+			Host:     task.Host,
+		})
+	}
+
+	return resp, nil
+}
+
+// 注册报告接口，供客户端调用，注册客户端的本地已有 reportCode 列表，并返回当前映射状态
 func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
@@ -82,102 +235,62 @@ func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	host := cluster.NormalizeHost(req.Host)
-	if host == "" {
-		host = cluster.NormalizeHost(r.RemoteAddr)
-	}
-	if host == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
+	rawReports := strings.TrimSpace(string(req.Reports))
+	if rawReports == "" || rawReports == "null" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("reports is required"))
 		return
 	}
 
-	added, total := clusterserver.GlobalReportHostRegistry().RegisterHostReports(host, req.Reports)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":       "ok",
-		"host":         host,
-		"received":     len(req.Reports),
-		"addedOrMoved": added,
-		"totalReports": total,
-		"time":         time.Now().Format(time.RFC3339),
-	})
-}
-
-// 列出所有 reportCode -> host 映射的接口，供客户端调用，获取当前集群中所有报告的分布状态
-func (s *Service) listReportsHostMapHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":       "ok",
-		"reports":      clusterserver.GlobalReportHostRegistry().Snapshot(),
-		"hostLoad":     clusterserver.GlobalReportHostRegistry().SnapshotLoads(),
-		"hostSeenAt":   clusterserver.GlobalReportHostRegistry().SnapshotSeenAt(),
-		"reportsCount": len(clusterserver.GlobalReportHostRegistry().Snapshot()),
-		"time":         time.Now().Format(time.RFC3339),
-	})
-}
-
-// 列出所有 playerId -> user/server 映射的接口，供客户端调用，获取当前集群中的玩家路由映射状态
-func (s *Service) listUsersMapHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
-		return
-	}
-
-	users := clusterserver.GlobalReportHostRegistry().SnapshotUsers()
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":     "ok",
-		"users":      users,
-		"usersCount": len(users),
-		"time":       time.Now().Format(time.RFC3339),
-	})
-}
-
-// 领取一个玩家映射接口，供客户端调用，领取成功后会立即从服务端删除该记录以避免重复领取
-func (s *Service) claimUserHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req claimUserRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %v", err))
-		return
-	}
-
-	host := cluster.NormalizeHost(req.Host)
-	if host == "" {
-		host = cluster.NormalizeHost(r.RemoteAddr)
-	}
-	if host == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
-		return
-	}
-
-	playerID, info, claimed := clusterserver.GlobalReportHostRegistry().ClaimUser(host)
-	log.Printf("领取玩家信息成功 host=%s playerId=%d user=%s server=%s", host, playerID, info.Name, info.Server)
-	if !claimed {
+	var legacyReports []string
+	if err := json.Unmarshal(req.Reports, &legacyReports); err == nil {
+		added, total := clusterserver.GlobalReportHostRegistry().RegisterHostReports(host, legacyReports)
+		log.Printf("[CLUSTER] 注册报告(旧格式) host=%s reports=%d addedOrMoved=%d 当前总报告数=%d", host, len(legacyReports), added, total)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"status":  "ok",
-			"host":    host,
-			"claimed": false,
-			"time":    time.Now().Format(time.RFC3339),
+			"status":       "ok",
+			"host":         host,
+			"received":     len(legacyReports),
+			"addedOrMoved": added,
+			"totalReports": total,
+			"time":         time.Now().Format(time.RFC3339),
 		})
 		return
 	}
 
+	var entries []registerReportEntry
+	if err := json.Unmarshal(req.Reports, &entries); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid reports payload: %v", err))
+		return
+	}
+
+	reportCode := cluster.NormalizeReportCode(req.Report)
+	if reportCode == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("report is required"))
+		return
+	}
+
+	effectiveHost := host
+	events := 0
+	for _, entry := range entries {
+		if effectiveHost == "" {
+			if h := cluster.NormalizeHost(entry.Host); h != "" {
+				effectiveHost = h
+			}
+		}
+		if entry.Events > events {
+			events = entry.Events
+		}
+	}
+
+	added, total := clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, effectiveHost, events)
+	log.Printf("[CLUSTER] 注册报告(新格式) host=%s report=%s entries=%d events=%d addedOrMoved=%d 当前总报告数=%d", effectiveHost, reportCode, len(entries), events, added, total)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":  "ok",
-		"host":    host,
-		"claimed": true,
-		"user": map[string]interface{}{
-			"playerId": playerID,
-			"username": info.Name,
-			"server":   info.Server,
-		},
-		"time": time.Now().Format(time.RFC3339),
+		"status":       "ok",
+		"host":         effectiveHost,
+		"report":       reportCode,
+		"received":     1,
+		"addedOrMoved": added,
+		"totalReports": total,
+		"time":         time.Now().Format(time.RFC3339),
 	})
 }
 
@@ -244,117 +357,203 @@ func (s *Service) scanLocalReportsHandler(w http.ResponseWriter, r *http.Request
 	})
 }
 
-// 领取任务接口，供客户端调用，领取一批待处理的报告解析任务，并返回任务详情
-func (s *Service) claimTasksHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req claimTasksRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %v", err))
-		return
-	}
-
-	host := cluster.NormalizeHost(req.Host)
-	if host == "" {
-		host = cluster.NormalizeHost(r.RemoteAddr)
-	}
-	if host == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
-		return
-	}
-
-	limit := req.Limit
-	if limit <= 0 {
-		limit = 1
-	}
-	if limit > 16 {
-		limit = 16
-	}
-
-	leaseSec := req.LeaseSec
-	if leaseSec <= 0 {
-		leaseSec = 900
-	}
-	if leaseSec > 3600 {
-		leaseSec = 3600
-	}
-
-	tasks := clusterserver.GlobalDispatchTaskQueue().Claim(host, limit, time.Duration(leaseSec)*time.Second)
-	resp := make([]pullTaskResponseItem, 0, len(tasks))
-	for _, task := range tasks {
-		resp = append(resp, pullTaskResponseItem{
-			TaskID:   task.ID,
-			PlayerID: task.PlayerID,
-			Reports:  append([]string(nil), task.Reports...),
-			Host:     task.Host,
-		})
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status": "ok",
-		"host":   host,
-		"tasks":  resp,
-		"time":   time.Now().Format(time.RFC3339),
-	})
-}
-
-// 确认任务接口，供客户端调用，确认一个已领取的任务的完成状态，并更新任务队列
-func (s *Service) ackTaskHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req ackTaskRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid json body: %v", err))
-		return
-	}
-
-	host := cluster.NormalizeHost(req.Host)
-	if host == "" {
-		host = cluster.NormalizeHost(r.RemoteAddr)
-	}
-	if host == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
-		return
-	}
-	if strings.TrimSpace(req.TaskID) == "" {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("taskId is required"))
-		return
-	}
-
-	updated := clusterserver.GlobalDispatchTaskQueue().Ack(req.TaskID, host, req.Success, req.Error)
-	if !updated {
-		writeError(w, http.StatusNotFound, fmt.Errorf("task not found or not claimable"))
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":  "ok",
-		"taskId":  req.TaskID,
-		"success": req.Success,
-		"time":    time.Now().Format(time.RFC3339),
-	})
-}
-
-// 列出所有任务的接口，供客户端调用，获取当前任务队列的快照状态，主要用于调试和监控
-func (s *Service) listTasksHandler(w http.ResponseWriter, r *http.Request) {
+// 任务 WS 长连接接口，客户端按 host 订阅任务可领取通知。
+func (s *Service) taskWSHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
 		return
 	}
 
-	tasks := clusterserver.GlobalDispatchTaskQueue().Snapshot()
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status": "ok",
-		"tasks":  tasks,
-		"count":  len(tasks),
-		"time":   time.Now().Format(time.RFC3339),
+	host := cluster.NormalizeHost(r.URL.Query().Get("host"))
+	if host == "" {
+		host = cluster.NormalizeHost(r.Header.Get("X-Cluster-Host"))
+	}
+	if host == "" {
+		host = cluster.NormalizeHost(r.RemoteAddr)
+	}
+	if host == "" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("host is required"))
+		return
+	}
+
+	conn, err := taskWSUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[CLUSTER] 任务WS升级失败 host=%s err=%v", host, err)
+		return
+	}
+	defer conn.Close()
+
+	msgCh, unsubscribe := clusterserver.GlobalTaskNotifyHub().Subscribe(host)
+	defer unsubscribe()
+
+	log.Printf("[CLUSTER] 任务WS已连接 host=%s subscribers=%d", host, clusterserver.GlobalTaskNotifyHub().SubscriberCount(host))
+
+	conn.SetReadLimit(1024)
+	conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 	})
+
+	var writeMu sync.Mutex
+	writeJSON := func(v interface{}) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		return conn.WriteJSON(v)
+	}
+	writePing := func() error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		return conn.WriteMessage(websocket.PingMessage, []byte("ping"))
+	}
+
+	handleWSRequest := func(req taskWSRequest) taskWSResponse {
+		action := strings.TrimSpace(strings.ToLower(req.Action))
+		resp := taskWSResponse{
+			Type:      "response",
+			RequestID: strings.TrimSpace(req.RequestID),
+			Action:    action,
+			Status:    "ok",
+		}
+
+		switch action {
+		case "get_reports":
+			resp.Payload = map[string]interface{}{
+				"reports": clusterserver.GlobalReportHostRegistry().Snapshot(),
+			}
+			return resp
+		case "claim_tasks":
+			var payload taskWSClaimPayload
+			if len(req.Payload) > 0 && string(req.Payload) != "null" {
+				if err := json.Unmarshal(req.Payload, &payload); err != nil {
+					resp.Status = "err"
+					resp.Error = fmt.Sprintf("invalid claim payload: %v", err)
+					return resp
+				}
+			}
+
+			tasks, err := claimTasksForHost(host, payload.Limit, payload.LeaseSec)
+			if err != nil {
+				resp.Status = "err"
+				resp.Error = err.Error()
+				return resp
+			}
+			resp.Payload = map[string]interface{}{
+				"host":  host,
+				"tasks": tasks,
+			}
+			return resp
+		case "ack_task":
+			var payload taskWSAckPayload
+			if len(req.Payload) > 0 && string(req.Payload) != "null" {
+				if err := json.Unmarshal(req.Payload, &payload); err != nil {
+					resp.Status = "err"
+					resp.Error = fmt.Sprintf("invalid ack payload: %v", err)
+					return resp
+				}
+			}
+			payload.TaskID = strings.TrimSpace(payload.TaskID)
+			if payload.TaskID == "" {
+				resp.Status = "err"
+				resp.Error = "taskId is required"
+				return resp
+			}
+
+			updated := clusterserver.GlobalDispatchTaskQueue().Ack(payload.TaskID, host, payload.Success, payload.Error)
+			if !updated {
+				resp.Status = "err"
+				resp.Error = "task not found or not claimable"
+				return resp
+			}
+
+			resp.Payload = map[string]interface{}{
+				"taskId":  payload.TaskID,
+				"success": payload.Success,
+			}
+			return resp
+		case "get_users_count":
+			users := clusterserver.GlobalReportHostRegistry().SnapshotUsers()
+			resp.Payload = map[string]interface{}{
+				"usersCount": len(users),
+			}
+			return resp
+		case "claim_user":
+			playerID, info, claimed := clusterserver.GlobalReportHostRegistry().ClaimUser(host)
+			if claimed {
+				info.PlayerID = playerID
+			}
+			resp.Payload = map[string]interface{}{
+				"host":    host,
+				"claimed": claimed,
+				"user":    info,
+			}
+			return resp
+		default:
+			resp.Status = "err"
+			resp.Error = fmt.Sprintf("unsupported action: %s", action)
+			return resp
+		}
+	}
+
+	connected := clusterserver.TaskNotifyMessage{
+		Type: "connected",
+		Host: host,
+		Time: time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := writeJSON(connected); err != nil {
+		log.Printf("[CLUSTER] 任务WS初始化消息发送失败 host=%s err=%v", host, err)
+		return
+	}
+
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			_ = conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+
+			var req taskWSRequest
+			if err := json.Unmarshal(raw, &req); err != nil {
+				continue
+			}
+			if strings.TrimSpace(strings.ToLower(req.Type)) != "request" {
+				continue
+			}
+
+			resp := handleWSRequest(req)
+			if err := writeJSON(resp); err != nil {
+				return
+			}
+		}
+	}()
+
+	pingTicker := time.NewTicker(25 * time.Second)
+	defer pingTicker.Stop()
+
+	for {
+		select {
+		case msg, ok := <-msgCh:
+			if !ok {
+				return
+			}
+			if err := writeJSON(msg); err != nil {
+				log.Printf("[CLUSTER] 任务WS消息发送失败 host=%s err=%v", host, err)
+				return
+			}
+		case <-pingTicker.C:
+			if err := writePing(); err != nil {
+				log.Printf("[CLUSTER] 任务WS心跳失败 host=%s err=%v", host, err)
+				return
+			}
+		case <-readDone:
+			log.Printf("[CLUSTER] 任务WS已断开 host=%s subscribers=%d", host, clusterserver.GlobalTaskNotifyHub().SubscriberCount(host))
+			return
+		}
+	}
 }
 
 func TimeTrack(start time.Time, name string) {
@@ -362,16 +561,46 @@ func TimeTrack(start time.Time, name string) {
 	log.Printf("%s 花费： %s", name, elapsed)
 }
 
+func parseRaderInput(r *http.Request) (url.Values, error) {
+	values := make(url.Values)
+	contentType := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+
+	if strings.Contains(contentType, "application/json") {
+		var payload raderRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			if err == io.EOF {
+				return nil, fmt.Errorf("未提供请求体")
+			}
+			return nil, fmt.Errorf("invalid json body: %v", err)
+		}
+		values.Set("username", strings.TrimSpace(payload.Username))
+		values.Set("server", strings.TrimSpace(payload.Server))
+		return values, nil
+	}
+
+	if err := r.ParseForm(); err != nil {
+		return nil, fmt.Errorf("invalid form body: %v", err)
+	}
+	values.Set("username", strings.TrimSpace(r.Form.Get("username")))
+	values.Set("server", strings.TrimSpace(r.Form.Get("server")))
+	return values, nil
+}
+
 // 雷达接口 先查表内pichash，如果没有则将玩家信息注册到表内，并返回查询结果
 func (s *Service) raderHandler(w http.ResponseWriter, r *http.Request) {
 	defer TimeTrack(time.Now(), "dashboard")
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed. Only POST is supported.", http.StatusMethodNotAllowed)
 		return
 	}
 
-	query := r.URL.Query()
-	params, err := checkParams(query)
+	input, err := parseRaderInput(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	params, err := checkParams(input)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -391,7 +620,7 @@ func (s *Service) raderHandler(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"status":   "ok",
 				"path":     r.URL.Path,
-				"query":    query,
+				"query":    input,
 				"playerId": player.PlayerID,
 				"查询添加":     storedUser,
 				"picHash":  pichash,
@@ -408,7 +637,7 @@ func (s *Service) raderHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":   "ok",
 		"path":     r.URL.Path,
-		"query":    query,
+		"query":    input,
 		"playerId": player.PlayerID,
 		"picHash":  pichash,
 		"time":     time.Now().Format(time.RFC3339),
@@ -487,20 +716,18 @@ func (s *Service) Handler() http.Handler {
 	// mux.HandleFunc("/api/monitor/params", s.paramsHandler)
 	// 查询username+server，返回图片hash
 	// 如果没有图片hash就加入待查询用户列表，等待客户端拉取进行V2查询
-	// 如果没有用户记录就创建用户记录并加入待查询用户列表，等待客户端拉取进行V2查询
+	// 如果没有用户记录就创建用户记录并加入待查询用户列表，等待客户端拉取进行V2查询,第一阶段
 	mux.HandleFunc("/api/ff14/rader", s.raderHandler)
-	mux.HandleFunc("/api/cluster/users/claim", s.claimUserHandler)
+
+	//reports 相关接口
+	mux.HandleFunc("/api/cluster/reports/register", s.registerReportsHandler)
+	mux.HandleFunc("/api/cluster/tasks/ws", s.taskWSHandler)
 
 	// 集群相关接口
-	mux.HandleFunc("/api/cluster/reports/register", s.registerReportsHandler)
 	mux.HandleFunc("/api/cluster/reports/heartbeat", s.heartbeatReportsHandler)
-	mux.HandleFunc("/api/cluster/get/reports", s.listReportsHostMapHandler)
-	mux.HandleFunc("/api/cluster/get/users", s.listUsersMapHandler)
-	mux.HandleFunc("/api/cluster/reports/scan-local", s.scanLocalReportsHandler)
-	// 任务相关接口
-	mux.HandleFunc("/api/cluster/tasks/claim", s.claimTasksHandler)
-	mux.HandleFunc("/api/cluster/tasks/ack", s.ackTaskHandler)
-	mux.HandleFunc("/api/cluster/tasks", s.listTasksHandler)
+	mux.HandleFunc("/api/cluster/reports/scan-local", s.scanLocalReportsHandler) //好像没啥用
+
+	// 任务传输仅保留 WS：/api/cluster/tasks/ws
 
 	c := cors.New(cors.Options{
 		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},

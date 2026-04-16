@@ -1,20 +1,21 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/user/ff14rader/internal/api"
+	"github.com/gorilla/websocket"
 	cluster "github.com/user/ff14rader/internal/cluster"
+	clusterserver "github.com/user/ff14rader/internal/cluster/server"
 	"github.com/user/ff14rader/internal/models"
 )
 
@@ -23,26 +24,12 @@ const (
 	defaultPullBatchSize   = 2
 	defaultPullLease       = 20 * time.Minute
 	defaultPullExecTimeout = 25 * time.Minute
+	defaultTaskWSReconnect = 3 * time.Second
 )
 
-var fflogsclient = *api.NewFFLogsClient()
-var syncManager = *api.NewSyncManager(&fflogsclient)
-
-type assignedReportsExecutor interface {
+type taskPullExecutor interface {
 	ExecuteAssignedReports(ctx context.Context, playerID int, reports []string) error
-}
-
-type pullTaskClaimRequest struct {
-	Host     string `json:"host"`
-	Limit    int    `json:"limit"`
-	LeaseSec int    `json:"leaseSec"`
-}
-
-type pullTaskAckRequest struct {
-	Host    string `json:"host"`
-	TaskID  string `json:"taskId"`
-	Success bool   `json:"success"`
-	Error   string `json:"error"`
+	StartIncrementalSync(ctx context.Context, player models.PlayerLite, region string) error
 }
 
 type pullTaskItem struct {
@@ -51,14 +38,66 @@ type pullTaskItem struct {
 	Reports  []string `json:"reports"`
 }
 
-type pullPlayerLiteItem struct {
-	Status string            `json:"status"`
-	User   models.PlayerLite `json:"user"`
+type pullClaimUser struct {
+	PlayerID  int    `json:"playerId"`
+	NewPlayer bool   `json:"newPlayer"`
+	Name      string `json:"name"`
+	Username  string `json:"username"`
+	Server    string `json:"server"`
+	Region    string `json:"region"`
 }
 
-type pullTaskClaimResponse struct {
-	Status string         `json:"status"`
-	Tasks  []pullTaskItem `json:"tasks"`
+type pullReportHostEntry struct {
+	Events int    `json:"events"`
+	Host   string `json:"host"`
+}
+
+type pullTaskWSMessage struct {
+	Type   string `json:"type"`
+	Host   string `json:"host,omitempty"`
+	Queued int    `json:"queued,omitempty"`
+	Time   string `json:"time,omitempty"`
+}
+
+type pullTaskWSRequest struct {
+	Type      string          `json:"type"`
+	RequestID string          `json:"requestId,omitempty"`
+	Action    string          `json:"action,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+type pullTaskWSResponse struct {
+	Type      string          `json:"type"`
+	RequestID string          `json:"requestId,omitempty"`
+	Action    string          `json:"action,omitempty"`
+	Status    string          `json:"status"`
+	Error     string          `json:"error,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+}
+
+type taskWSClaimPayload struct {
+	Limit    int `json:"limit"`
+	LeaseSec int `json:"leaseSec"`
+}
+
+type taskWSAckPayload struct {
+	TaskID  string `json:"taskId"`
+	Success bool   `json:"success"`
+	Error   string `json:"error"`
+}
+
+type taskWSClient struct {
+	wsURL     string
+	host      string
+	reconnect time.Duration
+	trigger   chan<- string
+
+	mu      sync.Mutex
+	conn    *websocket.Conn
+	pending map[string]chan pullTaskWSResponse
+	nextID  uint64
+
+	writeMu sync.Mutex
 }
 
 func envIntWithDefault(key string, fallback int) int {
@@ -120,122 +159,442 @@ func clusterPullExecTimeout() time.Duration {
 	return time.Duration(envIntWithDefault("CLUSTER_PULL_EXEC_TIMEOUT_SEC", int(defaultPullExecTimeout.Seconds()))) * time.Second
 }
 
-// claimTasksFromMaster 从主节点/api/cluster/tasks/claim请求任务reportCode。
-func claimTasksFromMaster(client *http.Client, master, host string, limit int, lease time.Duration) ([]pullTaskItem, error) {
-	payload := pullTaskClaimRequest{Host: host, Limit: limit, LeaseSec: int(lease.Seconds())}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return nil, err
+func clusterTaskWSEnabled() bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv("CLUSTER_TASK_WS_ENABLED")))
+	if raw == "" {
+		return true
 	}
-
-	urlText := strings.TrimRight(master, "/") + "/api/cluster/tasks/claim"
-	req, err := http.NewRequest(http.MethodPost, urlText, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("claim status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-
-	if len(raw) == 0 {
-		return nil, nil
-	}
-
-	var parsed pullTaskClaimResponse
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(strings.ToLower(parsed.Status)) != "ok" {
-		return nil, fmt.Errorf("claim non-ok status: %s", parsed.Status)
-	}
-	return parsed.Tasks, nil
 }
 
-// 通过/api/cluster/users/claim 获得username+server进行V2查询
-func claimPlayerLiteTasksFromMaster(client *http.Client, master, host string, limit int, lease time.Duration) (models.PlayerLite, error) {
-	payload := pullTaskClaimRequest{Host: host, Limit: limit, LeaseSec: int(lease.Seconds())}
-	body, err := json.Marshal(payload)
+func clusterTaskWSReconnect() time.Duration {
+	seconds := envIntWithDefault("CLUSTER_TASK_WS_RECONNECT_SEC", int(defaultTaskWSReconnect.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func clusterTaskWSURL(master, host string) (string, error) {
+	master = strings.TrimSpace(master)
+	if master == "" {
+		return "", fmt.Errorf("empty master endpoint")
+	}
+
+	parsed, err := url.Parse(master)
+	if err != nil {
+		return "", err
+	}
+
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	switch scheme {
+	case "https":
+		parsed.Scheme = "wss"
+	default:
+		parsed.Scheme = "ws"
+	}
+	parsed.Path = "/api/cluster/tasks/ws"
+	query := parsed.Query()
+	query.Set("host", cluster.NormalizeHost(host))
+	parsed.RawQuery = query.Encode()
+	parsed.Fragment = ""
+
+	return parsed.String(), nil
+}
+
+func newTaskWSClient(master, host string, trigger chan<- string) (*taskWSClient, error) {
+	wsURL, err := clusterTaskWSURL(master, host)
+	if err != nil {
+		return nil, err
+	}
+
+	return &taskWSClient{
+		wsURL:     wsURL,
+		host:      cluster.NormalizeHost(host),
+		reconnect: clusterTaskWSReconnect(),
+		trigger:   trigger,
+		pending:   make(map[string]chan pullTaskWSResponse),
+	}, nil
+}
+
+func (c *taskWSClient) sendTrigger(reason string) {
+	if c == nil || c.trigger == nil {
+		return
+	}
+	select {
+	case c.trigger <- reason:
+	default:
+	}
+}
+
+func (c *taskWSClient) ensureConnected() error {
+	if c == nil {
+		return fmt.Errorf("ws client is nil")
+	}
+
+	c.mu.Lock()
+	if c.conn != nil {
+		c.mu.Unlock()
+		return nil
+	}
+	c.mu.Unlock()
+
+	conn, resp, err := websocket.DefaultDialer.Dial(c.wsURL, nil)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if err != nil {
+		return err
+	}
+
+	conn.SetReadLimit(64 * 1024)
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	conn.SetPingHandler(func(appData string) error {
+		if err := conn.SetReadDeadline(time.Now().Add(120 * time.Second)); err != nil {
+			return err
+		}
+		return conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
+	})
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	})
+
+	c.mu.Lock()
+	if c.conn != nil {
+		c.mu.Unlock()
+		_ = conn.Close()
+		return nil
+	}
+	c.conn = conn
+	c.mu.Unlock()
+
+	log.Printf("[CLUSTER] 任务WS已连接 ws=%s", c.wsURL)
+	go c.readLoop(conn)
+	return nil
+}
+
+func (c *taskWSClient) readLoop(conn *websocket.Conn) {
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			c.setDisconnected(conn, err)
+			return
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+
+		var base struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(raw, &base); err != nil {
+			continue
+		}
+
+		switch strings.TrimSpace(strings.ToLower(base.Type)) {
+		case "response":
+			var resp pullTaskWSResponse
+			if err := json.Unmarshal(raw, &resp); err != nil {
+				continue
+			}
+			c.deliverResponse(resp)
+		case "task_available":
+			c.sendTrigger("ws_task_available")
+		case "connected":
+			var msg pullTaskWSMessage
+			if err := json.Unmarshal(raw, &msg); err == nil {
+				log.Printf("[CLUSTER] 任务WS握手成功 host=%s", msg.Host)
+			}
+		}
+	}
+}
+
+func (c *taskWSClient) deliverResponse(resp pullTaskWSResponse) {
+	requestID := strings.TrimSpace(resp.RequestID)
+	if requestID == "" {
+		return
+	}
+
+	c.mu.Lock()
+	ch, ok := c.pending[requestID]
+	if ok {
+		delete(c.pending, requestID)
+	}
+	c.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	select {
+	case ch <- resp:
+	default:
+	}
+}
+
+func (c *taskWSClient) removePending(requestID string) {
+	id := strings.TrimSpace(requestID)
+	if id == "" {
+		return
+	}
+
+	c.mu.Lock()
+	delete(c.pending, id)
+	c.mu.Unlock()
+}
+
+func (c *taskWSClient) setDisconnected(conn *websocket.Conn, err error) {
+	c.mu.Lock()
+	if c.conn != conn {
+		c.mu.Unlock()
+		return
+	}
+	c.conn = nil
+	pending := c.pending
+	c.pending = make(map[string]chan pullTaskWSResponse)
+	c.mu.Unlock()
+
+	for _, ch := range pending {
+		close(ch)
+	}
+	_ = conn.Close()
+	log.Printf("[CLUSTER] 任务WS断开，等待重连 ws=%s err=%v", c.wsURL, err)
+}
+
+func (c *taskWSClient) request(action string, payload interface{}, timeout time.Duration) (json.RawMessage, error) {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	if err := c.ensureConnected(); err != nil {
+		return nil, err
+	}
+
+	payloadRaw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	reqID := fmt.Sprintf("r-%d", atomic.AddUint64(&c.nextID, 1))
+	respCh := make(chan pullTaskWSResponse, 1)
+
+	c.mu.Lock()
+	conn := c.conn
+	c.pending[reqID] = respCh
+	c.mu.Unlock()
+
+	if conn == nil {
+		c.removePending(reqID)
+		return nil, fmt.Errorf("ws not connected")
+	}
+
+	req := pullTaskWSRequest{
+		Type:      "request",
+		RequestID: reqID,
+		Action:    strings.TrimSpace(strings.ToLower(action)),
+		Payload:   payloadRaw,
+	}
+
+	c.writeMu.Lock()
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err = conn.WriteJSON(req)
+	c.writeMu.Unlock()
+	if err != nil {
+		c.removePending(reqID)
+		c.setDisconnected(conn, err)
+		return nil, err
+	}
+
+	select {
+	case resp, ok := <-respCh:
+		if !ok {
+			return nil, fmt.Errorf("ws disconnected")
+		}
+		if strings.TrimSpace(strings.ToLower(resp.Status)) != "ok" {
+			msg := strings.TrimSpace(resp.Error)
+			if msg == "" {
+				msg = "ws response status is not ok"
+			}
+			return nil, fmt.Errorf("%s", msg)
+		}
+		return resp.Payload, nil
+	case <-time.After(timeout):
+		c.removePending(reqID)
+		return nil, fmt.Errorf("ws request timeout action=%s", action)
+	}
+}
+
+func (c *taskWSClient) close() {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	pending := c.pending
+	c.pending = make(map[string]chan pullTaskWSResponse)
+	c.mu.Unlock()
+
+	for _, ch := range pending {
+		close(ch)
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func syncReportHostRegistryFromMasterWS(ws *taskWSClient) error {
+	if ws == nil {
+		return fmt.Errorf("ws client is nil")
+	}
+
+	raw, err := ws.request("get_reports", nil, 10*time.Second)
+	if err != nil {
+		return err
+	}
+
+	var payload struct {
+		Reports map[string]pullReportHostEntry `json:"reports"`
+	}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return err
+		}
+	}
+
+	for code, entry := range payload.Reports {
+		_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(code, entry.Host, entry.Events)
+	}
+
+	return nil
+}
+
+func claimTasksFromMasterWS(ws *taskWSClient, limit int, lease time.Duration) ([]pullTaskItem, error) {
+	if ws == nil {
+		return nil, fmt.Errorf("ws client is nil")
+	}
+
+	raw, err := ws.request("claim_tasks", taskWSClaimPayload{Limit: limit, LeaseSec: int(lease.Seconds())}, 12*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	var payload struct {
+		Host  string         `json:"host"`
+		Tasks []pullTaskItem `json:"tasks"`
+	}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return nil, err
+		}
+	}
+
+	log.Printf("[CLUSTER] claim 成功(ws) host=%s tasks=%d", payload.Host, len(payload.Tasks))
+	return payload.Tasks, nil
+}
+
+func ackTaskToMasterWS(ws *taskWSClient, taskID string, success bool, errText string) {
+	if ws == nil {
+		return
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return
+	}
+
+	_, err := ws.request("ack_task", taskWSAckPayload{
+		TaskID:  strings.TrimSpace(taskID),
+		Success: success,
+		Error:   strings.TrimSpace(errText),
+	}, 8*time.Second)
+	if err != nil {
+		log.Printf("[CLUSTER] task ack(ws) failed task=%s err=%v", taskID, err)
+	}
+}
+
+func claimPlayerLiteTasksFromMasterWS(ws *taskWSClient, limit int, lease time.Duration) (models.PlayerLite, error) {
+	if ws == nil {
+		return models.PlayerLite{}, fmt.Errorf("ws client is nil")
+	}
+
+	raw, err := ws.request("get_users_count", nil, 8*time.Second)
 	if err != nil {
 		return models.PlayerLite{}, err
 	}
 
-	urlText := strings.TrimRight(master, "/") + "/api/cluster/users/claim"
-	req, err := http.NewRequest(http.MethodPost, urlText, bytes.NewReader(body))
-	if err != nil {
-		return models.PlayerLite{}, err
+	var usersPayload struct {
+		UsersCount int `json:"usersCount"`
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return models.PlayerLite{}, err
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &usersPayload); err != nil {
+			return models.PlayerLite{}, err
+		}
 	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return models.PlayerLite{}, fmt.Errorf("claim status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-
-	if len(raw) == 0 {
+	if usersPayload.UsersCount <= 0 {
 		return models.PlayerLite{}, nil
 	}
 
-	var parsed pullPlayerLiteItem
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	raw, err = ws.request("claim_user", nil, 10*time.Second)
+	if err != nil {
 		return models.PlayerLite{}, err
 	}
-	if strings.TrimSpace(strings.ToLower(parsed.Status)) != "ok" {
-		return models.PlayerLite{}, fmt.Errorf("claim non-ok status: %s", parsed.Status)
-	}
-	return parsed.User, nil
-}
 
-func ackTaskToMaster(client *http.Client, master, host, taskID string, success bool, errText string) {
-	payload := pullTaskAckRequest{Host: host, TaskID: taskID, Success: success, Error: strings.TrimSpace(errText)}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("[CLUSTER] task ack marshal failed task=%s err=%v", taskID, err)
-		return
+	var payload struct {
+		Host    string        `json:"host"`
+		Claimed bool          `json:"claimed"`
+		User    pullClaimUser `json:"user"`
+	}
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return models.PlayerLite{}, err
+		}
+	}
+	if !payload.Claimed {
+		return models.PlayerLite{}, nil
 	}
 
-	urlText := strings.TrimRight(master, "/") + "/api/cluster/tasks/ack"
-	req, err := http.NewRequest(http.MethodPost, urlText, bytes.NewReader(body))
-	if err != nil {
-		log.Printf("[CLUSTER] task ack request failed task=%s err=%v", taskID, err)
-		return
+	name := strings.TrimSpace(payload.User.Name)
+	if name == "" {
+		name = strings.TrimSpace(payload.User.Username)
 	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[CLUSTER] task ack failed task=%s err=%v", taskID, err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
-		log.Printf("[CLUSTER] task ack non-2xx task=%s status=%d body=%s", taskID, resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
+	return models.PlayerLite{
+		PlayerID:  payload.User.PlayerID,
+		NewPlayer: payload.User.NewPlayer,
+		Name:      name,
+		Server:    strings.TrimSpace(payload.User.Server),
+		Region:    strings.TrimSpace(payload.User.Region),
+	}, nil
 }
 
 // StartClusterTaskPullLoop 启动集群任务拉取循环。
-func StartClusterTaskPullLoop(executor assignedReportsExecutor) {
-	if executor == nil || !clusterPullEnabled() || clusterTaskMode() != "pull" {
+func StartClusterTaskPullLoop(executor taskPullExecutor) {
+	if executor == nil {
+		log.Printf("[CLUSTER] 任务拉取未启动: executor 为空")
 		return
 	}
-
+	if !clusterPullEnabled() {
+		log.Printf("[CLUSTER] 任务拉取未启动: CLUSTER_PULL_ENABLED=false")
+		return
+	}
+	if !clusterTaskWSEnabled() {
+		log.Printf("[CLUSTER] 任务拉取未启动: 已禁用HTTP回退，需启用 CLUSTER_TASK_WS_ENABLED")
+		return
+	}
+	mode := clusterTaskMode()
+	if mode != "pull" {
+		log.Printf("[CLUSTER] 任务拉取未启动: CLUSTER_TASK_MODE=%s", mode)
+		return
+	}
 	master := ClusterMasterEndpoint()
 	if master == "" {
+		log.Printf("[CLUSTER] 任务拉取未启动: 未配置主节点地址")
 		return
 	}
 
@@ -248,23 +607,45 @@ func StartClusterTaskPullLoop(executor assignedReportsExecutor) {
 	lease := clusterPullLease()
 	execTimeout := clusterPullExecTimeout()
 
-	go func() {
-		claimClient := &http.Client{Timeout: 10 * time.Second}
-		ackClient := &http.Client{Timeout: 10 * time.Second}
+	claimTrigger := make(chan string, 1)
 
-		runOnce := func() {
-			tasks, err := claimTasksFromMaster(claimClient, master, host, batch, lease)
-			if err != nil {
-				log.Printf("[CLUSTER] 拉取任务失败 master=%s host=%s err=%v", master, host, err)
-				return
-			}
-			if len(tasks) == 0 {
-				return
-			}
+	wsClient, err := newTaskWSClient(master, host, claimTrigger)
+	if err != nil {
+		log.Printf("[CLUSTER] 创建任务WS客户端失败 master=%s host=%s err=%v", master, host, err)
+		return
+	}
+	defer wsClient.close()
 
+	if err := wsClient.ensureConnected(); err != nil {
+		log.Printf("[CLUSTER] 初始连接任务WS失败 master=%s host=%s err=%v", master, host, err)
+	}
+
+	log.Printf("[CLUSTER] 任务拉取循环启动 master=%s host=%s interval=%s batch=%d lease=%s execTimeout=%s", master, host, interval, batch, lease, execTimeout)
+	runOnce := func(trigger string) {
+		if strings.TrimSpace(trigger) == "" {
+			trigger = "ticker"
+		}
+		log.Printf("[CLUSTER] 开始拉取任务 master=%s host=%s trigger=%s", master, host, trigger)
+
+		if err := syncReportHostRegistryFromMasterWS(wsClient); err != nil {
+			log.Printf("[CLUSTER] 同步报告映射失败(ws) master=%s host=%s err=%v", master, host, err)
+		}
+
+		tasks, err := claimTasksFromMasterWS(wsClient, batch, lease)
+		if err != nil {
+			log.Printf("[CLUSTER] 拉取任务失败(ws) master=%s host=%s err=%v", master, host, err)
+		}
+		if err != nil {
+			log.Printf("[CLUSTER] 拉取任务失败 master=%s host=%s err=%v", master, host, err)
+			return
+		}
+		if len(tasks) == 0 {
+			log.Printf("[CLUSTER] 本轮未领取到 reportCode 任务 host=%s", host)
+		}
+		if len(tasks) > 0 {
 			for _, task := range tasks {
 				if task.PlayerID == 0 || len(task.Reports) == 0 || strings.TrimSpace(task.TaskID) == "" {
-					ackTaskToMaster(ackClient, master, host, task.TaskID, false, "invalid task payload")
+					ackTaskToMasterWS(wsClient, task.TaskID, false, "invalid task payload")
 					continue
 				}
 
@@ -275,32 +656,47 @@ func StartClusterTaskPullLoop(executor assignedReportsExecutor) {
 
 				if err != nil {
 					log.Printf("[CLUSTER] 任务执行失败 host=%s task=%s err=%v", host, task.TaskID, err)
-					ackTaskToMaster(ackClient, master, host, task.TaskID, false, err.Error())
+					ackTaskToMasterWS(wsClient, task.TaskID, false, err.Error())
 					continue
 				}
 				log.Printf("[CLUSTER] 任务执行完成 host=%s task=%s", host, task.TaskID)
-				ackTaskToMaster(ackClient, master, host, task.TaskID, true, "")
+				ackTaskToMasterWS(wsClient, task.TaskID, true, "")
 			}
-
-			//V2接口查询玩家阶段
-			PlayerLite, err := claimPlayerLiteTasksFromMaster(claimClient, master, host, batch, lease)
-			if err != nil {
-				log.Printf("[CLUSTER] 拉取玩家信息任务失败 master=%s host=%s err=%v", master, host, err)
-				return
-			}
-			if PlayerLite.PlayerID != 0 && strings.TrimSpace(PlayerLite.Name) != "" && strings.TrimSpace(PlayerLite.Server) != "" {
-				log.Printf("[CLUSTER] 拉取玩家信息任务成功 host=%s playerId=%d name=%s server=%s", host, PlayerLite.PlayerID, PlayerLite.Name, PlayerLite.Server)
-				ctx := context.Background()
-				syncManager.StartIncrementalSync(ctx, PlayerLite, "CN")
-			}
-
 		}
 
-		runOnce()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			runOnce()
+		//V2接口查询玩家阶段
+		playerLite, err := claimPlayerLiteTasksFromMasterWS(wsClient, batch, lease)
+		if err != nil {
+			log.Printf("[CLUSTER] 拉取玩家信息任务失败(ws) master=%s host=%s err=%v", master, host, err)
 		}
-	}()
+		if err != nil {
+			log.Printf("[CLUSTER] 拉取玩家信息任务失败 master=%s host=%s err=%v", master, host, err)
+			return
+		}
+		if playerLite.PlayerID != 0 && strings.TrimSpace(playerLite.Name) != "" && strings.TrimSpace(playerLite.Server) != "" {
+			log.Printf("[CLUSTER] 拉取玩家信息任务成功 host=%s playerId=%d name=%s server=%s", host, playerLite.PlayerID, playerLite.Name, playerLite.Server)
+			region := strings.TrimSpace(playerLite.Region)
+			if region == "" {
+				region = "CN"
+			}
+			if err := executor.StartIncrementalSync(context.Background(), playerLite, region); err != nil {
+				log.Printf("[CLUSTER] 玩家增量同步失败 host=%s playerId=%d err=%v", host, playerLite.PlayerID, err)
+			}
+		}
+
+	}
+
+	// 启动前先同步一轮
+	runOnce("startup")
+	// 启动定时拉取循环（WS 失败时仍可兜底）
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			runOnce("ticker")
+		case trigger := <-claimTrigger:
+			runOnce(trigger)
+		}
+	}
 }
