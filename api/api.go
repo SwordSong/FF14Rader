@@ -93,6 +93,8 @@ type taskWSResponse struct {
 type taskWSClaimPayload struct {
 	Limit    int `json:"limit"`
 	LeaseSec int `json:"leaseSec"`
+	Capacity int `json:"capacity,omitempty"`
+	InFlight int `json:"inFlight,omitempty"`
 }
 
 type taskWSAckPayload struct {
@@ -192,6 +194,27 @@ func normalizeClaimArgs(limit int, leaseSec int) (int, int) {
 	}
 
 	return limit, leaseSec
+}
+
+func effectiveClaimLimit(limit int, capacity int, inFlight int) int {
+	if capacity <= 0 {
+		return limit
+	}
+	if capacity > 64 {
+		capacity = 64
+	}
+	if inFlight < 0 {
+		inFlight = 0
+	}
+
+	available := capacity - inFlight
+	if available <= 0 {
+		return 0
+	}
+	if limit > available {
+		return available
+	}
+	return limit
 }
 
 func claimTasksForHost(host string, limit int, leaseSec int) ([]pullTaskResponseItem, error) {
@@ -357,6 +380,34 @@ func (s *Service) scanLocalReportsHandler(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// 集群注册表快照接口，返回 globalReportHostRegistry 的当前内容。
+func (s *Service) clusterRegistrySnapshotHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed. Only GET is supported.", http.StatusMethodNotAllowed)
+		return
+	}
+
+	registry := clusterserver.GlobalReportHostRegistry()
+	reports := registry.Snapshot()
+	users := registry.SnapshotUsers()
+	loads := registry.SnapshotLoads()
+	seenAt := registry.SnapshotSeenAt()
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":  "ok",
+		"reports": reports,
+		"users":   users,
+		"loads":   loads,
+		"seenAt":  seenAt,
+		"counts": map[string]int{
+			"reports": len(reports),
+			"users":   len(users),
+			"hosts":   len(loads),
+		},
+		"time": time.Now().Format(time.RFC3339),
+	})
+}
+
 // 任务 WS 长连接接口，客户端按 host 订阅任务可领取通知。
 func (s *Service) taskWSHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -433,15 +484,31 @@ func (s *Service) taskWSHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			tasks, err := claimTasksForHost(host, payload.Limit, payload.LeaseSec)
+			normalizedLimit, _ := normalizeClaimArgs(payload.Limit, payload.LeaseSec)
+			effectiveLimit := effectiveClaimLimit(normalizedLimit, payload.Capacity, payload.InFlight)
+			if effectiveLimit <= 0 {
+				resp.Payload = map[string]interface{}{
+					"host":           host,
+					"tasks":          []pullTaskResponseItem{},
+					"effectiveLimit": 0,
+					"capacity":       payload.Capacity,
+					"inFlight":       payload.InFlight,
+				}
+				return resp
+			}
+
+			tasks, err := claimTasksForHost(host, effectiveLimit, payload.LeaseSec)
 			if err != nil {
 				resp.Status = "err"
 				resp.Error = err.Error()
 				return resp
 			}
 			resp.Payload = map[string]interface{}{
-				"host":  host,
-				"tasks": tasks,
+				"host":           host,
+				"tasks":          tasks,
+				"effectiveLimit": effectiveLimit,
+				"capacity":       payload.Capacity,
+				"inFlight":       payload.InFlight,
 			}
 			return resp
 		case "ack_task":
@@ -460,11 +527,16 @@ func (s *Service) taskWSHandler(w http.ResponseWriter, r *http.Request) {
 				return resp
 			}
 
-			updated := clusterserver.GlobalDispatchTaskQueue().Ack(payload.TaskID, host, payload.Success, payload.Error)
+			updated, reports := clusterserver.GlobalDispatchTaskQueue().Ack(payload.TaskID, host, payload.Success, payload.Error)
 			if !updated {
 				resp.Status = "err"
 				resp.Error = "task not found or not claimable"
 				return resp
+			}
+			if payload.Success {
+				for _, reportCode := range reports {
+					_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, host, 0)
+				}
 			}
 
 			resp.Payload = map[string]interface{}{
@@ -726,6 +798,7 @@ func (s *Service) Handler() http.Handler {
 	// 集群相关接口
 	mux.HandleFunc("/api/cluster/reports/heartbeat", s.heartbeatReportsHandler)
 	mux.HandleFunc("/api/cluster/reports/scan-local", s.scanLocalReportsHandler) //好像没啥用
+	mux.HandleFunc("/api/cluster/registry/snapshot", s.clusterRegistrySnapshotHandler)
 
 	// 任务传输仅保留 WS：/api/cluster/tasks/ws
 

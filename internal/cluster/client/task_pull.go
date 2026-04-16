@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -78,6 +79,8 @@ type pullTaskWSResponse struct {
 type taskWSClaimPayload struct {
 	Limit    int `json:"limit"`
 	LeaseSec int `json:"leaseSec"`
+	Capacity int `json:"capacity,omitempty"`
+	InFlight int `json:"inFlight,omitempty"`
 }
 
 type taskWSAckPayload struct {
@@ -149,6 +152,78 @@ func clusterPullBatchSize() int {
 		return 16
 	}
 	return v
+}
+
+func clusterHostCapacity() int {
+	v := envIntWithDefault("CLUSTER_HOST_CAPACITY", 0)
+	if v <= 0 {
+		v = runtime.NumCPU()
+	}
+	if v <= 0 {
+		v = 1
+	}
+	if v > 64 {
+		v = 64
+	}
+	return v
+}
+
+func readLoadAvg1() float64 {
+	data, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return -1
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return -1
+	}
+	v, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return -1
+	}
+	if v < 0 {
+		return -1
+	}
+	return v
+}
+
+func currentHostCapacity() (int, float64, float64) {
+	base := clusterHostCapacity()
+	capacity := base
+	loadAvg1 := readLoadAvg1()
+	loadPerCore := -1.0
+
+	cpus := runtime.NumCPU()
+	if cpus <= 0 {
+		cpus = 1
+	}
+
+	if loadAvg1 >= 0 {
+		loadPerCore = loadAvg1 / float64(cpus)
+		switch {
+		case loadPerCore >= 1.5:
+			capacity = maxInt(1, base/3)
+		case loadPerCore >= 1.0:
+			capacity = maxInt(1, base/2)
+		case loadPerCore >= 0.7:
+			capacity = maxInt(1, (base*3)/4)
+		}
+	}
+
+	if capacity <= 0 {
+		capacity = 1
+	}
+	if capacity > 64 {
+		capacity = 64
+	}
+	return capacity, loadAvg1, loadPerCore
+}
+
+func maxInt(a, b int) int {
+	if a >= b {
+		return a
+	}
+	return b
 }
 
 func clusterPullLease() time.Duration {
@@ -311,6 +386,7 @@ func (c *taskWSClient) readLoop(conn *websocket.Conn) {
 			if err := json.Unmarshal(raw, &msg); err == nil {
 				log.Printf("[CLUSTER] 任务WS握手成功 host=%s", msg.Host)
 			}
+			c.sendTrigger("ws_connected")
 		}
 	}
 }
@@ -476,12 +552,12 @@ func syncReportHostRegistryFromMasterWS(ws *taskWSClient) error {
 	return nil
 }
 
-func claimTasksFromMasterWS(ws *taskWSClient, limit int, lease time.Duration) ([]pullTaskItem, error) {
+func claimTasksFromMasterWS(ws *taskWSClient, limit int, lease time.Duration, capacity int, inFlight int) ([]pullTaskItem, error) {
 	if ws == nil {
 		return nil, fmt.Errorf("ws client is nil")
 	}
 
-	raw, err := ws.request("claim_tasks", taskWSClaimPayload{Limit: limit, LeaseSec: int(lease.Seconds())}, 12*time.Second)
+	raw, err := ws.request("claim_tasks", taskWSClaimPayload{Limit: limit, LeaseSec: int(lease.Seconds()), Capacity: capacity, InFlight: inFlight}, 12*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -606,6 +682,7 @@ func StartClusterTaskPullLoop(executor taskPullExecutor) {
 	batch := clusterPullBatchSize()
 	lease := clusterPullLease()
 	execTimeout := clusterPullExecTimeout()
+	var executingTasks int32
 
 	claimTrigger := make(chan string, 1)
 
@@ -626,12 +703,36 @@ func StartClusterTaskPullLoop(executor taskPullExecutor) {
 			trigger = "ticker"
 		}
 		log.Printf("[CLUSTER] 开始拉取任务 master=%s host=%s trigger=%s", master, host, trigger)
+		if trigger == "ws_connected" {
+			scanDir := cluster.ReportsScanDir()
+			count, regErr := RegisterLocalCompletedReportsToMaster(master, host, scanDir)
+			if regErr != nil {
+				log.Printf("[CLUSTER] WS重连后本地完成报告补注册失败 master=%s host=%s dir=%s err=%v", master, host, scanDir, regErr)
+			} else {
+				log.Printf("[CLUSTER] WS重连后本地完成报告补注册成功 master=%s host=%s reports=%d events=0", master, host, count)
+			}
+		}
 
 		if err := syncReportHostRegistryFromMasterWS(wsClient); err != nil {
 			log.Printf("[CLUSTER] 同步报告映射失败(ws) master=%s host=%s err=%v", master, host, err)
 		}
 
-		tasks, err := claimTasksFromMasterWS(wsClient, batch, lease)
+		capacity, loadAvg1, loadPerCore := currentHostCapacity()
+		inFlight := int(atomic.LoadInt32(&executingTasks))
+		reqLimit := batch
+		if capacity > reqLimit {
+			reqLimit = capacity
+		}
+		if reqLimit > 16 {
+			reqLimit = 16
+		}
+		if loadAvg1 >= 0 {
+			log.Printf("[CLUSTER] 动态能力 host=%s requestLimit=%d capacity=%d inFlight=%d loadAvg1=%.2f loadPerCore=%.2f", host, reqLimit, capacity, inFlight, loadAvg1, loadPerCore)
+		} else {
+			log.Printf("[CLUSTER] 动态能力 host=%s requestLimit=%d capacity=%d inFlight=%d", host, reqLimit, capacity, inFlight)
+		}
+
+		tasks, err := claimTasksFromMasterWS(wsClient, reqLimit, lease, capacity, inFlight)
 		if err != nil {
 			log.Printf("[CLUSTER] 拉取任务失败(ws) master=%s host=%s err=%v", master, host, err)
 		}
@@ -650,9 +751,11 @@ func StartClusterTaskPullLoop(executor taskPullExecutor) {
 				}
 
 				log.Printf("[CLUSTER] 拉取任务成功 host=%s task=%s player=%d reports=%v", host, task.TaskID, task.PlayerID, task.Reports)
+				atomic.AddInt32(&executingTasks, 1)
 				execCtx, cancel := context.WithTimeout(context.Background(), execTimeout)
 				err = executor.ExecuteAssignedReports(execCtx, task.PlayerID, task.Reports)
 				cancel()
+				atomic.AddInt32(&executingTasks, -1)
 
 				if err != nil {
 					log.Printf("[CLUSTER] 任务执行失败 host=%s task=%s err=%v", host, task.TaskID, err)

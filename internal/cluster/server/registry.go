@@ -145,9 +145,7 @@ func (r *ReportHostRegistry) RegisterReportWithEvents(reportCode, host string, e
 	existing, exists := r.reportHost[code]
 	newEntry := existing
 	newEntry.Host = h
-	if events > 0 || !exists {
-		newEntry.Events = events
-	}
+	newEntry.Events = events
 
 	if exists && existing.Host == newEntry.Host && existing.Events == newEntry.Events {
 		return 0, len(r.reportHost)

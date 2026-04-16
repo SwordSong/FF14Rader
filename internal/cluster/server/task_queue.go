@@ -208,12 +208,12 @@ func (q *DispatchTaskQueue) Claim(host string, limit int, lease time.Duration) [
 	return out
 }
 
-// Ack 确认任务执行结果。
-func (q *DispatchTaskQueue) Ack(taskID, host string, success bool, errText string) bool {
+// Ack 确认任务执行结果，并返回任务携带的 report 列表。
+func (q *DispatchTaskQueue) Ack(taskID, host string, success bool, errText string) (bool, []string) {
 	id := strings.TrimSpace(taskID)
 	h := cluster.NormalizeHost(host)
 	if id == "" || h == "" {
-		return false
+		return false, nil
 	}
 
 	now := time.Now()
@@ -223,11 +223,12 @@ func (q *DispatchTaskQueue) Ack(taskID, host string, success bool, errText strin
 
 	task, ok := q.tasks[id]
 	if !ok || task == nil {
-		return false
+		return false, nil
 	}
 	if task.ClaimedBy != "" && task.ClaimedBy != h {
-		return false
+		return false, nil
 	}
+	reports := append([]string(nil), task.Reports...)
 
 	task.LastError = strings.TrimSpace(errText)
 	task.UpdatedAt = now
@@ -235,13 +236,13 @@ func (q *DispatchTaskQueue) Ack(taskID, host string, success bool, errText strin
 		task.Status = taskStatusDone
 		task.ClaimedBy = h
 		task.LeaseUntil = time.Time{}
-		return true
+		return true, reports
 	}
 
 	task.Status = taskStatusPending
 	task.ClaimedBy = ""
 	task.LeaseUntil = time.Time{}
-	return true
+	return true, reports
 }
 
 // IsReportDone 判断报告是否已完成。

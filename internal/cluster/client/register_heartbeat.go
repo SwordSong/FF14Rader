@@ -18,8 +18,14 @@ const (
 )
 
 type masterRegisterPayload struct {
-	Host    string   `json:"host"`
-	Reports []string `json:"reports"`
+	Host    string                    `json:"host"`
+	Report  string                    `json:"report"`
+	Reports []masterRegisterReportRow `json:"reports"`
+}
+
+type masterRegisterReportRow struct {
+	Events int    `json:"events"`
+	Host   string `json:"host"`
 }
 
 type masterHeartbeatPayload struct {
@@ -46,16 +52,12 @@ func StartAutoRegisterAndHeartbeat() {
 		registerWait := ClusterRegisterWait()
 
 		registerOnce := func() {
-			reports, err := cluster.CollectReportCodesFromDir(scanDir)
+			count, err := registerLocalCompletedReports(registerClient, master, host, scanDir)
 			if err != nil {
-				log.Printf("[CLUSTER] 自动注册读取本地 reports 失败 host=%s dir=%s err=%v", host, scanDir, err)
+				log.Printf("[CLUSTER] 自动注册失败(本地完成报告) master=%s host=%s dir=%s err=%v", master, host, scanDir, err)
 				return
 			}
-			if err := postRegisterToMaster(registerClient, master, host, reports); err != nil {
-				log.Printf("[CLUSTER] 自动注册失败 master=%s host=%s reports=%d err=%v", master, host, len(reports), err)
-				return
-			}
-			log.Printf("[CLUSTER] 自动注册成功 master=%s host=%s reports=%d", master, host, len(reports))
+			log.Printf("[CLUSTER] 自动注册成功(本地完成报告) master=%s host=%s reports=%d events=0", master, host, count)
 		}
 
 		heartbeatOnce := func() error {
@@ -78,6 +80,59 @@ func StartAutoRegisterAndHeartbeat() {
 			}
 		}
 	}()
+}
+
+// RegisterLocalCompletedReportsToMaster 重新上报本地已存在 report，events=0 表示本地已完成。
+func RegisterLocalCompletedReportsToMaster(masterEndpoint, host, scanDir string) (int, error) {
+	client := &http.Client{Timeout: defaultRegisterTimeout}
+	return registerLocalCompletedReports(client, masterEndpoint, host, scanDir)
+}
+
+func registerLocalCompletedReports(client *http.Client, masterEndpoint, host, scanDir string) (int, error) {
+	reports, err := cluster.CollectReportCodesFromDir(scanDir)
+	if err != nil {
+		return 0, fmt.Errorf("collect local reports failed: %w", err)
+	}
+	if len(reports) == 0 {
+		return 0, nil
+	}
+
+	seen := make(map[string]struct{}, len(reports))
+	normalized := make([]string, 0, len(reports))
+	for _, raw := range reports {
+		code := cluster.NormalizeReportCode(raw)
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		normalized = append(normalized, code)
+	}
+	if len(normalized) == 0 {
+		return 0, nil
+	}
+
+	success := 0
+	failed := 0
+	var firstErr error
+	for _, code := range normalized {
+		if err := postRegisterReportWithEventsToMaster(client, masterEndpoint, host, code, 0); err != nil {
+			failed++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		success++
+	}
+
+	if failed > 0 {
+		return success, fmt.Errorf("partial register failed success=%d failed=%d firstErr=%v", success, failed, firstErr)
+	}
+
+	return success, nil
 }
 
 // waitMasterReady 等待主节点健康检查通过。
@@ -107,9 +162,15 @@ func waitMasterReady(client *http.Client, masterEndpoint string, timeout time.Du
 	}
 }
 
-// postRegisterToMaster 向主节点发送报告注册请求。
-func postRegisterToMaster(client *http.Client, masterEndpoint, host string, reports []string) error {
-	payload := masterRegisterPayload{Host: host, Reports: reports}
+// postRegisterReportWithEventsToMaster 向主节点发送单条报告注册请求。
+func postRegisterReportWithEventsToMaster(client *http.Client, masterEndpoint, host, reportCode string, events int) error {
+	payload := masterRegisterPayload{
+		Host:   host,
+		Report: reportCode,
+		Reports: []masterRegisterReportRow{
+			{Events: events, Host: host},
+		},
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -128,7 +189,7 @@ func postRegisterToMaster(client *http.Client, masterEndpoint, host string, repo
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("register status=%d", resp.StatusCode)
+		return fmt.Errorf("register status=%d report=%s", resp.StatusCode, reportCode)
 	}
 	return nil
 }
