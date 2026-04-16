@@ -291,9 +291,9 @@ func (s *SyncManager) downloadV1Reports(ctx context.Context, playerID int) ([]st
 	}
 }
 
-// markCompletedReportParseLogs 将下载完成的报告标记为已完成解析。
+// markCompletedReportParseLogs 同步报告级 downloaded/parsed_done 状态。
 func markCompletedReportParseLogs(playerID int) error {
-	return db.DB.Exec(`
+	if err := db.DB.Exec(`
 UPDATE reports r
 SET downloaded = true
 WHERE r.player_id = ?
@@ -304,6 +304,23 @@ WHERE r.player_id = ?
 		WHERE f.player_id = r.player_id
 			AND f.downloaded = false
 			AND f.master_id LIKE r.master_report || '-%'
+	)
+`, playerID).Error; err != nil {
+		return err
+	}
+
+	return db.DB.Exec(`
+UPDATE reports r
+SET parsed_done = true
+WHERE r.player_id = ?
+	AND r.parsed_done = false
+	AND r.downloaded = true
+	AND NOT EXISTS (
+		SELECT 1
+		FROM fight_sync_maps f
+		WHERE f.player_id = r.player_id
+			AND f.master_id LIKE r.master_report || '-%'
+			AND (f.downloaded = false OR f.parsed_done = false)
 	)
 `, playerID).Error
 }
