@@ -56,6 +56,7 @@ type registerReportsRequest struct {
 	Host    string          `json:"host"`
 	Report  string          `json:"report"`
 	Reports json.RawMessage `json:"reports"`
+	Reason  string          `json:"reason,omitempty"`
 }
 
 type heartbeatRequest struct {
@@ -169,6 +170,8 @@ func enqueuePendingTasksForHost(host string, limit int) (int, error) {
 		if queued > 0 {
 			queuedTotal += queued
 			_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(code, h, events)
+			reason := "db_pending_unparsed_report"
+			log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s events=%d", registerReasonPurpose(reason), reason, h, code, events)
 		}
 		if queuedTotal >= limit {
 			break
@@ -194,6 +197,31 @@ func normalizeClaimArgs(limit int, leaseSec int) (int, int) {
 	}
 
 	return limit, leaseSec
+}
+
+func normalizeRegisterReason(raw string) string {
+	reason := strings.TrimSpace(strings.ToLower(raw))
+	if reason == "" {
+		return "unspecified"
+	}
+	return reason
+}
+
+func registerReasonPurpose(reason string) string {
+	switch reason {
+	case "client_init_local_report":
+		return "程序初始化上报本地report"
+	case "client_reconnect_local_report":
+		return "重连服务端上报本地report"
+	case "v2_parse_completed":
+		return "V2解析完成上报"
+	case "events_parse_completed":
+		return "Events解析完成上报"
+	case "db_pending_unparsed_report", "db_pending_unparsed":
+		return "从数据库中拉取未下载解析的report"
+	default:
+		return "未标注目的"
+	}
 }
 
 func effectiveClaimLimit(limit int, capacity int, inFlight int) int {
@@ -258,6 +286,8 @@ func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	host := cluster.NormalizeHost(req.Host)
+	reason := normalizeRegisterReason(req.Reason)
+	reasonPurpose := registerReasonPurpose(reason)
 	rawReports := strings.TrimSpace(string(req.Reports))
 	if rawReports == "" || rawReports == "null" {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("reports is required"))
@@ -267,10 +297,12 @@ func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request)
 	var legacyReports []string
 	if err := json.Unmarshal(req.Reports, &legacyReports); err == nil {
 		added, total := clusterserver.GlobalReportHostRegistry().RegisterHostReports(host, legacyReports)
-		log.Printf("[CLUSTER] 注册报告(旧格式) host=%s reports=%d addedOrMoved=%d 当前总报告数=%d", host, len(legacyReports), added, total)
+		log.Printf("[CLUSTER] 注册报告：%s (旧格式) source=%s host=%s reports=%d addedOrMoved=%d 当前总报告数=%d", reasonPurpose, reason, host, len(legacyReports), added, total)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":       "ok",
 			"host":         host,
+			"reason":       reason,
+			"reasonText":   reasonPurpose,
 			"received":     len(legacyReports),
 			"addedOrMoved": added,
 			"totalReports": total,
@@ -305,10 +337,12 @@ func (s *Service) registerReportsHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	added, total := clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, effectiveHost, events)
-	log.Printf("[CLUSTER] 注册报告(新格式) host=%s report=%s entries=%d events=%d addedOrMoved=%d 当前总报告数=%d", effectiveHost, reportCode, len(entries), events, added, total)
+	log.Printf("[CLUSTER] 注册报告：%s (新格式) source=%s host=%s report=%s entries=%d events=%d addedOrMoved=%d 当前总报告数=%d", reasonPurpose, reason, effectiveHost, reportCode, len(entries), events, added, total)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":       "ok",
 		"host":         effectiveHost,
+		"reason":       reason,
+		"reasonText":   reasonPurpose,
 		"report":       reportCode,
 		"received":     1,
 		"addedOrMoved": added,
@@ -535,7 +569,10 @@ func (s *Service) taskWSHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			if payload.Success {
 				for _, reportCode := range reports {
+					normalized := cluster.NormalizeReportCode(reportCode)
 					_, _ = clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, host, 0)
+					reason := "events_parse_completed"
+					log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s events=0", registerReasonPurpose(reason), reason, host, normalized)
 				}
 			}
 

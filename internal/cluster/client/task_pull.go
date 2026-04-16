@@ -705,11 +705,11 @@ func StartClusterTaskPullLoop(executor taskPullExecutor) {
 		log.Printf("[CLUSTER] 开始拉取任务 master=%s host=%s trigger=%s", master, host, trigger)
 		if trigger == "ws_connected" {
 			scanDir := cluster.ReportsScanDir()
-			count, regErr := RegisterLocalCompletedReportsToMaster(master, host, scanDir)
+			count, regErr := RegisterLocalReportsWithEventsToMaster(master, host, scanDir, registerReasonReconnect)
 			if regErr != nil {
-				log.Printf("[CLUSTER] WS重连后本地完成报告补注册失败 master=%s host=%s dir=%s err=%v", master, host, scanDir, regErr)
+				log.Printf("[CLUSTER] WS重连后本地报告事件数补注册失败 master=%s host=%s dir=%s err=%v", master, host, scanDir, regErr)
 			} else {
-				log.Printf("[CLUSTER] WS重连后本地完成报告补注册成功 master=%s host=%s reports=%d events=0", master, host, count)
+				log.Printf("[CLUSTER] WS重连后本地报告事件数补注册成功 master=%s host=%s reports=%d", master, host, count)
 			}
 		}
 

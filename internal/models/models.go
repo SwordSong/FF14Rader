@@ -27,9 +27,9 @@ type Player struct {
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 	Reports          []Report  `gorm:"foreignKey:PlayerID" json:"reports"`
-	PicHash          string    `gorm:"size:50" json:"pichash"`
+	PicHash          string    `gorm:"column:pichash;size:50" json:"pichash"`
 	PicUpdatedAt     time.Time `json:"pic_updated_at"`
-	NewPlayer        bool      `json:"newPlayer"`
+	NewPlayer        bool      `gorm:"-" json:"newPlayer"`
 }
 
 type PlayerLite struct {

@@ -10,17 +10,21 @@ import (
 	"time"
 
 	cluster "github.com/user/ff14rader/internal/cluster"
+	"github.com/user/ff14rader/internal/db"
 )
 
 const (
 	defaultRegisterTimeout  = 10 * time.Second
 	defaultHeartbeatTimeout = 5 * time.Second
+	registerReasonInit      = "client_init_local_report"
+	registerReasonReconnect = "client_reconnect_local_report"
 )
 
 type masterRegisterPayload struct {
 	Host    string                    `json:"host"`
 	Report  string                    `json:"report"`
 	Reports []masterRegisterReportRow `json:"reports"`
+	Reason  string                    `json:"reason,omitempty"`
 }
 
 type masterRegisterReportRow struct {
@@ -30,6 +34,11 @@ type masterRegisterReportRow struct {
 
 type masterHeartbeatPayload struct {
 	Host string `json:"host"`
+}
+
+type reportPendingCountRow struct {
+	ReportCode string `gorm:"column:report_code"`
+	Events     int    `gorm:"column:events"`
 }
 
 // StartAutoRegisterAndHeartbeat 启动客户端自动注册与心跳。
@@ -51,13 +60,14 @@ func StartAutoRegisterAndHeartbeat() {
 		heartbeatClient := &http.Client{Timeout: defaultHeartbeatTimeout}
 		registerWait := ClusterRegisterWait()
 
-		registerOnce := func() {
-			count, err := registerLocalCompletedReports(registerClient, master, host, scanDir)
+		registerOnce := func(reason string) {
+			normalizedReason := normalizeRegisterReason(reason)
+			count, err := registerLocalReportsWithEvents(registerClient, master, host, scanDir, normalizedReason)
 			if err != nil {
-				log.Printf("[CLUSTER] 自动注册失败(本地完成报告) master=%s host=%s dir=%s err=%v", master, host, scanDir, err)
+				log.Printf("[CLUSTER] 自动注册失败 source=%s master=%s host=%s dir=%s err=%v", normalizedReason, master, host, scanDir, err)
 				return
 			}
-			log.Printf("[CLUSTER] 自动注册成功(本地完成报告) master=%s host=%s reports=%d events=0", master, host, count)
+			log.Printf("[CLUSTER] 自动注册成功 source=%s master=%s host=%s reports=%d", normalizedReason, master, host, count)
 		}
 
 		heartbeatOnce := func() error {
@@ -68,33 +78,39 @@ func StartAutoRegisterAndHeartbeat() {
 			log.Printf("[CLUSTER] 主节点就绪等待超时 master=%s wait=%s err=%v", master, registerWait, waitErr)
 		}
 
-		registerOnce()
+		registerOnce(registerReasonInit)
 
 		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 		for range ticker.C {
 			if err := heartbeatOnce(); err != nil {
 				log.Printf("[CLUSTER] 心跳失败 master=%s host=%s err=%v；尝试重新注册", master, host, err)
-				registerOnce()
+				registerOnce(registerReasonReconnect)
 				continue
 			}
 		}
 	}()
 }
 
-// RegisterLocalCompletedReportsToMaster 重新上报本地已存在 report，events=0 表示本地已完成。
-func RegisterLocalCompletedReportsToMaster(masterEndpoint, host, scanDir string) (int, error) {
+// RegisterLocalReportsWithEventsToMaster 重新上报本地 report 事件数，未解析报告上报 events>0，已完成上报 events=0。
+func RegisterLocalReportsWithEventsToMaster(masterEndpoint, host, scanDir, reason string) (int, error) {
 	client := &http.Client{Timeout: defaultRegisterTimeout}
-	return registerLocalCompletedReports(client, masterEndpoint, host, scanDir)
+	return registerLocalReportsWithEvents(client, masterEndpoint, host, scanDir, reason)
 }
 
-func registerLocalCompletedReports(client *http.Client, masterEndpoint, host, scanDir string) (int, error) {
+func registerLocalReportsWithEvents(client *http.Client, masterEndpoint, host, scanDir, reason string) (int, error) {
+	normalizedReason := normalizeRegisterReason(reason)
 	reports, err := cluster.CollectReportCodesFromDir(scanDir)
 	if err != nil {
 		return 0, fmt.Errorf("collect local reports failed: %w", err)
 	}
 	if len(reports) == 0 {
 		return 0, nil
+	}
+
+	pendingEvents, err := loadPendingEventsByReport()
+	if err != nil {
+		return 0, fmt.Errorf("load pending events failed: %w", err)
 	}
 
 	seen := make(map[string]struct{}, len(reports))
@@ -118,7 +134,11 @@ func registerLocalCompletedReports(client *http.Client, masterEndpoint, host, sc
 	failed := 0
 	var firstErr error
 	for _, code := range normalized {
-		if err := postRegisterReportWithEventsToMaster(client, masterEndpoint, host, code, 0); err != nil {
+		events := pendingEvents[code]
+		if events < 0 {
+			events = 0
+		}
+		if err := postRegisterReportWithEventsToMaster(client, masterEndpoint, host, code, events, normalizedReason); err != nil {
 			failed++
 			if firstErr == nil {
 				firstErr = err
@@ -133,6 +153,42 @@ func registerLocalCompletedReports(client *http.Client, masterEndpoint, host, sc
 	}
 
 	return success, nil
+}
+
+func normalizeRegisterReason(reason string) string {
+	normalized := strings.TrimSpace(strings.ToLower(reason))
+	if normalized == "" {
+		return "client_unspecified"
+	}
+	return normalized
+}
+
+func loadPendingEventsByReport() (map[string]int, error) {
+	rows := make([]reportPendingCountRow, 0)
+	if err := db.DB.Raw(`
+		SELECT
+			split_part(master_id, '-', 1) AS report_code,
+			COUNT(*)::int AS events
+		FROM fight_sync_maps
+		WHERE downloaded = false
+		GROUP BY split_part(master_id, '-', 1)
+	`).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]int, len(rows))
+	for _, row := range rows {
+		code := cluster.NormalizeReportCode(row.ReportCode)
+		if code == "" {
+			continue
+		}
+		events := row.Events
+		if events < 0 {
+			events = 0
+		}
+		out[code] = events
+	}
+	return out, nil
 }
 
 // waitMasterReady 等待主节点健康检查通过。
@@ -163,13 +219,14 @@ func waitMasterReady(client *http.Client, masterEndpoint string, timeout time.Du
 }
 
 // postRegisterReportWithEventsToMaster 向主节点发送单条报告注册请求。
-func postRegisterReportWithEventsToMaster(client *http.Client, masterEndpoint, host, reportCode string, events int) error {
+func postRegisterReportWithEventsToMaster(client *http.Client, masterEndpoint, host, reportCode string, events int, reason string) error {
 	payload := masterRegisterPayload{
 		Host:   host,
 		Report: reportCode,
 		Reports: []masterRegisterReportRow{
 			{Events: events, Host: host},
 		},
+		Reason: normalizeRegisterReason(reason),
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

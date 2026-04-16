@@ -44,7 +44,13 @@ type scoreTask struct {
 type clusterRegisterReportsPayload struct {
 	Report string            `json:"report"`
 	Entry  []reportHostEntry `json:"reports"`
+	Reason string            `json:"reason,omitempty"`
 }
+
+const (
+	clusterRegisterReasonV2Completed = "v2_parse_completed"
+	clusterRegisterReasonDBPending   = "db_pending_unparsed_report"
+)
 
 type reportHostEntry struct {
 	Events int    `json:"events"`
@@ -1504,7 +1510,7 @@ func postClusterReportsRegister(master string, payload clusterRegisterReportsPay
 		return err
 	}
 	defer resp.Body.Close()
-	log.Printf("[CLUSTER] 上报报告注册结果 master=%s report=%s entries=%d status=%d", master, payload.Report, len(payload.Entry), resp.StatusCode)
+	log.Printf("[CLUSTER] 上报报告注册结果 master=%s report=%s reason=%s entries=%d status=%d", master, payload.Report, strings.TrimSpace(payload.Reason), len(payload.Entry), resp.StatusCode)
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("register reports status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(raw)))
@@ -1540,7 +1546,8 @@ func postReportHostAssignmentsToClusterMaster(assignments map[string]reportHostE
 			Report: code,
 			// 注意：客户端通过 V2 解析得到的 reportHost 上报时，Host 必须留空。
 			// 这里不要改成 entry.Host，避免客户端覆盖主节点的全局路由决策。
-			Entry: []reportHostEntry{{Events: entry.Events, Host: ""}},
+			Entry:  []reportHostEntry{{Events: entry.Events, Host: ""}},
+			Reason: clusterRegisterReasonDBPending,
 		}
 		if err := postClusterReportsRegister(master, payload); err != nil {
 			if firstErr == nil {
@@ -1569,7 +1576,8 @@ func postReportsToClusterMaster(codes []string) error {
 		payload := clusterRegisterReportsPayload{
 			Report: code,
 			// 同上：V2 解析结果上报仅传事件量，Host 始终留空。
-			Entry: []reportHostEntry{{Events: 0, Host: ""}},
+			Entry:  []reportHostEntry{{Events: 0, Host: ""}},
+			Reason: clusterRegisterReasonV2Completed,
 		}
 		if err := postClusterReportsRegister(master, payload); err != nil {
 			if firstErr == nil {
@@ -1843,24 +1851,50 @@ func absInt64(v int64) int64 {
 
 // EnsurePlayerID 确保玩家记录存在，返回玩家 ID；如果不存在则创建新记录
 func EnsurePlayerID(name, server, region string) (models.PlayerLite, string, error) {
+	name = strings.TrimSpace(name)
+	server = strings.TrimSpace(server)
+	region = strings.TrimSpace(region)
+	if region == "" {
+		region = "CN"
+	}
+
 	var player models.Player
-	var playerLite models.PlayerLite
-	err := db.DB.Clauses(dbresolver.Write).Select("id", "pichash").Where("name = ? AND server = ? AND region = ?", name, server, region).First(&player).Error
-	playerLite.PlayerID = player.ID
-	playerLite.Name = name
-	playerLite.Server = server
-	if err == nil {
-		// 已存在玩家记录，返回 ID 和 PicHash
+	query := db.DB.Clauses(dbresolver.Write).
+		Select("id", "pichash").
+		Where("name = ? AND server = ? AND region = ?", name, server, region).
+		Limit(1).
+		Find(&player)
+	if query.Error != nil {
+		return models.PlayerLite{}, "", query.Error
+	}
+
+	playerLite := models.PlayerLite{
+		PlayerID: player.ID,
+		Name:     name,
+		Server:   server,
+		Region:   region,
+	}
+	if query.RowsAffected > 0 {
 		playerLite.NewPlayer = false
 		return playerLite, player.PicHash, nil
 	}
 
-	if errCreate := db.DB.Clauses(dbresolver.Write).Create(&playerLite).Error; errCreate != nil {
-		// 创建玩家记录失败，返回错误
+	newPlayer := models.Player{
+		Name:   name,
+		Server: server,
+		Region: region,
+	}
+	if errCreate := db.DB.Clauses(dbresolver.Write).Select("name", "server", "region").Create(&newPlayer).Error; errCreate != nil {
 		return models.PlayerLite{}, "", errCreate
 	}
-	// 成功创建新玩家记录，返回新 ID 和 PicHash（可能为空）
-	return playerLite, "", nil
+
+	return models.PlayerLite{
+		PlayerID:  newPlayer.ID,
+		NewPlayer: true,
+		Name:      name,
+		Server:    server,
+		Region:    region,
+	}, "", nil
 }
 
 // shouldRunV2ReportQuery 根据玩家状态和更新时间判断是否执行 V2 报告查询。
