@@ -769,7 +769,8 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 					if err == nil {
 						break
 					}
-					log.Printf("[V1] fight %s-%d 下载失败(尝试 %d/%d): %v", code, fight.ID, attempt, attempts, err)
+					hint := v1DownloadFailureHint(err)
+					log.Printf("[V1] fight %s-%d 下载失败(尝试 %d/%d): %s | rawErr=%v", code, fight.ID, attempt, attempts, hint, err)
 					if attempt < attempts {
 						time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 					}
