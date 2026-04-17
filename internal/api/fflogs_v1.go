@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -65,6 +66,24 @@ type v1EventsFetchStats struct {
 	Pages        int
 	Events       int
 	FetchElapsed time.Duration
+}
+
+type v1HTTPStatusError struct {
+	API        string
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *v1HTTPStatusError) Error() string {
+	status := strings.TrimSpace(e.Status)
+	if status == "" {
+		status = fmt.Sprintf("%d", e.StatusCode)
+	}
+	if e.Body == "" {
+		return fmt.Sprintf("%s request failed: %s", e.API, status)
+	}
+	return fmt.Sprintf("%s request failed: %s: %s", e.API, status, e.Body)
 }
 
 type allReportsFightEntry struct {
@@ -458,7 +477,12 @@ func fetchV1Fights(ctx context.Context, client *http.Client, baseURL, apiKey, co
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("v1 fights request failed: %s: %s", resp.Status, truncate(string(body), 256))
+		return nil, &v1HTTPStatusError{
+			API:        "v1 fights",
+			StatusCode: resp.StatusCode,
+			Status:     strings.TrimSpace(resp.Status),
+			Body:       truncate(string(body), 256),
+		}
 	}
 
 	var parsed v1FightsResponse
@@ -543,7 +567,12 @@ func fetchV1EventsPage(ctx context.Context, client *http.Client, baseURL, apiKey
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("v1 events request failed: %s: %s", resp.Status, truncate(string(body), 256))
+		return nil, &v1HTTPStatusError{
+			API:        "v1 events",
+			StatusCode: resp.StatusCode,
+			Status:     strings.TrimSpace(resp.Status),
+			Body:       truncate(string(body), 256),
+		}
 	}
 
 	var parsed v1EventsResponse
@@ -569,6 +598,43 @@ func truncate(input string, max int) string {
 		return input
 	}
 	return input[:max]
+}
+
+func v1DownloadFailureHint(err error) string {
+	if err == nil {
+		return "未知错误"
+	}
+
+	var statusErr *v1HTTPStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.StatusCode == http.StatusTooManyRequests {
+			return fmt.Sprintf("FFLogs 接口限速，status=%s code=%d，请降低并发或稍后重试", statusErr.Status, statusErr.StatusCode)
+		}
+		return fmt.Sprintf("FFLogs 接口返回异常，status=%s code=%d", statusErr.Status, statusErr.StatusCode)
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "网络超时，请检查网络并可尝试增大 FFLOGS_V1_REPORT_TIMEOUT_SEC 或降低 FFLOGS_V1_CONCURRENCY"
+	}
+
+	msg := strings.TrimSpace(err.Error())
+	lower := strings.ToLower(msg)
+
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || strings.Contains(lower, "context deadline exceeded"):
+		return "请求超时(context deadline exceeded)，可尝试增大 FFLOGS_V1_REPORT_TIMEOUT_SEC 或降低 FFLOGS_V1_CONCURRENCY"
+	case errors.Is(err, context.Canceled) || strings.Contains(lower, "context canceled"):
+		return "任务被取消(context canceled)"
+	case strings.Contains(lower, " 429") || strings.Contains(lower, "status 429"):
+		return "FFLogs 接口限速(429)，请降低并发或稍后重试"
+	case strings.Contains(lower, "no such host"):
+		return "域名解析失败(no such host)，请检查网络/DNS"
+	case strings.Contains(lower, "tls") || strings.Contains(lower, "handshake"):
+		return "TLS/握手失败，请检查网络或证书链"
+	default:
+		return msg
+	}
 }
 
 // toV1SavedEventsPayload 组装用于持久化的 V1 事件载荷结构。
@@ -709,9 +775,10 @@ func downloadV1Report(ctx context.Context, client *http.Client, baseURL, apiKey,
 					}
 				}
 				if err != nil {
-					log.Printf("[V1] fight %s-%d 失败，跳过", code, fight.ID)
+					hint := v1DownloadFailureHint(err)
+					log.Printf("[V1] fight %s-%d 失败，跳过，原因: %s | rawErr=%v", code, fight.ID, hint, err)
 					atomic.StoreInt32(&allDone, 0)
-					logProgress(entry.FightID, "失败(下载)")
+					logProgress(entry.FightID, fmt.Sprintf("失败(下载: %s)", hint))
 					return
 				}
 
