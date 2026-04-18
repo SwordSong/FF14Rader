@@ -967,6 +967,7 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 		return nil
 	}
 	mastersByReport := groupMastersByReport(masters)
+	encounterIDFilter, hasEncounterIDFilter := getEncounterIDFilter()
 	if err := s.writeReports(playerID, masters, reportMetadata, reportSummaries); err != nil {
 		return err
 	}
@@ -989,6 +990,7 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 			}
 
 			batch := make([]models.FightSyncMap, 0, len(masterGroup))
+			skippedByZoneFilter := 0
 			for _, master := range masterGroup {
 				fight := master.fight
 				bossPercentage := 0.0
@@ -1007,10 +1009,20 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 				if ev, ok := fight["encounterID"].(float64); ok {
 					encounterID = int(ev)
 				}
+				gameZoneID := 0
 				var gameZoneJSON datatypes.JSON
 				if gz, ok := fight["gameZone"].(map[string]interface{}); ok {
+					if idRaw, ok := gz["id"].(float64); ok {
+						gameZoneID = int(idRaw)
+					}
 					if raw, err := json.Marshal(gz); err == nil {
 						gameZoneJSON = datatypes.JSON(raw)
+					}
+				}
+				if hasEncounterIDFilter {
+					if _, exists := encounterIDFilter[gameZoneID]; !exists {
+						skippedByZoneFilter++
+						continue
 					}
 				}
 
@@ -1047,6 +1059,13 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 					Difficulty:          difficulty,
 					EncounterID:         encounterID,
 				})
+			}
+
+			if skippedByZoneFilter > 0 {
+				log.Printf("[INFO] fight_sync_maps 入库过滤(game_zone.id): report=%s kept=%d skipped=%d", reportCode, len(batch), skippedByZoneFilter)
+			}
+			if len(batch) == 0 {
+				return
 			}
 
 			if err := s.batchUpsertFightSyncMaps(batch); err != nil {
