@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	defaultHostTTL       = 2 * time.Minute
-	defaultEvictInterval = 30 * time.Second
+	defaultHostTTL                     = 2 * time.Minute
+	defaultEvictInterval               = 30 * time.Second
+	defaultRegistryPendingSyncInterval = 3 * time.Minute
 )
 
 func envDurationSeconds(key string, fallback time.Duration) time.Duration {
@@ -32,6 +33,11 @@ func ClusterHostTTL() time.Duration {
 // ClusterEvictInterval 返回集群剔除间隔。
 func ClusterEvictInterval() time.Duration {
 	return envDurationSeconds("CLUSTER_EVICT_INTERVAL_SEC", defaultEvictInterval)
+}
+
+// ClusterRegistryPendingSyncInterval 返回 registry 未解析事件回填间隔。
+func ClusterRegistryPendingSyncInterval() time.Duration {
+	return envDurationSeconds("CLUSTER_REGISTRY_PENDING_SYNC_INTERVAL_SEC", defaultRegistryPendingSyncInterval)
 }
 
 // ClusterTaskMode 返回集群任务调度模式。

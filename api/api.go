@@ -123,6 +123,11 @@ type pendingParsedSeedItem struct {
 	EventIndexes []int
 }
 
+type pendingParsedCountByReportRow struct {
+	ReportCode string `gorm:"column:report_code"`
+	Events     int    `gorm:"column:events"`
+}
+
 func collectPendingParsedSeedItems(rows []pendingParsedEventSeedRow) []pendingParsedSeedItem {
 	if len(rows) == 0 {
 		return nil
@@ -313,6 +318,57 @@ func normalizeRegisterReason(raw string) string {
 	return reason
 }
 
+func loadPendingParsedEventCountsByReports(reportCodes []string) (map[string]int, error) {
+	if len(reportCodes) == 0 {
+		return map[string]int{}, nil
+	}
+
+	normalized := make([]string, 0, len(reportCodes))
+	seen := make(map[string]struct{}, len(reportCodes))
+	for _, reportCode := range reportCodes {
+		code := cluster.NormalizeReportCode(reportCode)
+		if code == "" {
+			continue
+		}
+		if _, ok := seen[code]; ok {
+			continue
+		}
+		seen[code] = struct{}{}
+		normalized = append(normalized, code)
+	}
+	if len(normalized) == 0 {
+		return map[string]int{}, nil
+	}
+
+	rows := make([]pendingParsedCountByReportRow, 0)
+	if err := db.DB.Raw(`
+		SELECT
+			UPPER(split_part(master_id, '-', 1)) AS report_code,
+			COUNT(*)::int AS events
+		FROM fight_sync_maps
+		WHERE parsed_done = false
+			AND UPPER(split_part(master_id, '-', 1)) IN ?
+		GROUP BY UPPER(split_part(master_id, '-', 1))
+	`, normalized).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]int, len(rows))
+	for _, row := range rows {
+		code := cluster.NormalizeReportCode(row.ReportCode)
+		if code == "" {
+			continue
+		}
+		events := row.Events
+		if events < 0 {
+			events = 0
+		}
+		out[code] = events
+	}
+
+	return out, nil
+}
+
 func registerReasonPurpose(reason string) string {
 	switch reason {
 	case "client_init_local_report":
@@ -323,6 +379,8 @@ func registerReasonPurpose(reason string) string {
 		return "V2解析完成上报"
 	case "events_parse_completed":
 		return "Events解析完成上报"
+	case "events_parse_incomplete":
+		return "Events解析未完成上报"
 	case "db_pending_downloaded_unparsed_event":
 		return "从数据库中拉取已下载未解析的event"
 	case "db_pending_unparsed_report", "db_pending_unparsed":
@@ -694,12 +752,36 @@ func (s *Service) taskWSHandler(w http.ResponseWriter, r *http.Request) {
 				return resp
 			}
 			if payload.Success {
+				pendingCounts, countErr := loadPendingParsedEventCountsByReports(reports)
+				if countErr != nil {
+					log.Printf("[CLUSTER] 任务ack后加载待解析event统计失败 task=%s err=%v", payload.TaskID, countErr)
+					pendingCounts = map[string]int{}
+				}
+				snapshot := clusterserver.GlobalReportHostRegistry().Snapshot()
 				for _, reportCode := range reports {
 					normalized := cluster.NormalizeReportCode(reportCode)
-					added, _ := clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(reportCode, host, 0)
+					if normalized == "" {
+						continue
+					}
+
+					events, ok := pendingCounts[normalized]
+					if !ok {
+						if entry, exists := snapshot[normalized]; exists {
+							events = entry.Events
+						}
+					}
+					if events < 0 {
+						events = 0
+					}
+
 					reason := "events_parse_completed"
+					if events > 0 {
+						reason = "events_parse_incomplete"
+					}
+
+					added, _ := clusterserver.GlobalReportHostRegistry().RegisterReportWithEvents(normalized, host, events)
 					if added > 0 {
-						log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s events=0", registerReasonPurpose(reason), reason, host, normalized)
+						log.Printf("[CLUSTER] 注册报告：%s source=%s host=%s report=%s events=%d", registerReasonPurpose(reason), reason, host, normalized, events)
 					}
 				}
 			}

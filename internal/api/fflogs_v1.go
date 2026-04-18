@@ -1119,9 +1119,72 @@ func (s *SyncManager) ExecuteAssignedReports(ctx context.Context, playerID int, 
 		}
 	}
 	if err := s.scorePendingDownloadedFightsByReportsAndFightIDs(ctx, playerID, requestedCodes, eventIndexes); err != nil {
-		log.Printf("[SCORE] assigned score pass failed: %v", err)
+		return fmt.Errorf("assigned score pass failed: %v", err)
 	}
-	return markCompletedReportParseLogs(playerID)
+
+	if err := markCompletedReportParseLogs(playerID); err != nil {
+		return err
+	}
+
+	remaining, err := countPendingParsedDoneByReportsAndFightIDs(playerID, requestedCodes, eventIndexes)
+	if err != nil {
+		return fmt.Errorf("check assigned pending fights failed: %v", err)
+	}
+	if remaining > 0 {
+		return fmt.Errorf("assigned reports still have unparsed fights: %d", remaining)
+	}
+
+	return nil
+}
+
+func countPendingParsedDoneByReportsAndFightIDs(playerID int, reportCodes []string, fightIDs []int) (int64, error) {
+	if playerID == 0 || len(reportCodes) == 0 {
+		return 0, nil
+	}
+
+	normalizedReports := make([]string, 0, len(reportCodes))
+	reportSeen := make(map[string]struct{}, len(reportCodes))
+	for _, reportCode := range reportCodes {
+		code := cluster.NormalizeReportCode(reportCode)
+		if code == "" {
+			continue
+		}
+		if _, ok := reportSeen[code]; ok {
+			continue
+		}
+		reportSeen[code] = struct{}{}
+		normalizedReports = append(normalizedReports, code)
+	}
+	if len(normalizedReports) == 0 {
+		return 0, nil
+	}
+
+	query := db.DB.Model(&models.FightSyncMap{}).
+		Where("player_id = ? AND parsed_done = ?", playerID, false).
+		Where("UPPER(split_part(master_id, '-', 1)) IN ?", normalizedReports)
+
+	normalizedFightIDs := make([]int, 0, len(fightIDs))
+	fightSeen := make(map[int]struct{}, len(fightIDs))
+	for _, fightID := range fightIDs {
+		if fightID <= 0 {
+			continue
+		}
+		if _, ok := fightSeen[fightID]; ok {
+			continue
+		}
+		fightSeen[fightID] = struct{}{}
+		normalizedFightIDs = append(normalizedFightIDs, fightID)
+	}
+	if len(normalizedFightIDs) > 0 {
+		query = query.Where("CASE WHEN split_part(master_id, '-', 2) ~ '^[0-9]+$' THEN split_part(master_id, '-', 2)::int ELSE 0 END IN ?", normalizedFightIDs)
+	}
+
+	var count int64
+	if err := query.Count(&count).Error; err != nil {
+		return 0, err
+	}
+
+	return count, nil
 }
 
 // BackfillPlayerOutputPercentiles 返回回填玩家输出百分位。
