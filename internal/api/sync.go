@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -499,6 +500,25 @@ func (s *SyncManager) scorePendingDownloadedFightsByReportsAndFightIDs(ctx conte
 	log.Printf("[SCORE] 解析进度启动 | 已解析=0/%d 当前并发=0/%d 当前速度=0.00 fights/s 预计完成=--", totalCount, workerCount)
 	sem := make(chan struct{}, workerCount)
 	var wg sync.WaitGroup
+	var reportRepairLocksMu sync.Mutex
+	reportRepairLocks := make(map[string]*sync.Mutex)
+	reportRepairLock := func(reportCode string) *sync.Mutex {
+		key := strings.ToUpper(strings.TrimSpace(reportCode))
+		if key == "" {
+			key = reportCode
+		}
+
+		reportRepairLocksMu.Lock()
+		defer reportRepairLocksMu.Unlock()
+
+		lock, ok := reportRepairLocks[key]
+		if ok {
+			return lock
+		}
+		lock = &sync.Mutex{}
+		reportRepairLocks[key] = lock
+		return lock
+	}
 
 	for _, task := range tasks {
 		wg.Add(1)
@@ -510,6 +530,19 @@ func (s *SyncManager) scorePendingDownloadedFightsByReportsAndFightIDs(ctx conte
 				atomic.AddInt64(&activeCount, -1)
 				<-sem
 			}()
+
+			repairLock := reportRepairLock(reportCode)
+			repairLock.Lock()
+			recoveredByV1, ensureErr := s.ensureFightArtifactsForScoring(ctx, playerID, reportCode, fightID)
+			repairLock.Unlock()
+			if ensureErr != nil {
+				log.Printf("[SCORE] fight %s-%d 本地文件检查/补拉失败: %v", reportCode, fightID, ensureErr)
+				logProgress(reportCode, fightID, "失败(补拉V1)", "")
+				return
+			}
+			if recoveredByV1 {
+				log.Printf("[SCORE] fight %s-%d 本地文件缺失，已触发V1补拉", reportCode, fightID)
+			}
 
 			scoreCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
@@ -554,6 +587,138 @@ func (s *SyncManager) scorePendingDownloadedFightsByReportsAndFightIDs(ctx conte
 		log.Printf("[SCORE] 解析结束(部分失败) | 已解析=%d/%d", finalParsed, totalCount)
 	}
 	return nil
+}
+
+func resolveReportDir(rootDir, reportCode string) string {
+	rawCode := strings.TrimSpace(reportCode)
+	normalizedCode := cluster.NormalizeReportCode(rawCode)
+
+	candidates := []string{rawCode, normalizedCode, strings.ToLower(rawCode)}
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		dir := filepath.Join(rootDir, candidate)
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+
+	if normalizedCode != "" {
+		if entries, err := os.ReadDir(rootDir); err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+				if cluster.NormalizeReportCode(entry.Name()) == normalizedCode {
+					return filepath.Join(rootDir, entry.Name())
+				}
+			}
+		}
+	}
+
+	if normalizedCode != "" {
+		return filepath.Join(rootDir, normalizedCode)
+	}
+	return filepath.Join(rootDir, rawCode)
+}
+
+func reportFightArtifactsReady(rootDir, reportCode string, fightID int) bool {
+	if strings.TrimSpace(rootDir) == "" || strings.TrimSpace(reportCode) == "" || fightID <= 0 {
+		return false
+	}
+
+	reportDir := resolveReportDir(rootDir, reportCode)
+	reportFightsPath := filepath.Join(reportDir, "report_fights.json")
+	if info, err := os.Stat(reportFightsPath); err != nil || info.IsDir() {
+		return false
+	}
+
+	eventsPath := filepath.Join(reportDir, fmt.Sprintf("fight_%d_events.json", fightID))
+	return isUsableV1EventsFile(eventsPath)
+}
+
+func loadFightEntriesByReportFight(playerID int, reportCode string, fightID int) ([]pendingFightEntry, error) {
+	if playerID == 0 || fightID <= 0 {
+		return nil, nil
+	}
+
+	code := cluster.NormalizeReportCode(reportCode)
+	if code == "" {
+		return nil, nil
+	}
+
+	var mappings []models.FightSyncMap
+	if err := db.DB.Select("id", "master_id").
+		Where("player_id = ?", playerID).
+		Where("UPPER(split_part(master_id, '-', 1)) = ?", code).
+		Where("CASE WHEN split_part(master_id, '-', 2) ~ '^[0-9]+$' THEN split_part(master_id, '-', 2)::int ELSE 0 END = ?", fightID).
+		Order("id ASC").
+		Find(&mappings).Error; err != nil {
+		return nil, err
+	}
+
+	entries := make([]pendingFightEntry, 0, len(mappings))
+	for _, mapping := range mappings {
+		report, parsedFightID, ok := splitMasterID(mapping.MasterID)
+		if !ok {
+			continue
+		}
+		entries = append(entries, pendingFightEntry{
+			MappingID:  int(mapping.ID),
+			MasterID:   mapping.MasterID,
+			ReportCode: report,
+			FightID:    parsedFightID,
+		})
+	}
+
+	return entries, nil
+}
+
+func (s *SyncManager) ensureFightArtifactsForScoring(ctx context.Context, playerID int, reportCode string, fightID int) (bool, error) {
+	rootDir := getAllReportsDir()
+	if reportFightArtifactsReady(rootDir, reportCode, fightID) {
+		return false, nil
+	}
+
+	entries, err := loadFightEntriesByReportFight(playerID, reportCode, fightID)
+	if err != nil {
+		return false, fmt.Errorf("load fight mapping failed: %v", err)
+	}
+	if len(entries) == 0 {
+		return false, fmt.Errorf("missing fight mapping for report=%s fight=%d", reportCode, fightID)
+	}
+
+	apiKey, err := getV1ApiKey()
+	if err != nil {
+		return false, err
+	}
+	baseURL := getV1BaseURL()
+	reportTimeout := getV1ReportTimeout()
+	client := newV1HTTPClient(reportTimeout)
+
+	downloadCode := strings.TrimSpace(reportCode)
+	if strings.TrimSpace(entries[0].ReportCode) != "" {
+		downloadCode = entries[0].ReportCode
+	}
+
+	downloadCtx, cancel := context.WithTimeout(ctx, reportTimeout)
+	defer cancel()
+	if _, _, err := downloadV1Report(downloadCtx, client, baseURL, apiKey, rootDir, playerID, downloadCode, entries, 1, reportTimeout); err != nil {
+		return false, fmt.Errorf("v1 download fallback failed: %v", err)
+	}
+
+	if reportFightArtifactsReady(rootDir, reportCode, fightID) || reportFightArtifactsReady(rootDir, downloadCode, fightID) {
+		return true, nil
+	}
+
+	return false, fmt.Errorf("fight artifacts still missing after v1 fallback report=%s fight=%d", reportCode, fightID)
 }
 
 // getScoreConcurrency 根据环境变量和评分服务建议值计算评分并发数。
