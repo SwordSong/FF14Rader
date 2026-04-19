@@ -974,6 +974,8 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 8)
+	var persistedMu sync.Mutex
+	persistedReports := make(map[string]struct{}, len(mastersByReport))
 
 	for _, group := range mastersByReport {
 		wg.Add(1)
@@ -990,7 +992,7 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 			}
 
 			batch := make([]models.FightSyncMap, 0, len(masterGroup))
-			skippedByZoneFilter := 0
+			skippedByEncounterFilter := 0
 			for _, master := range masterGroup {
 				fight := master.fight
 				bossPercentage := 0.0
@@ -1009,19 +1011,15 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 				if ev, ok := fight["encounterID"].(float64); ok {
 					encounterID = int(ev)
 				}
-				gameZoneID := 0
 				var gameZoneJSON datatypes.JSON
 				if gz, ok := fight["gameZone"].(map[string]interface{}); ok {
-					if idRaw, ok := gz["id"].(float64); ok {
-						gameZoneID = int(idRaw)
-					}
 					if raw, err := json.Marshal(gz); err == nil {
 						gameZoneJSON = datatypes.JSON(raw)
 					}
 				}
 				if hasEncounterIDFilter {
-					if _, exists := encounterIDFilter[gameZoneID]; !exists {
-						skippedByZoneFilter++
+					if _, exists := encounterIDFilter[encounterID]; !exists {
+						skippedByEncounterFilter++
 						continue
 					}
 				}
@@ -1061,8 +1059,8 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 				})
 			}
 
-			if skippedByZoneFilter > 0 {
-				log.Printf("[INFO] fight_sync_maps 入库过滤(game_zone.id): report=%s kept=%d skipped=%d", reportCode, len(batch), skippedByZoneFilter)
+			if skippedByEncounterFilter > 0 {
+				log.Printf("[INFO] fight_sync_maps 入库过滤(encounter_id): report=%s kept=%d skipped=%d", reportCode, len(batch), skippedByEncounterFilter)
 			}
 			if len(batch) == 0 {
 				return
@@ -1070,13 +1068,29 @@ func (s *SyncManager) processSyncReports(playerID int, charName string, reports 
 
 			if err := s.batchUpsertFightSyncMaps(batch); err != nil {
 				log.Printf("批量写入报告 %s 失败: %v", reportCode, err)
+				return
+			}
+
+			normalizedCode := cluster.NormalizeReportCode(reportCode)
+			if normalizedCode != "" {
+				persistedMu.Lock()
+				persistedReports[normalizedCode] = struct{}{}
+				persistedMu.Unlock()
 			}
 		}(group)
 	}
 
 	wg.Wait()
-	if err := postReportsToClusterMaster(uniqueCodes); err != nil {
-		log.Printf("[CLUSTER] 上报 reportCode 失败 reports=%d err=%v", len(uniqueCodes), err)
+	persistedCodes := make([]string, 0, len(persistedReports))
+	for code := range persistedReports {
+		persistedCodes = append(persistedCodes, code)
+	}
+	sort.Strings(persistedCodes)
+
+	if len(persistedCodes) == 0 {
+		log.Printf("[CLUSTER] 跳过 reportCode 上报：无有效入库报告 candidateReports=%d", len(uniqueCodes))
+	} else if err := postReportsToClusterMaster(persistedCodes); err != nil {
+		log.Printf("[CLUSTER] 上报 reportCode 失败 reports=%d err=%v", len(persistedCodes), err)
 	}
 
 	log.Printf("多线程并行同步完成")
@@ -1780,12 +1794,12 @@ func loadPendingEventCountsForReports(reportCodes []string) (map[string]int, err
 	rows := make([]pendingReportEventsCountRow, 0)
 	if err := db.DB.Raw(`
 		SELECT
-			split_part(master_id, '-', 1) AS report_code,
+			UPPER(split_part(master_id, '-', 1)) AS report_code,
 			COUNT(*)::int AS events
 		FROM fight_sync_maps
 		WHERE parsed_done = false
-			AND split_part(master_id, '-', 1) IN ?
-		GROUP BY split_part(master_id, '-', 1)
+			AND UPPER(split_part(master_id, '-', 1)) IN ?
+		GROUP BY UPPER(split_part(master_id, '-', 1))
 	`, reportCodes).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
