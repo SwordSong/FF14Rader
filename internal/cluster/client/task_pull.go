@@ -608,6 +608,7 @@ func ackTaskToMasterWS(ws *taskWSClient, taskID string, success bool, errText st
 	}
 }
 
+// claimPlayerLiteTasksFromMasterWS 从主节点WS接口拉取玩家信息任务。
 func claimPlayerLiteTasksFromMasterWS(ws *taskWSClient, limit int, lease time.Duration) (models.PlayerLite, error) {
 	if ws == nil {
 		return models.PlayerLite{}, fmt.Errorf("ws client is nil")
@@ -748,17 +749,28 @@ func StartClusterTaskPullLoop(executor taskPullExecutor) {
 			log.Printf("[CLUSTER] 动态能力 host=%s requestLimit=%d capacity=%d inFlight=%d", host, reqLimit, capacity, inFlight)
 		}
 
-		tasks, err := claimTasksFromMasterWS(wsClient, reqLimit, lease, capacity, inFlight)
-		if err != nil {
-			log.Printf("[CLUSTER] 拉取任务失败(ws) master=%s host=%s err=%v", master, host, err)
+		// 先处理玩家查询任务，避免被 report 任务执行时长阻塞。
+		playerLite, playerClaimErr := claimPlayerLiteTasksFromMasterWS(wsClient, batch, lease)
+		if playerClaimErr != nil {
+			log.Printf("[CLUSTER] 拉取玩家信息任务失败(ws) master=%s host=%s err=%v", master, host, playerClaimErr)
+		} else if playerLite.PlayerID != 0 && strings.TrimSpace(playerLite.Name) != "" && strings.TrimSpace(playerLite.Server) != "" {
+			log.Printf("[CLUSTER] 拉取玩家信息任务成功 host=%s playerId=%d name=%s server=%s", host, playerLite.PlayerID, playerLite.Name, playerLite.Server)
+			region := strings.TrimSpace(playerLite.Region)
+			if region == "" {
+				region = "CN"
+			}
+			if err := executor.StartIncrementalSync(context.Background(), playerLite, region); err != nil {
+				log.Printf("[CLUSTER] 玩家增量同步失败 host=%s playerId=%d err=%v", host, playerLite.PlayerID, err)
+			}
 		}
-		if err != nil {
-			log.Printf("[CLUSTER] 拉取任务失败 master=%s host=%s err=%v", master, host, err)
-			return
+
+		tasks, taskClaimErr := claimTasksFromMasterWS(wsClient, reqLimit, lease, capacity, inFlight)
+		if taskClaimErr != nil {
+			log.Printf("[CLUSTER] 拉取任务失败(ws) master=%s host=%s err=%v", master, host, taskClaimErr)
 		}
-		if len(tasks) == 0 {
-			log.Printf("[CLUSTER] 本轮未领取到 reportCode 任务 host=%s", host)
-		}
+		// if len(tasks) == 0 {
+		// 	log.Printf("[CLUSTER] 本轮未领取到 reportCode 任务 host=%s", host)
+		// }
 		if len(tasks) > 0 {
 			for _, task := range tasks {
 				if task.PlayerID == 0 || len(task.Reports) == 0 || strings.TrimSpace(task.TaskID) == "" {
@@ -781,26 +793,6 @@ func StartClusterTaskPullLoop(executor taskPullExecutor) {
 				}
 				log.Printf("[CLUSTER] 任务执行完成 host=%s task=%s", host, task.TaskID)
 				ackTaskToMasterWS(wsClient, task.TaskID, true, "")
-			}
-		}
-
-		//V2接口查询玩家阶段
-		playerLite, err := claimPlayerLiteTasksFromMasterWS(wsClient, batch, lease)
-		if err != nil {
-			log.Printf("[CLUSTER] 拉取玩家信息任务失败(ws) master=%s host=%s err=%v", master, host, err)
-		}
-		if err != nil {
-			log.Printf("[CLUSTER] 拉取玩家信息任务失败 master=%s host=%s err=%v", master, host, err)
-			return
-		}
-		if playerLite.PlayerID != 0 && strings.TrimSpace(playerLite.Name) != "" && strings.TrimSpace(playerLite.Server) != "" {
-			log.Printf("[CLUSTER] 拉取玩家信息任务成功 host=%s playerId=%d name=%s server=%s", host, playerLite.PlayerID, playerLite.Name, playerLite.Server)
-			region := strings.TrimSpace(playerLite.Region)
-			if region == "" {
-				region = "CN"
-			}
-			if err := executor.StartIncrementalSync(context.Background(), playerLite, region); err != nil {
-				log.Printf("[CLUSTER] 玩家增量同步失败 host=%s playerId=%d err=%v", host, playerLite.PlayerID, err)
 			}
 		}
 
